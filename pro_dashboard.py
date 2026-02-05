@@ -243,13 +243,22 @@ with analysis_cols[2]:
     - Safe-haven demand spiking
     """)
 
-# 深度简报 (颜色已调整为浅色主题)
+# 深度简报 (颜色已调整为浅色主题，内容动态生成)
 st.markdown(f"#### 🧠 {t['analysis_report']}")
+
+# 动态生成分析内容
+pred_1d = predictions['1d']
+trend_str = "震荡上行" if pred_1d['dir'] > 0 else "承压调整"
+trend_color = "#d97706" if pred_1d['dir'] > 0 else "#dc2626"
+bond_change = live_data.get('10Y_Bond', {}).get('change', 0)
+bond_str = "有所回落，支撑金价" if bond_change < 0 else "持续反弹，施压金价"
+advice_str = "逢低分批建仓" if pred_1d['dir'] > 0 else "注意风险，暂时观望"
+
 with st.container():
     st.markdown(f"""
-    <div style="background-color: #f8f9fa; padding: 25px; border-radius: 12px; border-left: 6px solid #d97706; box-shadow: 0 2px 5px rgba(0,0,0,0.05); color: #1f2937;">
-        <p style="margin-bottom: 15px;"><strong style="color: #b45309; font-size: 1.1em;">AI 实时研判：</strong> 当前市场正处于关键的宏观数据发布窗口期。实时数据显示美元指数（DXY）微幅震荡，而黄金（XAUUSD）展现出极强的抗跌性。模型识别到大量避险资金流入，抵消了高利率环境的压力。</p>
-        <p style="margin-bottom: 15px;"><strong style="color: #b45309; font-size: 1.1em;">关键信号：</strong> 10年期美债收益率与金价的负相关性近期有所减弱，这表明地缘溢价正在成为主导因子。技术面上，金价站稳 20日均线，多头动能正在积蓄。</p>
-        <p style="margin-top: 15px; padding-top: 10px; border-top: 1px solid #e5e7eb;"><strong style="color: #dc2626; font-size: 1.1em;">操作建议：</strong> 建议重点关注今日收盘价。若能突破关键阻力位，T+1 模型预测将迎来一波快速拉升。短线交易者可逢低做多，长线投资者继续持有。</p>
+    <div style="background-color: #f8f9fa; padding: 25px; border-radius: 12px; border-left: 6px solid {trend_color}; box-shadow: 0 2px 5px rgba(0,0,0,0.05); color: #1f2937;">
+        <p style="margin-bottom: 15px;"><strong style="color: #b45309; font-size: 1.1em;">AI 实时研判：</strong> 当前市场正处于关键窗口期。实时数据显示美元指数（DXY）{("走势疲软" if live_data.get('USD_Index', {}).get('change', 0) < 0 else "强势震荡")}，黄金（XAUUSD）呈现 <strong>{trend_str}</strong> 态势。模型置信度为 {pred_1d['prob']*100:.1f}%。</p>
+        <p style="margin-bottom: 15px;"><strong style="color: #b45309; font-size: 1.1em;">关键信号：</strong> 10年期美债收益率近期{bond_str}。技术面上，当前价格波动率预期为 {pred_1d['vol']*100:.2f}%，市场情绪偏向{("乐观" if pred_1d['dir'] > 0 else "谨慎")}。</p>
+        <p style="margin-top: 15px; padding-top: 10px; border-top: 1px solid #e5e7eb;"><strong style="color: #dc2626; font-size: 1.1em;">操作建议：</strong> {advice_str}。建议密切关注 {live_data.get('Gold', {}).get('price'):.2f} 附近的支撑/阻力位。</p>
     </div>
     """, unsafe_allow_html=True)
