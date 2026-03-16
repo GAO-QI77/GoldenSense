@@ -1,0 +1,11 @@
+{
+    "event_type": "Inflation",
+    "strength": "0.00",
+    "direction": "看跌 (Bearish)",
+    "confidence": "60.0%",
+    "historical_cases": [
+        "2026-01-30",
+        "2026-01-31"
+    ],
+    "summary": "检测到重大的 inflation 相关新闻，情绪强度为 0.00。基于历史数据，该类事件对金价的预期影响为 看跌 (Bearish)。"
+}
