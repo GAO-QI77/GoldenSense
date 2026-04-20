@@ -5,4 +5,7 @@ __pycache__/
 venv/
 *.log
 model_checkpoints_backup/
-
+node_modules/
+dist/
+modern_showcase_site/node_modules/
+modern_showcase_site/dist/

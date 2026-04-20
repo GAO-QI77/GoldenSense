@@ -1,12 +1,14 @@
-import yfinance as yf
-import pandas as pd
-import numpy as np
-import feedparser
-from bs4 import BeautifulSoup
-import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 import time
 import re
+
+from bs4 import BeautifulSoup
+import feedparser
+import numpy as np
+import pandas as pd
+import requests
+import yfinance as yf
 
 class MarketDataLoader:
     """
@@ -18,7 +20,7 @@ class MarketDataLoader:
             self.tickers = {
                 'Gold': 'GC=F',        # Gold Futures
                 'Silver': 'SI=F',      # Silver Futures
-                'USD_Index': 'DX=F',   # US Dollar Index
+                'USD_Index': 'DX-Y.NYB',   # US Dollar Index (DXY)
                 'S&P500': '^GSPC',     # S&P 500
                 'VIX': '^VIX',         # Volatility Index
                 'Crude_Oil': 'CL=F',   # Crude Oil Futures
@@ -67,16 +69,29 @@ class NewsDataLoader:
     """
     高级新闻数据加载器：包含因果分析、情感量化与重要性加权。
     """
-    def __init__(self, feeds=None):
+    def __init__(
+        self,
+        feeds=None,
+        *,
+        request_timeout=2.5,
+        total_timeout=3.5,
+        max_workers=4,
+        max_items=24,
+    ):
         if feeds is None:
             self.feeds = [
-                'https://www.reutersagency.com/feed/?best-topics=business-finance',
-                'https://search.cnbc.com/rs/search/combined?partnerId=2&keywords=gold%20price',
-                'https://www.investing.com/rss/news_95.rss',
-                'https://www.fxstreet.com/rss/news'
+                'https://news.google.com/rss/search?q=gold+price+when:7d&hl=en-US&gl=US&ceid=US:en',
+                'https://news.google.com/rss/search?q=fed+gold+when:7d&hl=en-US&gl=US&ceid=US:en',
+                'https://news.google.com/rss/search?q=dollar+gold+when:7d&hl=en-US&gl=US&ceid=US:en',
+                'https://www.fxstreet.com/rss/news',
+                'https://www.investing.com/rss/news_95.rss'
             ]
         else:
             self.feeds = feeds
+        self.request_timeout = request_timeout
+        self.total_timeout = total_timeout
+        self.max_workers = max_workers
+        self.max_items = max_items
             
         # 扩展的因果字典：[情感极性, 影响类别, 强度]
         # 影响类别: 1: 通胀, 2: 利率, 3: 避险, 4: 汇率
@@ -108,22 +123,53 @@ class NewsDataLoader:
             'central bank buying': [1.8, 0, 0.8]
         }
 
+    def _fetch_feed(self, url, headers):
+        response = requests.get(
+            url,
+            timeout=(min(2.0, self.request_timeout), self.request_timeout),
+            headers=headers,
+        )
+        response.raise_for_status()
+        feed = feedparser.parse(response.content)
+        items = []
+        for entry in feed.entries:
+            items.append({
+                'title': entry.title,
+                'summary': getattr(entry, 'summary', ''),
+                'published': getattr(entry, 'published', datetime.now().strftime('%Y-%m-%d')),
+                'source': url.split('/')[2],
+                'url': getattr(entry, 'link', None),
+            })
+        return items
+
     def fetch_news(self):
         news_items = []
-        for url in self.feeds:
-            try:
-                feed = feedparser.parse(url)
-                for entry in feed.entries:
-                    # 提取更多元数据用于加权
-                    news_items.append({
-                        'title': entry.title,
-                        'summary': getattr(entry, 'summary', ''),
-                        'published': getattr(entry, 'published', datetime.now().strftime('%Y-%m-%d')),
-                        'source': url.split('/')[2]
-                    })
-            except Exception as e:
-                print(f"Error fetching {url}: {e}")
-        return news_items
+        headers = {
+            "User-Agent": "GoldenSenseBot/1.0 (+https://localhost)"
+        }
+        if not self.feeds:
+            return news_items
+
+        executor = ThreadPoolExecutor(max_workers=min(self.max_workers, len(self.feeds)))
+        futures = {executor.submit(self._fetch_feed, url, headers): url for url in self.feeds}
+        try:
+            for future in as_completed(futures, timeout=self.total_timeout):
+                url = futures[future]
+                try:
+                    news_items.extend(future.result())
+                    if len(news_items) >= self.max_items:
+                        break
+                except Exception as e:
+                    print(f"Error fetching {url}: {e}")
+        except TimeoutError:
+            pass
+        finally:
+            for future in futures:
+                if not future.done():
+                    future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        return news_items[: self.max_items]
 
     def analyze_causality(self, news_items):
         """

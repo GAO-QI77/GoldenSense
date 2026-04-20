@@ -5,6 +5,7 @@ from sklearn.ensemble import RandomForestRegressor
 from statsmodels.tsa.arima.model import ARIMA
 from sklearn.linear_model import Ridge
 import numpy as np
+from typing import Optional, Tuple
 
 class GRUModel(nn.Module):
     def __init__(self, input_dim, hidden_size=64, num_layers=2, dropout=0.2):
@@ -22,15 +23,59 @@ class TransformerModel(nn.Module):
     """
     def __init__(self, input_dim, d_model=64, nhead=4, num_layers=2, dropout=0.1):
         super(TransformerModel, self).__init__()
-        self.encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(self.encoder_layer, num_layers=num_layers)
+        self.encoder_layer = _ExplainableTransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout)
+        self.transformer_encoder = _ExplainableTransformerEncoder(
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
         self.input_fc = nn.Linear(input_dim, d_model)
         self.output_fc = nn.Linear(d_model, 1)
+        self.last_attention_weights = None
 
     def forward(self, x):
         x = self.input_fc(x)
-        x = self.transformer_encoder(x)
+        x, attn = self.transformer_encoder(x)
+        self.last_attention_weights = attn
         return self.output_fc(x[:, -1, :]).squeeze(-1)
+
+
+class _ExplainableTransformerEncoder(nn.Module):
+    def __init__(self, d_model: int, nhead: int, num_layers: int, dropout: float):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [_ExplainableTransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout) for _ in range(num_layers)]
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        last_attn = None
+        for layer in self.layers:
+            x, last_attn = layer(x)
+        return x, last_attn
+
+
+class _ExplainableTransformerEncoderLayer(nn.Module):
+    def __init__(self, d_model: int, nhead: int, dropout: float):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=nhead, dropout=dropout, batch_first=True)
+        self.linear1 = nn.Linear(d_model, 2048)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(2048, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.activation = nn.functional.relu
+
+    def forward(self, src: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        src2, attn_weights = self.self_attn(src, src, src, need_weights=True, average_attn_weights=False)
+        src = self.norm1(src + self.dropout1(src2))
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = self.norm2(src + self.dropout2(src2))
+        return src, attn_weights
 
 class DynamicEnsemble:
     """
@@ -147,8 +192,8 @@ class DynamicEnsemble:
             self.rf = joblib.load(os.path.join(path, "rf.joblib"))
             self.meta_learner = joblib.load(os.path.join(path, "meta_learner.joblib"))
             
-            self.gru.load_state_dict(torch.load(os.path.join(path, "gru.pth")))
-            self.transformer.load_state_dict(torch.load(os.path.join(path, "transformer.pth")))
+            self.gru.load_state_dict(torch.load(os.path.join(path, "gru.pth"), map_location="cpu"))
+            self.transformer.load_state_dict(torch.load(os.path.join(path, "transformer.pth"), map_location="cpu"))
             
             if os.path.exists(os.path.join(path, "weights.npy")):
                 self.model_weights = np.load(os.path.join(path, "weights.npy"))
@@ -160,6 +205,3 @@ class DynamicEnsemble:
         except Exception as e:
             print(f"Error loading model: {e}")
             return False
-
-
-

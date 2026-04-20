@@ -1,0 +1,110 @@
+services:
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: ankane/pgvector:pg16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+
+  inference:
+    build: .
+    command: python3 -m uvicorn inference_service:app --host 0.0.0.0 --port 8010
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8010:8010"
+    depends_on:
+      - redis
+
+  memory:
+    build: .
+    command: python3 -m uvicorn memory_service:app --host 0.0.0.0 --port 8012
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+    ports:
+      - "8012:8012"
+    depends_on:
+      - postgres
+
+  market_ingest:
+    build: .
+    command: python3 -m uvicorn market_snapshot_service:app --host 0.0.0.0 --port 8014
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      MARKET_REFRESH_SECONDS: "60"
+      MARKET_STALE_AFTER_SECONDS: "180"
+    ports:
+      - "8014:8014"
+    depends_on:
+      - redis
+      - postgres
+
+  news_ingest:
+    build: .
+    command: python3 -m uvicorn news_ingest_service:app --host 0.0.0.0 --port 8016
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      NEWS_REFRESH_SECONDS: "300"
+    ports:
+      - "8016:8016"
+    depends_on:
+      - redis
+      - postgres
+
+  agent_gateway:
+    build: .
+    command: python3 -m uvicorn agent_gateway:app --host 0.0.0.0 --port 8020
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      FORECAST_URL: http://inference:8010/api/v1/forecast
+      MEMORY_URL: http://memory:8012/api/v1/memory/search
+      MARKET_SNAPSHOT_URL: http://market_ingest:8014/api/v1/market/snapshot/latest
+      RECENT_NEWS_URL: http://news_ingest:8016/api/v1/news/recent
+      AGENT_DEFAULT_MODEL: gpt-5.4-mini
+      AGENT_COMPLEX_MODEL: gpt-5.4
+      AGENT_PUBLIC_API_KEYS: dev-public-key
+      AGENT_INTERNAL_API_KEYS: dev-internal-key
+      AGENT_ALLOW_ORIGINS: http://localhost:4173,http://127.0.0.1:4173,http://localhost:8501,http://127.0.0.1:8501
+    ports:
+      - "8020:8020"
+    depends_on:
+      - inference
+      - memory
+      - market_ingest
+      - news_ingest
+
+  frontend:
+    build: .
+    command: python3 -m streamlit run frontend/dashboard.py --server.address 0.0.0.0 --server.port 8501
+    environment:
+      AGENT_GATEWAY_URL: http://agent_gateway:8020/api/v1/agent/trigger
+      AGENT_GATEWAY_INTERNAL_API_KEY: dev-internal-key
+    ports:
+      - "8501:8501"
+    depends_on:
+      - agent_gateway
+
+  webapp:
+    image: node:20-alpine
+    working_dir: /app/modern_showcase_site
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 4173"
+    environment:
+      VITE_AGENT_API_URL: http://localhost:8020/api/v1/agent/analyze
+      VITE_AGENT_FEEDBACK_URL: http://localhost:8020/api/v1/agent/feedback
+      VITE_AGENT_API_KEY: dev-public-key
+    ports:
+      - "4173:4173"
+    volumes:
+      - .:/app
+    depends_on:
+      - agent_gateway

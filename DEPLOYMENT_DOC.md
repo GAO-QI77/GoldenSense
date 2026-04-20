@@ -1,41 +1,124 @@
-# GoldenSense 部署指南
+# GoldenSense Agent 部署指南
 
-本系统支持在本地环境或云端 (如 Streamlit Cloud) 快速部署。
+本仓库当前只保留正式 GoldenSense Agent 主链路，不再包含旧的直播平台或旧 Streamlit 看板部署方式。
 
-## 1. 本地部署
+## 1. 基线环境
 
-### 系统要求
-- Python 3.9 或更高版本
-- 网络连接 (用于实时抓取 yfinance 数据及新闻 RSS)
+- Python 3.12
+- Node.js 20
+- Docker / Docker Compose（可选）
 
-### 安装依赖
+安装 Python 依赖：
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### 数据初始化
-系统需要预先训练模型并缓存数据：
-```bash
-python3 train_stacking.py
-```
-*注：此过程将生成 `prediction_results.csv`, `raw_market_data.csv` 等关键文件。*
+## 2. 本地启动后端主链路
 
-### 启动服务
+推荐直接使用：
+
 ```bash
-python3 -m streamlit run pro_dashboard.py
+zsh scripts/dev_stack.sh start
 ```
 
-## 2. 云端部署 (Streamlit Cloud)
+查看状态：
 
-1. 将代码推送至 GitHub 仓库。
-2. 登录 [Streamlit Cloud](https://share.streamlit.io/)。
-3. 点击 "New app"，选择对应的仓库、分支及主文件 `pro_dashboard.py`。
-4. 在 "Secrets" 中配置必要的环境变量（如有）。
-5. 点击 "Deploy" 即可完成。
+```bash
+zsh scripts/dev_stack.sh status
+```
 
-## 3. 核心文件说明
-- `stacking_model.py`: 模型架构与 Stacking 逻辑。
-- `data_loader.py`: 数据采集与 NLP 情感处理。
-- `feature_engineer.py`: 黄金市场专属特征工程。
-- `pro_dashboard.py`: Streamlit 交互式前端。
-- `train_stacking.py`: 模型训练与 A/B 测试脚本。
+停止服务：
+
+```bash
+zsh scripts/dev_stack.sh stop
+```
+
+默认会拉起：
+
+- `inference_service.py`
+- `memory_service.py`
+- `market_snapshot_service.py`
+- `news_ingest_service.py`
+- `agent_gateway.py`
+
+## 3. 鉴权配置
+
+正式 Agent 网关要求 API key：
+
+```bash
+export AGENT_PUBLIC_API_KEYS=dev-public-key
+export AGENT_INTERNAL_API_KEYS=dev-internal-key
+```
+
+- `POST /api/v1/agent/analyze` 与 `POST /api/v1/agent/feedback`：接受 public 或 internal key
+- `GET /api/v1/agent/traces/{analysis_id}` 与 `POST /api/v1/agent/trigger`：只接受 internal key
+
+## 4. 前端启动
+
+消费者前台：
+
+```bash
+cd modern_showcase_site
+npm install
+npm run dev
+```
+
+常用前端环境变量：
+
+```bash
+VITE_AGENT_API_URL=http://localhost:8020/api/v1/agent/analyze
+VITE_AGENT_FEEDBACK_URL=http://localhost:8020/api/v1/agent/feedback
+VITE_AGENT_API_KEY=dev-public-key
+```
+
+内部 QA / 运营面板：
+
+```bash
+python3 -m streamlit run frontend/dashboard.py
+```
+
+如需走旧的内部触发入口，请配置：
+
+```bash
+export AGENT_GATEWAY_INTERNAL_API_KEY=dev-internal-key
+```
+
+## 5. Docker Compose
+
+```bash
+docker compose up --build
+```
+
+当前编排会启动：
+
+- `redis`
+- `postgres`
+- `inference`
+- `memory`
+- `market_ingest`
+- `news_ingest`
+- `agent_gateway`
+- `frontend`
+- `webapp`
+
+## 6. 验证
+
+核心测试：
+
+```bash
+python3 -m pytest -q \
+  tests/test_agent_analyze.py \
+  tests/test_news_ingest_service.py \
+  tests/test_memory_service.py \
+  tests/test_inference_service.py \
+  tests/test_market_snapshot_service.py \
+  tests/test_impact_breakdown.py \
+  tests/test_vix_data.py
+```
+
+主链路冒烟：
+
+```bash
+python3 scripts/smoke_agent.py
+```
