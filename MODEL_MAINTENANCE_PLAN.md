@@ -1,78 +1,120 @@
-# AI Model Maintenance & Retraining Strategy
+# GoldenSense Model Maintenance & Retraining Strategy
 
-**Project**: GoldenSense  
-**Version**: 1.0  
-**Date**: 2026-03-16
-
----
-
-## 1. Port Conflict Resolution & Prevention
-
-### Diagnosis
-Port conflicts occur when the server process (`uvicorn`) is not terminated properly or when multiple instances are launched.
-*   **Check Command**: `lsof -i :8000` (MacOS/Linux) or `netstat -ano | findstr :8000` (Windows).
-*   **Kill Command**: `kill -9 <PID>` (MacOS/Linux) or `taskkill /PID <PID> /F` (Windows).
-
-### Solution Implemented
-The `server.py` startup logic has been modified to automatically detect port availability:
-1.  Check port 8000.
-2.  If occupied, increment port number (8001, 8002...) until a free port is found.
-3.  Log the selected port to stdout.
-
-### Best Practices
-*   Use a process manager like `supervisord` or `systemd` in production.
-*   Implement a `shutdown` hook in FastAPI to close connections gracefully.
+- **Project**: GoldenSense
+- **Version**: 1.1
+- **Date**: 2026-05-12
 
 ---
 
-## 2. Model Retraining Strategy
+## 1. Current Runtime Model
 
-### 2.1 Business Context Analysis
-*   **Asset**: Gold (XAU/USD).
-*   **Market Regime**: High volatility, influenced by geopolitical events and macro data (CPI, NFP).
-*   **Data Velocity**: 
-    *   Price: Tick-level (aggregated to daily/hourly).
-    *   News: Real-time.
-*   **Concept Drift**: Significant. A model trained on 2020 (COVID) data may fail in 2024 (Rate Cuts).
+GoldenSense runs as a small service mesh rather than a single `server.py` entrypoint:
 
-### 2.2 Retraining Frequency
-Based on the decay curve of financial time-series models:
+| Service | Default port | Role |
+| --- | --- | --- |
+| `inference_service.py` | `8010` | Loads checkpoints and returns horizon forecasts |
+| `memory_service.py` | `8012` | Searches historical event memory |
+| `market_snapshot_service.py` | `8014` | Provides market snapshots and indicator groups |
+| `news_ingest_service.py` | `8016` | Normalizes recent news |
+| `agent_gateway.py` | `8020` | Orchestrates the public agent API |
 
-| Frequency | Trigger | Scope | Resource Cost |
-| :--- | :--- | :--- | :--- |
-| **Weekly (Recommended)** | Every Sunday | Full Retrain (Rolling Window 2Y) | Medium (10-20 mins) |
-| **Daily (Incremental)** | New data available | Online Learning / Fine-tuning | Low (< 2 mins) |
-| **Event-Driven** | Major Regime Change (e.g., War, Rate Hike) | Full Retrain + Hyperparam Search | High (1-2 hours) |
+Use `zsh scripts/dev_stack.sh start` for local backend development, or
+`docker compose up --build` for the full local stack. If a port is occupied,
+stop the existing process with `zsh scripts/dev_stack.sh stop` or inspect the
+port with `lsof -i :<port>`.
 
-**Decision**: Adopt a **Weekly Full Retrain** strategy with a rolling window of 2 years to capture recent market dynamics while discarding obsolete patterns.
+---
 
-### 2.3 Monitoring & Alerts
+## 2. Asset Policy
 
-Define Key Performance Indicators (KPIs) to trigger emergency retraining:
+The tracked files in `model_checkpoints/` and the small CSV/JSON research files
+are lightweight demo assets used by local inference, training, tests, and
+documentation examples. They are intentionally kept small enough for this public
+repository.
 
-*   **Accuracy (Directional)**: < 50% for 3 consecutive days.
-*   **MAE (Price)**: > $50 deviation.
-*   **Data Drift**: Input distribution shift > 20% (KS-Test).
+Do not commit private datasets, customer data, provider credentials, or large
+production model versions. Use one of these instead:
 
-### 2.4 Rollback Strategy
+- GitHub Release artifacts for versioned demo bundles
+- Object storage for production datasets and large checkpoints
+- Git LFS only when repository-level binary versioning is truly required
 
-Always keep the previous best model.
+---
 
-1.  **Backup**: Before saving new model, rename `model_checkpoints` to `model_checkpoints_backup`.
-2.  **Validation**: New model must beat the old model on the last 30 days of hold-out data.
-3.  **Rollback**: If new model performs worse in production (24h grace period), restore from backup.
+## 3. Retraining Strategy
 
-### 2.5 Automation Pipeline
+### 3.1 Business Context
+
+- **Asset**: Gold / XAUUSD.
+- **Market regime**: Sensitive to real yields, USD, inflation data, central bank
+  policy, geopolitical shocks, and ETF/central-bank demand.
+- **Data velocity**: Daily/hourly price data for the current demo path; external
+  providers should be used before production exposure.
+- **Concept drift**: High. A model trained on one macro regime should not be
+  treated as stable without monitoring.
+
+### 3.2 Frequency
+
+| Frequency | Trigger | Scope | Resource cost |
+| --- | --- | --- | --- |
+| Weekly | Scheduled research refresh | Full retrain over a rolling window | Medium |
+| Daily | New market/news data available | Lightweight validation and feature refresh | Low |
+| Event-driven | Major regime shift or model degradation | Full retrain plus review | High |
+
+Recommended default: weekly full retrain plus event-driven retrain when the
+model fails validation.
+
+### 3.3 Monitoring Signals
+
+Track these before promoting a new checkpoint:
+
+- Directional accuracy over the latest holdout window
+- Mean absolute error against recent gold prices
+- Feature distribution drift versus the training window
+- Rate of degraded or heuristic proxy responses from `inference_service.py`
+- Freshness and availability of market/news inputs
+
+---
+
+## 4. Promotion and Rollback
+
+1. Train into a temporary output directory, not directly over
+   `model_checkpoints/`.
+2. Compare the candidate against the current checkpoint on a recent holdout
+   window.
+3. Promote only if the candidate improves the chosen acceptance metrics and
+   preserves the service response contract.
+4. Keep the previous checkpoint bundle as a rollback artifact.
+5. If live monitoring degrades after promotion, restore the previous bundle and
+   mark the failed candidate for review.
+
+Example local retraining command:
 
 ```bash
-# Weekly Cron Job (Sunday 00:00)
-0 0 * * 0 /usr/bin/python3 /path/to/train_stacking.py --mode=production >> /var/log/goldensense/retrain.log 2>&1
+python3 train_stacking.py
 ```
 
-## 3. Resource Cost Analysis
+Example scheduled production shape:
 
-*   **Training**: ~15 mins on CPU (M1/M2). Cost negligible.
-*   **Inference**: < 50ms.
-*   **Storage**: < 500MB per checkpoint version.
+```bash
+0 0 * * 0 /usr/bin/python3 /srv/goldensense/train_stacking.py >> /var/log/goldensense/retrain.log 2>&1
+```
 
-**Conclusion**: The Weekly Retrain strategy offers the best balance between model freshness and operational stability.
+---
+
+## 5. Validation Checklist
+
+Before publishing new model assets or changing the training path, run:
+
+```bash
+python3 -m pytest tests/test_inference_service.py tests/test_agent_analyze.py
+python3 scripts/smoke_agent.py
+```
+
+For frontend-facing changes to model explanations, also run:
+
+```bash
+cd modern_showcase_site
+npm run build
+npm run test:e2e
+```

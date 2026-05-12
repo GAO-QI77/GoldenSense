@@ -1,9 +1,15 @@
 __pycache__/
 *.pyc
 .DS_Store
+.env
+.env.*
+!.env.example
+.pytest_cache/
 .venv/
 venv/
 *.log
+.trae/
+.vercel/
 model_checkpoints_backup/
 node_modules/
 dist/
