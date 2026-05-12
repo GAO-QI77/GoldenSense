@@ -9,3 +9,5 @@ node_modules/
 dist/
 modern_showcase_site/node_modules/
 modern_showcase_site/dist/
+modern_showcase_site/test-results/
+modern_showcase_site/playwright-report/

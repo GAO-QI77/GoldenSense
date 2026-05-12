@@ -4,9 +4,9 @@
 
 它现在承担三件事：
 
-- 展示“现在怎么看黄金”的结论卡。
-- 接收用户问题、风险偏好和分析周期，不再要求手动输入新闻。
-- 渲染 Agent 返回的证据卡、引用、自动抓取的新闻和三周期判断。
+- `/` 展示黄金预测、四类指标、新闻、引用和数据质量。
+- `/agent` 接收完整风险问卷、用户问题、风险偏好和分析周期。
+- 渲染 Agent 返回的风险适配 briefing、证据卡、引用、自动抓取的新闻和三周期判断。
 
 ## 开发
 
@@ -18,7 +18,9 @@ npm run dev
 默认会通过 Vite 开发代理请求：
 
 ```bash
+/api/v1/agent/dashboard/current
 /api/v1/agent/analyze
+/api/v1/agent/feedback
 ```
 
 代理默认会转发到：
@@ -27,16 +29,11 @@ npm run dev
 http://127.0.0.1:8020
 ```
 
-反馈默认会请求：
-
-```bash
-/api/v1/agent/feedback
-```
-
 如需直连或覆盖：
 
 ```bash
 VITE_AGENT_API_URL=http://localhost:8020/api/v1/agent/analyze
+VITE_AGENT_DASHBOARD_URL=http://localhost:8020/api/v1/agent/dashboard/current
 VITE_AGENT_FEEDBACK_URL=http://localhost:8020/api/v1/agent/feedback
 VITE_AGENT_API_KEY=dev-public-key
 VITE_AGENT_PROXY_TARGET=http://127.0.0.1:8020
@@ -46,19 +43,19 @@ VITE_AGENT_PROXY_TARGET=http://127.0.0.1:8020
 
 ```bash
 npm run build
+npm run test:e2e
 ```
 
-已验证当前版本可以成功生成 `dist/`。
+`test:e2e` 使用 Playwright 覆盖首页指标、Agent 完整问卷和移动端横向溢出检查。
 
 ## 页面结构
 
-- 顶部 Hero：一句话结论、风险条和当前画像。
-- 中部工作区：提问表单 + 自动新闻预览 + 对话与建议。
-- 下部证据区：三周期参考、证据卡、可追溯引用和后续追问建议。
+- 研究主页：价格条、三周期预测、四类指标、数据质量、自动新闻和指标引用。
+- Agent 页：完整风险问卷、风险适配建议、证据卡、新闻、引用和反馈。
 - 结论区反馈：用户可以直接标记“有帮助 / 没帮助”，把 `analysis_id` 回传给后端；请求会附带低权限 public API key。
 
 ## 设计原则
 
-- 面向无技术背景散户，用词短、结论清楚。
-- 不做“神谕式”喊单，所有结论都必须有失效条件。
-- 风格以金色、羊皮纸和深墨色为主，不走默认 SaaS 模板路线。
+- 面向中文散户研究辅助场景，用词清楚但保持专业密度。
+- 不做“神谕式”喊单，所有结论都必须有失效条件、引用或降级标记。
+- 风格是安静、密集、克制的黄金研究终端，不做营销落地页。

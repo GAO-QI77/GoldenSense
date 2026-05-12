@@ -2,6 +2,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 import time
 import re
+from typing import Protocol
 
 from bs4 import BeautifulSoup
 import feedparser
@@ -10,10 +11,52 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+
+class MarketDataProvider(Protocol):
+    provider_name: str
+
+    def fetch_data(self, period='2y', interval='1d'):
+        ...
+
+
+class NewsDataProvider(Protocol):
+    provider_name: str
+
+    def fetch_news(self):
+        ...
+
+    def analyze_causality(self, news_items):
+        ...
+
+    def get_daily_signals(self, scored_items):
+        ...
+
+
+class UnconfiguredMarketDataProvider:
+    provider_name = "unconfigured"
+
+    def fetch_data(self, period='2y', interval='1d'):
+        raise RuntimeError("market_data_provider_not_configured")
+
+
+class UnconfiguredNewsDataProvider:
+    provider_name = "unconfigured"
+
+    def fetch_news(self):
+        raise RuntimeError("news_data_provider_not_configured")
+
+    def analyze_causality(self, news_items):
+        return []
+
+    def get_daily_signals(self, scored_items):
+        return pd.DataFrame()
+
 class MarketDataLoader:
     """
     Fetches market data from yfinance.
     """
+    provider_name = "yfinance"
+
     def __init__(self, tickers=None):
         if tickers is None:
             # Default tickers for gold price influence
@@ -25,7 +68,7 @@ class MarketDataLoader:
                 'VIX': '^VIX',         # Volatility Index
                 'Crude_Oil': 'CL=F',   # Crude Oil Futures
                 '10Y_Bond': '^TNX',    # 10Y Treasury Note Yield
-                '2Y_Bond': '^IRX'      # 13 Week Treasury Bill (Proxy for 2Y or short term)
+                '2Y_Bond': '2YY=F'     # 2-Year Yield Futures; production should use a dedicated rates provider.
             }
         else:
             self.tickers = tickers
@@ -69,6 +112,8 @@ class NewsDataLoader:
     """
     高级新闻数据加载器：包含因果分析、情感量化与重要性加权。
     """
+    provider_name = "rss"
+
     def __init__(
         self,
         feeds=None,
@@ -217,6 +262,20 @@ class NewsDataLoader:
             'fx': 'sum'
         })
         return daily_signals
+
+
+def create_market_data_provider(provider_name: str) -> MarketDataProvider:
+    normalized = (provider_name or "").strip().lower()
+    if normalized in {"", "yfinance", "dev", "development"}:
+        return MarketDataLoader()
+    return UnconfiguredMarketDataProvider()
+
+
+def create_news_data_provider(provider_name: str) -> NewsDataProvider:
+    normalized = (provider_name or "").strip().lower()
+    if normalized in {"", "rss", "dev", "development"}:
+        return NewsDataLoader()
+    return UnconfiguredNewsDataProvider()
 
 if __name__ == "__main__":
     # Test script

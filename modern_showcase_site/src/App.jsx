@@ -1,47 +1,49 @@
-import React, { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
-import { motion, useReducedMotion } from 'framer-motion';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { BrowserRouter, Link, NavLink, Route, Routes } from 'react-router-dom';
 import {
   AlertTriangle,
   ArrowRight,
-  BadgeAlert,
+  BadgeCheck,
   BarChart3,
+  BookOpenCheck,
   BrainCircuit,
+  CalendarDays,
+  Calculator,
   CheckCircle2,
-  ChevronDown,
+  ChevronRight,
+  Crosshair,
   Clock3,
+  DatabaseZap,
   ExternalLink,
   FileSearch,
-  Flame,
+  Gauge,
   Landmark,
+  LineChart,
   Loader2,
-  MessagesSquare,
+  LockKeyhole,
   Newspaper,
   Radar,
   ShieldCheck,
-  Sparkles,
+  SlidersHorizontal,
+  Target,
+  TrendingDown,
   TrendingUp,
-  Waves,
-  Zap,
+  WalletCards,
 } from 'lucide-react';
 
 const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
+const DASHBOARD_URL =
+  import.meta.env.VITE_AGENT_DASHBOARD_URL || API_URL.replace('/analyze', '/dashboard/current');
 const FEEDBACK_URL = import.meta.env.VITE_AGENT_FEEDBACK_URL || API_URL.replace('/analyze', '/feedback');
 const API_KEY = import.meta.env.VITE_AGENT_API_KEY || 'dev-public-key';
 
-const starterPrompts = [
-  '今晚 CPI 如果高于预期，黄金短线应该怎么看？',
-  '我比较保守，现在是不是适合小仓试探黄金？',
-  '地缘冲突升级的话，黄金的 T+1、T+7、T+30 应该分别怎么看？',
-  '如果美元继续走强，黄金这周更适合观望还是降低暴露？',
-];
-
 const horizonLabels = {
-  '24h': '24 小时',
-  '7d': '7 天',
-  '30d': '30 天',
+  '24h': '短线 T+1',
+  '7d': '中线 T+7',
+  '30d': '长线 T+30',
 };
 
-const horizonTags = {
+const horizonShortLabels = {
   '24h': 'T+1',
   '7d': 'T+7',
   '30d': 'T+30',
@@ -53,222 +55,398 @@ const riskLabels = {
   aggressive: '进取型',
 };
 
-const riskDescriptions = {
-  conservative: '优先控制回撤，建议更偏小仓和等待确认。',
-  balanced: '接受适度波动，更看重风险收益比的平衡。',
-  aggressive: '允许更高波动，但依然要看失效条件和风险条。',
-};
-
-const horizonDescriptions = {
-  '24h': '更偏事件驱动与短线波动，适合看下一次宏观催化会不会改写方向。',
-  '7d': '一周视角更适合判断情绪是否延续，以及风险偏好会不会持续切换。',
-  '30d': '中期参考更适合看趋势结构和叙事是否真正站稳，而不是单一数据点。',
-};
-
-const stanceTone = {
+const stanceClass = {
   偏多: 'tone-bull',
   偏空: 'tone-bear',
   中性: 'tone-neutral',
   高风险观望: 'tone-risk',
 };
 
-const signalTypeMeta = {
-  market: { label: '市场状态', icon: BarChart3 },
-  quant: { label: '量化预测', icon: BrainCircuit },
-  news: { label: '新闻情绪', icon: Flame },
-  memory: { label: '历史类比', icon: FileSearch },
-  macro: { label: '宏观语境', icon: Landmark },
-  risk: { label: '风险画像', icon: ShieldCheck },
+const groupIcons = {
+  fundamental: Landmark,
+  technical: LineChart,
+  macro_policy: Gauge,
+  flow_sentiment: Radar,
 };
 
-const basisLabels = {
-  ensemble_model: '模型直推',
-  heuristic_proxy: '代理预测',
-  degraded_fallback: '降级回退',
+const indicatorDirectionLabel = {
+  bullish: '偏多',
+  bearish: '偏空',
+  neutral: '中性',
+  risk: '风险',
 };
 
-const riskOptions = Object.entries(riskLabels).map(([value, label]) => ({ value, label }));
-const horizonOptions = Object.entries(horizonLabels).map(([value, label]) => ({ value, label }));
+const positionLabels = {
+  none: '无持仓',
+  long: '已有多头',
+  short: '已有空头',
+  hedged: '已对冲',
+};
+
+const baseCapital = 100000;
+
+const investorDefaults = {
+  risk_capacity: 'medium',
+  trading_horizon: 'short',
+  experience_level: 'intermediate',
+  capital_allocation_pct: 10,
+  max_drawdown_pct: 8,
+  current_position: 'none',
+  liquidity_need: 'medium',
+  leverage_attitude: 'none',
+  investment_goal: 'event_trade',
+};
+
+const selectMeta = {
+  risk_capacity: [
+    ['low', '低'],
+    ['medium', '中'],
+    ['high', '高'],
+  ],
+  trading_horizon: [
+    ['short', '短线'],
+    ['medium', '中线'],
+    ['long', '长线'],
+  ],
+  experience_level: [
+    ['beginner', '新手'],
+    ['intermediate', '有经验'],
+    ['advanced', '成熟交易者'],
+  ],
+  current_position: [
+    ['none', '无持仓'],
+    ['long', '已有多头'],
+    ['short', '已有空头'],
+    ['hedged', '已对冲'],
+  ],
+  liquidity_need: [
+    ['low', '低'],
+    ['medium', '中'],
+    ['high', '高'],
+  ],
+  leverage_attitude: [
+    ['none', '不用杠杆'],
+    ['low', '低杠杆'],
+    ['medium', '中等杠杆'],
+    ['high', '高杠杆'],
+  ],
+  investment_goal: [
+    ['capital_preservation', '本金保护'],
+    ['income', '稳健增值'],
+    ['event_trade', '事件交易'],
+    ['trend_following', '趋势跟随'],
+    ['speculation', '投机博弈'],
+  ],
+};
+
+const starterPrompts = [
+  '如果今晚 CPI 高于预期，黄金短线应该如何控制风险？',
+  '美元指数继续走强时，黄金 T+7 的失效条件是什么？',
+  '我已经有黄金多头，接下来一周该关注哪些指标？',
+  '地缘冲突升温但 ETF 没有流入，黄金是不是只适合观望？',
+];
+
+function apiHeaders(extra = {}) {
+  return {
+    'Content-Type': 'application/json',
+    'X-API-Key': API_KEY,
+    ...extra,
+  };
+}
+
+async function readApiJson(response, fallbackMessage) {
+  const text = await response.text();
+  const trimmed = text.trim();
+  let json = null;
+
+  if (trimmed) {
+    try {
+      json = JSON.parse(trimmed);
+    } catch (error) {
+      throw new Error(`${fallbackMessage}：服务返回非 JSON 内容。`);
+    }
+  }
+
+  if (!response.ok) {
+    const detail = json?.detail;
+    const message = typeof detail === 'string' ? detail : detail?.message || json?.message;
+    throw new Error(message || `${fallbackMessage}：HTTP ${response.status}`);
+  }
+
+  if (!json) {
+    throw new Error(`${fallbackMessage}：服务返回空响应。`);
+  }
+
+  return json;
+}
+
+function forecastBasisLabel(forecast) {
+  if (!forecast) return '等待预测基线';
+  if (forecast.basis === 'heuristic_proxy') return '代理量化引擎：真实行情驱动';
+  if (forecast.basis === 'degraded_fallback' || forecast.model_status === 'unavailable') return '量化引擎不可用';
+  if (forecast.basis === 'ensemble_model') return '训练量化模型';
+  return forecast.basis || '预测基线';
+}
 
 function App() {
-  const shouldReduceMotion = useReducedMotion();
+  return (
+    <BrowserRouter>
+      <AppShell>
+        <Routes>
+          <Route path="/" element={<DashboardPage />} />
+          <Route path="/agent" element={<AgentPage />} />
+          <Route path="*" element={<DashboardPage />} />
+        </Routes>
+      </AppShell>
+    </BrowserRouter>
+  );
+}
+
+function AppShell({ children }) {
+  return (
+    <div className="terminal-shell">
+      <header className="topbar">
+        <Link to="/" className="brand-lockup" aria-label="GoldenSense home">
+          <span className="brand-mark">
+            <BarChart3 size={18} />
+          </span>
+          <span>
+            <strong>GoldenSense</strong>
+            <small>Gold Research Terminal</small>
+          </span>
+        </Link>
+
+        <nav className="topnav" aria-label="Main navigation">
+          <NavLink to="/" end>
+            <LineChart size={16} />
+            研究主页
+          </NavLink>
+          <NavLink to="/agent">
+            <BrainCircuit size={16} />
+            风险画像 Agent
+          </NavLink>
+        </nav>
+
+        <div className="compliance-pill">
+          <ShieldCheck size={15} />
+          研究辅助 · 非下单系统
+        </div>
+      </header>
+      {children}
+    </div>
+  );
+}
+
+function DashboardPage() {
+  const [dashboard, setDashboard] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    const controller = new AbortController();
+    async function loadDashboard() {
+      try {
+        setLoading(true);
+        setError('');
+        const response = await fetch(DASHBOARD_URL, {
+          method: 'GET',
+          headers: apiHeaders(),
+          signal: controller.signal,
+        });
+        const json = await readApiJson(response, '首页研究数据读取失败');
+        setDashboard(json);
+      } catch (loadError) {
+        if (loadError.name !== 'AbortError') {
+          setError(loadError.message || '首页研究数据读取失败');
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setLoading(false);
+        }
+      }
+    }
+    loadDashboard();
+    return () => controller.abort();
+  }, []);
+
+  const market = dashboard?.market_status;
+  const forecasts = dashboard?.horizon_forecasts || [];
+  const groups = dashboard?.indicator_groups || [];
+  const dataQuality = dashboard?.data_quality;
+  const degradationFlags = dashboard?.degradation_flags || [];
+  const news = dashboard?.recent_news || [];
+  const citations = dashboard?.citations || [];
+  const sourceHealth = dashboard?.source_health || [];
+  const goldHistory = dashboard?.gold_history;
+
+  const primaryForecast = forecasts[0];
+  const dashboardStatus = loading ? 'loading' : error ? 'error' : dataQuality?.status || 'ok';
+  const dashboardInsights = useMemo(
+    () => buildDashboardInsights({ market, forecasts, groups, news, dataQuality, degradationFlags }),
+    [market, forecasts, groups, news, dataQuality, degradationFlags],
+  );
+
+  return (
+    <main className="page-surface dashboard-page">
+      <section className="terminal-header">
+        <div>
+          <p className="eyebrow">XAUUSD Research Brief</p>
+          <h1>黄金价格预测与指标总览</h1>
+          <p>
+            主页只展示稳定市场基线和指标证据；个人风险画像、周期选择和适配建议放在独立 Agent 页处理。
+          </p>
+        </div>
+        <StatusBadge status={dashboardStatus} loading={loading} />
+      </section>
+
+      {error ? <ErrorPanel title="首页研究数据不可用" message={error} /> : null}
+
+      <section className="market-strip" aria-label="Market summary">
+        <MetricTile
+          label="XAUUSD"
+          value={loading ? '读取中' : market ? formatPrice(market.latest_price) : 'N/A'}
+          detail={market ? `1D ${formatPercent(market.price_change_pct_1d)}` : '等待市场快照'}
+          tone={market?.price_change_pct_1d >= 0 ? 'bull' : market?.price_change_pct_1d < 0 ? 'bear' : 'neutral'}
+          icon={market?.price_change_pct_1d >= 0 ? TrendingUp : TrendingDown}
+        />
+        <MetricTile
+          label="主预测"
+          value={primaryForecast ? primaryForecast.stance : loading ? '读取中' : 'N/A'}
+          detail={primaryForecast ? `${primaryForecast.action} · ${primaryForecast.confidence_band}置信度` : 'T+1 baseline'}
+          tone={primaryForecast ? toneName(primaryForecast.stance) : 'neutral'}
+          icon={Radar}
+        />
+        <MetricTile
+          label="数据新鲜度"
+          value={market ? `${market.freshness_seconds}s` : loading ? '读取中' : 'N/A'}
+          detail={market?.is_stale ? '快照陈旧' : dataQuality?.status === 'degraded' ? '含降级数据' : '当前可用'}
+          tone={market?.is_stale || dataQuality?.status === 'degraded' ? 'risk' : 'bull'}
+          icon={DatabaseZap}
+        />
+        <MetricTile
+          label="质量提示"
+          value={degradationFlags.length ? `${degradationFlags.length} 项` : loading ? '读取中' : '正常'}
+          detail={degradationFlags[0] || dataQuality?.indicator_status || '无降级标记'}
+          tone={degradationFlags.length ? 'risk' : 'neutral'}
+          icon={BadgeCheck}
+        />
+      </section>
+
+      <section className="research-brief-grid">
+        <CoreThesisPanel thesis={dashboardInsights.thesis} />
+        <DriverMatrix groups={groups} drivers={dashboardInsights.drivers} />
+      </section>
+
+      <section className="forecast-grid" aria-label="Forecast horizons">
+        {forecasts.length ? (
+          forecasts.map((forecast) => <ForecastCard key={forecast.horizon} forecast={forecast} />)
+        ) : (
+          <PlaceholderPanel icon={Clock3} text={loading ? '正在读取 T+1 / T+7 / T+30 预测基线。' : '暂无预测基线。'} />
+        )}
+      </section>
+
+      <GoldTrendPanel history={goldHistory} loading={loading} />
+
+      <section className="research-brief-grid lower">
+        <CatalystCalendar events={dashboardInsights.events} />
+        <ScenarioPanel scenarios={dashboardInsights.scenarios} />
+      </section>
+
+      <section className="workspace-layout">
+        <div className="primary-column">
+          <SectionHeader
+            kicker="Indicator Pillars"
+            title="四类核心指标"
+            description="基本面、技术面、宏观政策和资金情绪分开展示，每个指标保留来源、状态与新鲜度。"
+          />
+          <div className="indicator-grid">
+            {groups.length ? (
+              groups.map((group) => <IndicatorGroupCard key={group.id} group={group} />)
+            ) : (
+              <PlaceholderPanel icon={Gauge} text={loading ? '正在读取指标柱。' : '暂无指标数据。'} />
+            )}
+          </div>
+        </div>
+
+        <aside className="side-rail">
+          <QualityPanel quality={dataQuality} flags={degradationFlags} />
+          <SourceHealthPanel sources={sourceHealth} loading={loading} />
+          <NewsPanel news={news} loading={loading} />
+          <CitationPanel citations={citations} />
+          <Link className="agent-entry" to="/agent">
+            <span>
+              <strong>进入风险画像 Agent</strong>
+              <small>填写完整问卷后生成风险适配 briefing</small>
+            </span>
+            <ArrowRight size={17} />
+          </Link>
+        </aside>
+      </section>
+      <TerminalFooter
+        left="GoldenSense Research Dashboard"
+        right="价格、指标、来源健康与风险提示统一在首页收口"
+      />
+    </main>
+  );
+}
+
+function AgentPage() {
   const [question, setQuestion] = useState(starterPrompts[0]);
-  const [riskProfile, setRiskProfile] = useState('conservative');
+  const [riskProfile, setRiskProfile] = useState('balanced');
   const [horizon, setHorizon] = useState('24h');
+  const [investorProfile, setInvestorProfile] = useState(investorDefaults);
+  const [analysis, setAnalysis] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [analysis, setAnalysis] = useState(null);
-  const [conversation, setConversation] = useState([]);
   const [feedbackStatus, setFeedbackStatus] = useState('');
-  const [feedbackLoading, setFeedbackLoading] = useState(false);
-  const [highlightedCitation, setHighlightedCitation] = useState('');
-  const [tickerIndex, setTickerIndex] = useState(0);
-
-  const deferredQuestion = useDeferredValue(question);
-  const formRef = useRef(null);
-  const briefingRef = useRef(null);
-  const citationTimeoutRef = useRef(null);
+  const resultRef = useRef(null);
 
   const summary = analysis?.summary_card;
   const riskBanner = analysis?.risk_banner;
+  const forecasts = analysis?.horizon_forecasts || [];
   const evidenceCards = analysis?.evidence_cards || [];
   const citations = analysis?.citations || [];
-  const horizonForecasts = analysis?.horizon_forecasts || [];
   const recentNews = analysis?.recent_news || [];
-  const followUpQuestions = analysis?.follow_up_questions || [];
-  const degradationFlags = analysis?.degradation_flags || [];
+  const selectedForecast = forecasts.find((item) => item.horizon === horizon) || forecasts[0];
 
-  function apiHeaders(extra = {}) {
-    return {
-      'Content-Type': 'application/json',
-      'X-API-Key': API_KEY,
-      ...extra,
-    };
+  const profileScore = useMemo(() => {
+    let score = 0;
+    if (Number(investorProfile.capital_allocation_pct) >= 50) score += 3;
+    else if (Number(investorProfile.capital_allocation_pct) >= 25) score += 2;
+    else if (Number(investorProfile.capital_allocation_pct) >= 10) score += 1;
+    if (Number(investorProfile.max_drawdown_pct) <= 5) score += 2;
+    else if (Number(investorProfile.max_drawdown_pct) <= 10) score += 1;
+    score += { none: 0, low: 1, medium: 2, high: 3 }[investorProfile.leverage_attitude] || 0;
+    if (investorProfile.experience_level === 'beginner') score += 1;
+    if (investorProfile.liquidity_need === 'high') score += 2;
+    if (['long', 'short'].includes(investorProfile.current_position)) score += 1;
+    if (investorProfile.investment_goal === 'speculation') score += 1;
+    return score;
+  }, [investorProfile]);
+
+  const profileLevel = profileScore >= 5 ? '高' : profileScore >= 2 ? '中' : '低';
+  const riskBudget = useMemo(() => buildRiskBudget(investorProfile, profileScore), [investorProfile, profileScore]);
+  const suitabilityGate = useMemo(
+    () => buildSuitabilityGate(investorProfile, profileScore, riskBudget),
+    [investorProfile, profileScore, riskBudget],
+  );
+  const executionScenarios = useMemo(
+    () => buildExecutionScenarios({ summary, selectedForecast, riskBudget, investorProfile }),
+    [summary, selectedForecast, riskBudget, investorProfile],
+  );
+
+  function updateInvestorProfile(key, value) {
+    setInvestorProfile((current) => ({
+      ...current,
+      [key]: ['capital_allocation_pct', 'max_drawdown_pct'].includes(key) ? Number(value) : value,
+    }));
   }
-
-  const containerVariants = useMemo(
-    () => ({
-      hidden: { opacity: 1 },
-      show: {
-        opacity: 1,
-        transition: {
-          staggerChildren: shouldReduceMotion ? 0 : 0.08,
-          delayChildren: shouldReduceMotion ? 0 : 0.02,
-        },
-      },
-    }),
-    [shouldReduceMotion],
-  );
-
-  const itemVariants = useMemo(
-    () => ({
-      hidden: { opacity: 0, y: shouldReduceMotion ? 0 : 18 },
-      show: {
-        opacity: 1,
-        y: 0,
-        transition: { duration: shouldReduceMotion ? 0.08 : 0.45, ease: 'easeOut' },
-      },
-    }),
-    [shouldReduceMotion],
-  );
-
-  const quickMood = useMemo(() => {
-    if (loading) {
-      return '正在整合市场快照、量化信号、新闻和历史类比。';
-    }
-    if (!summary) {
-      return '把宏观新闻、量化信号和历史类比压缩成散户也能快速读懂的判断。';
-    }
-    return `${summary.stance} · ${summary.action} · ${summary.confidence_band}置信度`;
-  }, [loading, summary]);
-
-  const selectedForecast = useMemo(() => {
-    if (!horizonForecasts.length) return null;
-    return horizonForecasts.find((item) => item.horizon === horizon) || horizonForecasts[0];
-  }, [horizon, horizonForecasts]);
-
-  const analysisStats = useMemo(
-    () => [
-      {
-        label: '新闻',
-        value: recentNews.length ? `${recentNews.length} 条` : '0 条',
-      },
-      {
-        label: '证据',
-        value: evidenceCards.length ? `${evidenceCards.length} 张` : '0 张',
-      },
-      {
-        label: '引用',
-        value: citations.length ? `${citations.length} 条` : '0 条',
-      },
-      {
-        label: '耗时',
-        value: analysis?.timing_ms?.total ? `${analysis.timing_ms.total} ms` : '未执行',
-      },
-    ],
-    [analysis, citations.length, evidenceCards.length, recentNews.length],
-  );
-
-  const workflowSteps = loading
-    ? [
-        '读取统一市场快照与风险环境',
-        '拉取近端新闻并生成多周期判断',
-        '按用户画像收敛为可执行建议',
-      ]
-    : summary
-      ? [
-          `主结论：${summary.stance}，建议 ${summary.action}`,
-          `重点风险：${riskBanner?.title || '等待风险条'}`,
-          '你可以继续追问关键价位、仓位或失效情景',
-        ]
-      : [
-          '输入你的问题，系统会自动抓取近端新闻与市场快照',
-          '同时生成 T+1 / T+7 / T+30 三档判断',
-          '按散户风险偏好重写成可执行建议',
-        ];
-
-  const heroStatus = loading ? 'Agent 正在整理本轮信号' : summary ? '最近一次分析已完成' : '等待你发起问题';
-  const heroStatusTone = loading ? 'pending' : summary ? 'ready' : 'idle';
-
-  const heroTickerItems = useMemo(() => {
-    if (loading) {
-      return [
-        '正在读取市场快照、量化信号、新闻和历史类比。',
-        '本轮会同时生成 T+1、T+7、T+30 三档判断。',
-        '风险偏好与分析周期已经锁定到当前输入里。',
-      ];
-    }
-
-    if (summary) {
-      return [
-        quickMood,
-        `当前锁定：${riskLabels[riskProfile]} · ${horizonLabels[horizon]}`,
-        `已纳入 ${recentNews.length} 条新闻、${evidenceCards.length} 张证据卡、${citations.length} 条引用。`,
-        riskBanner?.message || '所有结论都必须能回到证据文本和失效条件。',
-      ];
-    }
-
-    return [
-      '从一个更具体的问题开始，GoldenSense 才能把判断收敛到可执行的下一步。',
-      `当前默认：${riskLabels[riskProfile]} · ${horizonLabels[horizon]}。`,
-      '你不需要手动贴新闻，系统会自动抓取本轮近端情报。',
-      '输入一个事件、期限和立场疑问，首轮结果会更有用。',
-    ];
-  }, [citations.length, evidenceCards.length, horizon, loading, quickMood, recentNews.length, riskBanner?.message, riskProfile, summary]);
-
-  const heroTickerText = heroTickerItems[tickerIndex] || heroTickerItems[0];
-
-  useEffect(() => {
-    setTickerIndex(0);
-  }, [heroTickerItems.length, loading, horizon, riskProfile, summary]);
-
-  useEffect(() => {
-    if (shouldReduceMotion || heroTickerItems.length <= 1) {
-      return undefined;
-    }
-
-    const intervalId = window.setInterval(() => {
-      setTickerIndex((current) => (current + 1) % heroTickerItems.length);
-    }, 2800);
-
-    return () => window.clearInterval(intervalId);
-  }, [heroTickerItems, shouldReduceMotion]);
-
-  useEffect(
-    () => () => {
-      if (citationTimeoutRef.current) {
-        window.clearTimeout(citationTimeoutRef.current);
-      }
-    },
-    [],
-  );
 
   async function handleSubmit(event) {
     event.preventDefault();
-
-    const trimmedQuestion = question.trim();
-    if (!trimmedQuestion) {
-      setError('请输入你的问题，再开始分析。');
+    const trimmed = question.trim();
+    if (!trimmed) {
+      setError('请输入具体问题后再开始分析。');
       return;
     }
 
@@ -276,799 +454,893 @@ function App() {
     setError('');
     setFeedbackStatus('');
 
-    const payload = {
-      question: trimmedQuestion,
-      risk_profile: riskProfile,
-      horizon,
-      locale: 'zh-CN',
-    };
-
     try {
       const response = await fetch(API_URL, {
         method: 'POST',
         headers: apiHeaders(),
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          question: trimmed,
+          risk_profile: riskProfile,
+          horizon,
+          locale: 'zh-CN',
+          investor_profile: investorProfile,
+        }),
       });
-      const json = await response.json();
-      if (!response.ok) {
-        throw new Error(json?.detail?.message || json?.detail || '分析请求失败');
-      }
-
-      startTransition(() => {
-        setAnalysis(json);
-        setConversation((prev) => {
-          const next = [
-            ...prev,
-            {
-              id: `${Date.now()}-user`,
-              role: 'user',
-              content: trimmedQuestion,
-            },
-            {
-              id: `${Date.now()}-assistant`,
-              role: 'assistant',
-              content: json.summary_card.reasons[0] || `${json.summary_card.stance}，${json.summary_card.action}`,
-            },
-          ];
-          return next.slice(-6);
-        });
-      });
-
-      window.setTimeout(() => {
-        briefingRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      }, 120);
+      const json = await readApiJson(response, 'Agent 分析失败');
+      setAnalysis(json);
+      window.setTimeout(() => resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
     } catch (submitError) {
-      setError(submitError.message || '分析请求失败');
+      setError(submitError.message || 'Agent 分析失败');
     } finally {
       setLoading(false);
     }
   }
 
   async function submitFeedback(rating) {
-    if (!analysis?.analysis_id || feedbackLoading) return;
-
+    if (!analysis?.analysis_id) return;
     try {
-      setFeedbackLoading(true);
       const response = await fetch(FEEDBACK_URL, {
         method: 'POST',
         headers: apiHeaders(),
-        body: JSON.stringify({
-          analysis_id: analysis.analysis_id,
-          rating,
-          comment: null,
-        }),
+        body: JSON.stringify({ analysis_id: analysis.analysis_id, rating, comment: null }),
       });
-      if (!response.ok) {
-        throw new Error('反馈提交失败');
-      }
-      setFeedbackStatus(rating === 'helpful' ? '已记录：这条回答对你有帮助。' : '已记录：我们会重点改进这类回答。');
+      await readApiJson(response, '反馈提交失败');
+      setFeedbackStatus(rating === 'helpful' ? '已记录：这条 briefing 有帮助。' : '已记录：这类回答会进入后续评估。');
     } catch (feedbackError) {
       setFeedbackStatus(feedbackError.message || '反馈提交失败');
-    } finally {
-      setFeedbackLoading(false);
     }
-  }
-
-  function handleQuestionKeyDown(event) {
-    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-      event.preventDefault();
-      formRef.current?.requestSubmit();
-    }
-  }
-
-  function usePrompt(prompt) {
-    setQuestion(prompt);
-    setError('');
-  }
-
-  function handleFollowUp(questionText) {
-    setQuestion(questionText);
-    setError('');
-    formRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  }
-
-  function scrollToCitation(citationId) {
-    const node = document.getElementById(`citation-${citationId}`);
-    if (!node) return;
-
-    node.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    setHighlightedCitation(citationId);
-
-    if (citationTimeoutRef.current) {
-      window.clearTimeout(citationTimeoutRef.current);
-    }
-    citationTimeoutRef.current = window.setTimeout(() => setHighlightedCitation(''), 1800);
-  }
-
-  function scrollToBriefing() {
-    briefingRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
   return (
-    <div className="consumer-shell">
-      <section className="hero-stage">
-        <div className="hero-inner">
-          <header className="hero-masthead">
-            <div className="brand-cluster">
-              <div className="brand-mark">
-                <Sparkles size={16} />
-              </div>
-              <div className="brand-copy">
-                <span>GoldenSense Retail Agent</span>
-                <strong>黄金判断不是一句喊单，而是一份可追溯的 briefing</strong>
-              </div>
-            </div>
-            <div className={`page-status ${heroStatusTone}`}>
-              {loading ? <Loader2 size={14} className="spinning" /> : <CheckCircle2 size={14} />}
-              {heroStatus}
-            </div>
-          </header>
-
-          <div className="hero-grid">
-            <motion.div className="hero-story" initial="hidden" animate="show" variants={containerVariants}>
-              <motion.div variants={itemVariants} className="eyebrow">
-                <Sparkles size={14} />
-                Education-first Gold Agent
-              </motion.div>
-
-              <motion.div variants={itemVariants} className="hero-copy-block">
-                <p className="hero-kicker">Retail Gold Briefing Engine</p>
-                <h1>现在怎么看黄金</h1>
-                <p className="hero-description">
-                  面向中文散户的黄金投资助手。它不会替你下单，而是把新闻、量化、历史剧本和风险边界整理成一份可以继续追问的判断。
-                </p>
-              </motion.div>
-
-              <motion.div variants={itemVariants} className="hero-band">
-                <div className={`signal-chip ${summary ? stanceTone[summary.stance] : 'tone-outline'}`}>
-                  {summary ? summary.stance : '尚未生成结论'}
-                </div>
-                <div className="signal-chip tone-outline">风险画像：{riskLabels[riskProfile]}</div>
-                <div className="signal-chip tone-outline">主结论视角：{horizonLabels[horizon]}</div>
-                {degradationFlags.length ? <div className="signal-chip tone-risk">数据降级：{degradationFlags.length} 项</div> : null}
-              </motion.div>
-
-              <motion.div variants={itemVariants} className="hero-ticker-shell">
-                <div className="ticker-label">
-                  <Radar size={14} />
-                  Live Signal
-                </div>
-                <motion.div
-                  key={heroTickerText}
-                  className="hero-ticker-current"
-                  initial={{ opacity: 0, y: shouldReduceMotion ? 0 : 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: shouldReduceMotion ? 0.08 : 0.28 }}
-                >
-                  {heroTickerText}
-                </motion.div>
-              </motion.div>
-
-              <motion.form
-                ref={formRef}
-                variants={itemVariants}
-                className="hero-console"
-                onSubmit={handleSubmit}
-              >
-                <div className="console-topline">
-                  <div>
-                    <h2>立即发起一轮分析</h2>
-                    <p>把问题直接丢给 Agent，系统会自动抓取市场快照、新闻与历史类比，并回到同一张判断卡里。</p>
-                  </div>
-                  <button className="submit-button hero-submit" type="submit" disabled={loading}>
-                    {loading ? '分析中…' : '开始分析'}
-                    {loading ? <Loader2 size={16} className="spinning" /> : <ArrowRight size={16} />}
-                  </button>
-                </div>
-
-                <label className="field console-field">
-                  <span>你的问题</span>
-                  <textarea
-                    value={question}
-                    onChange={(event) => setQuestion(event.target.value)}
-                    onKeyDown={handleQuestionKeyDown}
-                    rows={5}
-                    placeholder="例：如果本周美联储偏鹰，黄金 24 小时和 7 天分别要怎么看？"
-                  />
-                </label>
-
-                <div className="selection-strip hero-selection-strip">
-                  <SelectionBadge label="风险偏好" value={riskLabels[riskProfile]} />
-                  <SelectionBadge label="分析周期" value={horizonLabels[horizon]} />
-                  <SelectionBadge label="发送捷径" value="Cmd/Ctrl + Enter" />
-                </div>
-
-                <div className="control-grid">
-                  <SegmentedControl
-                    label="风险偏好"
-                    value={riskProfile}
-                    options={riskOptions}
-                    description={riskDescriptions[riskProfile]}
-                    disabled={loading}
-                    onChange={setRiskProfile}
-                  />
-                  <SegmentedControl
-                    label="分析周期"
-                    value={horizon}
-                    options={horizonOptions}
-                    description={horizonDescriptions[horizon]}
-                    disabled={loading}
-                    onChange={setHorizon}
-                  />
-                </div>
-
-                <div className="prompt-rail">
-                  <div className="rail-label">
-                    <Zap size={14} />
-                    推荐提问轨道
-                  </div>
-                  <div className="prompt-row prompt-rail-grid">
-                    {starterPrompts.map((prompt) => (
-                      <button
-                        key={prompt}
-                        type="button"
-                        className="prompt-chip"
-                        onClick={() => usePrompt(prompt)}
-                        disabled={loading}
-                      >
-                        {prompt}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {error ? (
-                  <div className="error-box hero-status-box">
-                    <AlertTriangle size={16} />
-                    {error}
-                  </div>
-                ) : (
-                  <div className={`status-banner hero-status-box ${loading ? 'pending' : 'idle'}`}>
-                    {loading ? <Loader2 size={16} className="spinning" /> : <Clock3 size={16} />}
-                    {loading
-                      ? 'Agent 正在读取市场、新闻、历史类比并生成三周期判断…'
-                      : '输入越具体，系统越容易把判断收敛成你真正能执行的下一步。'}
-                  </div>
-                )}
-              </motion.form>
-
-              <motion.button variants={itemVariants} type="button" className="hero-scroll-cue" onClick={scrollToBriefing}>
-                <span>向下查看完整 briefing 与证据</span>
-                <ChevronDown size={16} />
-              </motion.button>
-            </motion.div>
-
-            <motion.aside className="hero-intelligence" initial="hidden" animate="show" variants={containerVariants}>
-              <motion.article variants={itemVariants} className="intel-card intel-card-primary">
-                <div className="intel-card-head">
-                  <span className="intel-label">Current Thesis</span>
-                  <span className={`intel-tone ${summary ? stanceTone[summary.stance] : 'tone-outline'}`}>
-                    {summary ? summary.confidence_band : '待生成'}
-                  </span>
-                </div>
-                <strong>{summary ? summary.stance : '等待分析'}</strong>
-                <p>{summary ? summary.reasons[0] : '提交一个更具体的问题后，这里会先亮出本轮主结论与建议动作。'}</p>
-                <div className="intel-chip-row">
-                  <span className={`signal-chip ${summary ? stanceTone[summary.stance] : 'tone-outline'}`}>
-                    {summary?.action || '准备中'}
-                  </span>
-                  <span className="signal-chip tone-outline">
-                    {summary ? horizonLabels[summary.horizon] : horizonLabels[horizon]}
-                  </span>
-                </div>
-              </motion.article>
-
-              <motion.article variants={itemVariants} className="intel-card">
-                <div className="intel-card-head">
-                  <span className="intel-label">Signal Grid</span>
-                  <TrendingUp size={16} />
-                </div>
-                <div className="hero-stat-grid">
-                  {analysisStats.map((item) => (
-                    <InsightStat key={item.label} label={item.label} value={item.value} tone="hero" />
-                  ))}
-                </div>
-              </motion.article>
-
-              <motion.article variants={itemVariants} className="intel-card">
-                <div className="intel-card-head">
-                  <span className="intel-label">Workflow</span>
-                  <Waves size={16} />
-                </div>
-                <ol className="hero-steps">
-                  {workflowSteps.map((step) => (
-                    <li key={step}>{step}</li>
-                  ))}
-                </ol>
-              </motion.article>
-
-              <motion.article variants={itemVariants} className="intel-card intel-card-preview">
-                <div className="intel-card-head">
-                  <span className="intel-label">Question Preview</span>
-                  <Newspaper size={16} />
-                </div>
-                <p className="intel-preview-text">{deferredQuestion || '先输入你的问题，再让 Agent 开始分析。'}</p>
-                <div className="intel-split">
-                  <div>
-                    <span className="intel-label">锁定画像</span>
-                    <strong>{riskLabels[riskProfile]}</strong>
-                  </div>
-                  <div>
-                    <span className="intel-label">分析镜头</span>
-                    <strong>{horizonTags[horizon]}</strong>
-                  </div>
-                </div>
-              </motion.article>
-            </motion.aside>
-          </div>
+    <main className="page-surface agent-page">
+      <section className="terminal-header">
+        <div>
+          <p className="eyebrow">Retail Suitability Workflow</p>
+          <h1>风险画像 Agent</h1>
+          <p>
+            先收集完整问卷，再把稳定预测解释成风险适配建议。输出包含证据、失效条件和禁止执行条件，不提供下单指令。
+          </p>
+        </div>
+        <div className={`profile-score level-${profileLevel === '高' ? 'high' : profileLevel === '中' ? 'medium' : 'low'}`}>
+          <span>问卷风险</span>
+          <strong>{profileLevel}</strong>
+          <small>score {profileScore}</small>
         </div>
       </section>
 
-      <section className="content-shell">
-        <div className="content-inner">
-          <div className="section-ribbon">
-            <span className="section-ribbon-label">Today&apos;s Lens</span>
-            <div className="section-ribbon-chips">
-              <span className={`signal-chip ${summary ? stanceTone[summary.stance] : 'tone-outline'}`}>{quickMood}</span>
-              <span className="signal-chip tone-outline">主观察周期：{horizonLabels[horizon]}</span>
-              <span className="signal-chip tone-outline">当前画像：{riskLabels[riskProfile]}</span>
-            </div>
+      <section className="agent-layout">
+        <form className="agent-form" onSubmit={handleSubmit}>
+          <PanelTitle icon={SlidersHorizontal} title="分析输入" subtitle="问题、周期和基础风险偏好" />
+
+          <label className="field">
+            <span>你的问题</span>
+            <textarea
+              value={question}
+              onChange={(event) => setQuestion(event.target.value)}
+              rows={6}
+              placeholder="例：如果 CPI 高于预期，黄金短线和一周视角分别要怎么看？"
+            />
+          </label>
+
+          <div className="prompt-bank">
+            {starterPrompts.map((prompt) => (
+              <button key={prompt} type="button" onClick={() => setQuestion(prompt)}>
+                {prompt}
+              </button>
+            ))}
           </div>
 
-          <section className="workspace-grid">
-            <motion.section
-              ref={briefingRef}
-              className="panel panel-briefing"
-              initial="hidden"
-              animate="show"
-              variants={containerVariants}
-            >
-              <motion.div variants={itemVariants} className="panel-head">
-                <div>
-                  <h2>本轮判断 Briefing</h2>
-                  <p>先把结论、风险和理由讲清楚，再决定是否继续深挖。</p>
-                </div>
-                <div className={`timing-chip ${loading ? 'pending' : ''}`}>
-                  {loading ? <Loader2 size={14} className="spinning" /> : <Clock3 size={14} />}
-                  {analysis?.timing_ms?.total ? `${analysis.timing_ms.total} ms` : '未执行'}
-                </div>
-              </motion.div>
+          <div className="control-pair">
+            <SegmentedControl
+              label="风险承受能力"
+              value={riskProfile}
+              options={[
+                ['conservative', riskLabels.conservative],
+                ['balanced', riskLabels.balanced],
+                ['aggressive', riskLabels.aggressive],
+              ]}
+              onChange={setRiskProfile}
+            />
+            <SegmentedControl
+              label="分析周期"
+              value={horizon}
+              options={Object.entries(horizonLabels)}
+              onChange={setHorizon}
+            />
+          </div>
 
-              {loading && !summary ? (
-                <motion.div variants={itemVariants} className="loading-panel">
-                  <div className="decision-banner waiting">
-                    <div className="decision-copy">
-                      <span className="summary-kicker">处理中</span>
-                      <h3>Agent 正在生成本轮结论</h3>
-                      <p>这一步会把市场快照、量化预测、新闻和历史类比压缩成一张可读的结论卡。</p>
-                    </div>
-                    <Loader2 size={28} className="spinning" />
-                  </div>
-                  <div className="loading-grid">
-                    {['读取快照', '抓取新闻', '合成判断', '收敛建议'].map((item) => (
-                      <div key={item} className="loading-card">
-                        <span>{item}</span>
-                        <div className="loading-line" />
-                        <div className="loading-line short" />
-                      </div>
-                    ))}
-                  </div>
-                </motion.div>
-              ) : summary ? (
-                <>
-                  <motion.div variants={itemVariants} className="decision-banner">
-                    <div className="decision-copy">
-                      <span className="summary-kicker">主结论</span>
-                      <h3>{summary.action}</h3>
-                      <p>{summary.reasons[0]}</p>
-                    </div>
-                    <div className={`decision-tone ${stanceTone[summary.stance] || 'tone-neutral'}`}>
-                      <strong>{summary.stance}</strong>
-                      <span>{summary.confidence_band}置信度</span>
-                    </div>
-                  </motion.div>
+          <PanelTitle icon={WalletCards} title="完整风险问卷" subtitle="用于限制建议强度，不改变市场预测基线" />
 
-                  <motion.div variants={itemVariants} className="briefing-stats">
-                    {analysisStats.map((item) => (
-                      <InsightStat key={item.label} label={item.label} value={item.value} />
-                    ))}
-                  </motion.div>
+          <div className="questionnaire-grid">
+            <SelectField
+              label="风险容量"
+              value={investorProfile.risk_capacity}
+              options={selectMeta.risk_capacity}
+              onChange={(value) => updateInvestorProfile('risk_capacity', value)}
+            />
+            <SelectField
+              label="交易周期"
+              value={investorProfile.trading_horizon}
+              options={selectMeta.trading_horizon}
+              onChange={(value) => updateInvestorProfile('trading_horizon', value)}
+            />
+            <SelectField
+              label="经验水平"
+              value={investorProfile.experience_level}
+              options={selectMeta.experience_level}
+              onChange={(value) => updateInvestorProfile('experience_level', value)}
+            />
+            <SelectField
+              label="已有持仓"
+              value={investorProfile.current_position}
+              options={selectMeta.current_position}
+              onChange={(value) => updateInvestorProfile('current_position', value)}
+            />
+            <NumberField
+              label="资金占比"
+              suffix="%"
+              value={investorProfile.capital_allocation_pct}
+              min="0"
+              max="100"
+              onChange={(value) => updateInvestorProfile('capital_allocation_pct', value)}
+            />
+            <NumberField
+              label="最大回撤"
+              suffix="%"
+              value={investorProfile.max_drawdown_pct}
+              min="0"
+              max="100"
+              onChange={(value) => updateInvestorProfile('max_drawdown_pct', value)}
+            />
+            <SelectField
+              label="流动性需求"
+              value={investorProfile.liquidity_need}
+              options={selectMeta.liquidity_need}
+              onChange={(value) => updateInvestorProfile('liquidity_need', value)}
+            />
+            <SelectField
+              label="杠杆态度"
+              value={investorProfile.leverage_attitude}
+              options={selectMeta.leverage_attitude}
+              onChange={(value) => updateInvestorProfile('leverage_attitude', value)}
+            />
+            <SelectField
+              label="投资目标"
+              value={investorProfile.investment_goal}
+              options={selectMeta.investment_goal}
+              onChange={(value) => updateInvestorProfile('investment_goal', value)}
+            />
+          </div>
 
-                  <motion.div variants={itemVariants} className="summary-main">
-                    <div>
-                      <span className="summary-kicker">当前倾向</span>
-                      <strong>{summary.stance}</strong>
-                    </div>
-                    <div>
-                      <span className="summary-kicker">建议动作</span>
-                      <strong>{summary.action}</strong>
-                    </div>
-                    <div>
-                      <span className="summary-kicker">观察周期</span>
-                      <strong>{horizonLabels[summary.horizon]}</strong>
-                    </div>
-                  </motion.div>
+          <RiskBudgetPanel budget={riskBudget} profile={investorProfile} />
+          <SuitabilityGatePanel gate={suitabilityGate} />
 
-                  <motion.div variants={itemVariants} className="summary-columns">
-                    <SummaryList title="为什么这么看" items={summary.reasons} />
-                    <SummaryList title="什么情况下失效" items={summary.invalidators} />
-                  </motion.div>
+          {error ? <ErrorPanel title="Agent 分析失败" message={error} /> : null}
 
-                  <motion.div variants={itemVariants} className="briefing-sidecar">
-                    <div className={`risk-banner ${riskBanner?.level || 'medium'}`}>
-                      <strong>{riskBanner?.title || '等待分析'}</strong>
-                      <p>{riskBanner?.message || '执行分析后，这里会显示本轮最关键的风险提醒。'}</p>
-                    </div>
+          <button className="primary-action" type="submit" disabled={loading}>
+            {loading ? <Loader2 size={17} className="spinning" /> : <BrainCircuit size={17} />}
+            {loading ? '生成 briefing 中' : '生成风险适配 briefing'}
+          </button>
+        </form>
 
-                    <div className="focus-card">
-                      <div className="focus-card-head">
-                        <span>你当前关注的周期</span>
-                        <strong>{selectedForecast ? horizonLabels[selectedForecast.horizon] : horizonLabels[horizon]}</strong>
-                      </div>
-                      {selectedForecast ? (
-                        <>
-                          <div className={`signal-chip ${stanceTone[selectedForecast.stance] || 'tone-neutral'}`}>
-                            {selectedForecast.stance}
-                          </div>
-                          <p>
-                            {selectedForecast.action}，{selectedForecast.confidence_band}置信度，概率约{' '}
-                            {(selectedForecast.probability * 100).toFixed(1)}%。
-                          </p>
-                          <span className="focus-note">{basisLabels[selectedForecast.basis] || selectedForecast.basis}</span>
-                        </>
-                      ) : (
-                        <p>分析完成后，这里会突出当前所选周期的重点判断。</p>
-                      )}
-                    </div>
-                  </motion.div>
+        <aside className="agent-context">
+          <PanelTitle icon={LockKeyhole} title="Agent 边界" subtitle="工业级研究终端的输出纪律" />
+          <ul className="boundary-list">
+            <li>预测基线来自行情和量化服务，不被用户问题改写。</li>
+            <li>问卷只影响风险适配、建议强度和禁止执行条件。</li>
+            <li>数据陈旧、证据冲突、提示注入或过度确定性语言会强制降级。</li>
+            <li>所有结论必须能回到证据卡、引用或降级标记。</li>
+          </ul>
+          {selectedForecast ? (
+            <div className="sticky-forecast">
+              <span>{horizonShortLabels[selectedForecast.horizon]}</span>
+              <strong>{selectedForecast.stance}</strong>
+              <small>{forecastBasisLabel(selectedForecast)}</small>
+              <p>{selectedForecast.reasons?.[0]}</p>
+            </div>
+          ) : (
+            <div className="sticky-forecast muted">
+              <span>等待分析</span>
+              <strong>暂无 briefing</strong>
+              <p>提交后这里会保留当前周期的稳定预测基线。</p>
+            </div>
+          )}
+          <PositionModePanel budget={riskBudget} profile={investorProfile} />
+        </aside>
+      </section>
 
-                  <motion.p variants={itemVariants} className="disclaimer">
-                    {summary.disclaimer}
-                  </motion.p>
+      <section ref={resultRef} className="analysis-output">
+        <SectionHeader
+          kicker="Agent Briefing"
+          title="风险适配分析"
+          description="输出方向、情景、失效条件和禁止执行条件，避免把研究解读误读成下单指令。"
+        />
 
-                  <motion.div variants={itemVariants} className="feedback-row">
-                    <span>这条回答对你有帮助吗？</span>
-                    <button
-                      type="button"
-                      className="feedback-button"
-                      onClick={() => submitFeedback('helpful')}
-                      disabled={feedbackLoading}
-                    >
-                      有帮助
-                    </button>
-                    <button
-                      type="button"
-                      className="feedback-button ghost"
-                      onClick={() => submitFeedback('not_helpful')}
-                      disabled={feedbackLoading}
-                    >
-                      没帮助
-                    </button>
-                  </motion.div>
-                  {feedbackStatus ? (
-                    <motion.p variants={itemVariants} className="feedback-status">
-                      {feedbackStatus}
-                    </motion.p>
-                  ) : null}
+        {!analysis && !loading ? (
+          <PlaceholderPanel icon={BookOpenCheck} text="填写问卷并提交后，这里会展示完整 briefing、证据卡和引用。" />
+        ) : null}
 
-                  <motion.div variants={itemVariants} className="follow-up-block">
-                    <div className="section-mini-head">
-                      <div>
-                        <h3>继续追问</h3>
-                        <span>点一下就能把问题带回输入区，继续推进这一轮分析。</span>
-                      </div>
-                    </div>
-                    <div className="follow-up-grid">
-                      {followUpQuestions.map((item) => (
-                        <button key={item} type="button" className="follow-up-button" onClick={() => handleFollowUp(item)}>
-                          <span>{item}</span>
-                          <ArrowRight size={16} />
-                        </button>
-                      ))}
-                    </div>
-                  </motion.div>
-                </>
-              ) : (
-                <motion.div variants={itemVariants} className="empty-briefing">
-                  <BrainCircuit size={22} />
-                  <div>
-                    <h3>先发起一次问题</h3>
-                    <p>系统会返回“方向 + 风险 + 证据 + 失效条件”的完整回答，并把三周期判断一起展开。</p>
-                  </div>
-                </motion.div>
-              )}
-            </motion.section>
+        {loading ? (
+          <PlaceholderPanel icon={Loader2} text="Agent 正在读取预测基线、新闻、历史类比和问卷门控。" spinning />
+        ) : null}
 
-            <motion.section className="panel panel-sidecar" initial="hidden" animate="show" variants={containerVariants}>
-              <motion.div variants={itemVariants} className="panel-head">
-                <div>
-                  <h2>上下文与自动情报</h2>
-                  <p>系统自动抓取的新闻、你的最近问题与当前这轮交互节奏。</p>
-                </div>
-                <MessagesSquare size={18} />
-              </motion.div>
-
-              <div className="side-stack">
-                <motion.div variants={itemVariants} className="side-surface auto-news-block">
-                  <div className="section-mini-head">
-                    <div>
-                      <h3>系统自动抓取的新闻</h3>
-                      <span>{recentNews.length ? `${recentNews.length} 条已纳入本轮` : '提交问题后自动抓取'}</span>
-                    </div>
-                    <div className="mini-badge">无需手动贴新闻</div>
-                  </div>
-                  <div className="news-brief-list">
-                    {recentNews.length === 0 ? (
-                      <div className="placeholder-card">
-                        <BrainCircuit size={18} />
-                        提交问题后，系统会自动获取最近的黄金/宏观新闻，并把它们融入分析。
-                      </div>
-                    ) : (
-                      recentNews.slice(0, 3).map((item) => (
-                        <article key={item.event_id} className="news-brief-card">
-                          <div className="news-brief-meta">
-                            <span>{item.source}</span>
-                            <span>{formatDateTime(item.published_at)}</span>
-                          </div>
-                          <h3>{item.title}</h3>
-                          <p>{item.summary}</p>
-                        </article>
-                      ))
-                    )}
-                  </div>
-                </motion.div>
-
-                <motion.div variants={itemVariants} className="side-surface conversation-block">
-                  <div className="section-mini-head">
-                    <div>
-                      <h3>最近对话</h3>
-                      <span>保留最近几轮提问，方便你继续追问与修正视角。</span>
-                    </div>
-                  </div>
-
-                  <div className="chat-stack">
-                    {conversation.length === 0 ? (
-                      <div className="chat-empty">
-                        <BrainCircuit size={20} />
-                        <p>提交一次问题后，这里会留下你的提问和本轮最核心的一句判断。</p>
-                      </div>
-                    ) : (
-                      conversation.map((item) => (
-                        <div key={item.id} className={`chat-bubble ${item.role}`}>
-                          <span>{item.role === 'user' ? '你' : 'GoldenSense'}</span>
-                          <p>{item.content}</p>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </motion.div>
+        {summary ? (
+          <div className="briefing-grid">
+            <section className="decision-panel">
+              <div className="decision-head">
+                <span className={`stance-badge ${stanceClass[summary.stance] || 'tone-neutral'}`}>{summary.stance}</span>
+                <span>{summary.confidence_band}置信度</span>
               </div>
-            </motion.section>
-          </section>
+              <h2>{summary.action}</h2>
+              <p>{summary.reasons?.[0]}</p>
+              <div className={`risk-banner level-${riskBanner?.level || 'medium'}`}>
+                <strong>{riskBanner?.title}</strong>
+                <span>{riskBanner?.message}</span>
+              </div>
+              <div className="reason-columns">
+                <SummaryList title="关键理由" items={summary.reasons || []} />
+                <SummaryList title="禁止执行 / 失效条件" items={summary.invalidators || []} />
+              </div>
+              <p className="disclaimer">{summary.disclaimer}</p>
+              <div className="feedback-row">
+                <span>这条 briefing 是否有帮助？</span>
+                <button type="button" onClick={() => submitFeedback('helpful')}>
+                  有帮助
+                </button>
+                <button type="button" onClick={() => submitFeedback('not_helpful')}>
+                  没帮助
+                </button>
+              </div>
+              {feedbackStatus ? <p className="feedback-status">{feedbackStatus}</p> : null}
+            </section>
 
-          <section className="insight-grid">
-            <motion.section className="panel" initial="hidden" animate="show" variants={containerVariants}>
-              <motion.div variants={itemVariants} className="panel-head">
-                <div>
-                  <h2>三周期参考</h2>
-                  <p>同一批新闻与市场快照下的 T+1 / T+7 / T+30，对比后更容易看清短中期分歧。</p>
-                </div>
-                <BadgeAlert size={18} />
-              </motion.div>
+            <section className="evidence-panel">
+              <PanelTitle icon={FileSearch} title="证据卡片" subtitle={`${evidenceCards.length} 张证据 / ${citations.length} 条引用`} />
+              <div className="evidence-list">
+                {evidenceCards.map((card) => (
+                  <article key={card.id} className={`evidence-card ${card.direction}`}>
+                    <span>{card.signal_type}</span>
+                    <h3>{card.title}</h3>
+                    <p>{card.takeaway}</p>
+                    <small>{card.citation_ids.map((id) => `#${id}`).join(' ')}</small>
+                  </article>
+                ))}
+              </div>
+            </section>
+          </div>
+        ) : null}
 
-              <motion.div variants={itemVariants} className="multi-horizon-grid">
-                {horizonForecasts.length === 0 ? (
-                  <div className="placeholder-card">
-                    <Clock3 size={18} />
-                    分析完成后，这里会同时给出 T+1、T+7、T+30 的判断与原因。
-                  </div>
-                ) : (
-                  horizonForecasts.map((item) => (
-                    <article
-                      key={item.horizon}
-                      className={`horizon-card ${item.horizon === horizon ? 'active' : ''} ${stanceTone[item.stance] || 'tone-neutral'}`}
-                    >
-                      <div className="horizon-card-head">
-                        <span>{horizonTags[item.horizon]}</span>
-                        <span>{basisLabels[item.basis] || item.basis}</span>
-                      </div>
-                      <strong>{item.stance}</strong>
-                      <div className="horizon-card-stats">
-                        <span>{item.action}</span>
-                        <span>{item.confidence_band}置信度</span>
-                        <span>{(item.probability * 100).toFixed(1)}%</span>
-                      </div>
-                      <ul>
-                        {item.reasons.slice(0, 3).map((reason) => (
-                          <li key={reason}>{reason}</li>
-                        ))}
-                      </ul>
+        {summary ? <ExecutionScenarioPanel scenarios={executionScenarios} /> : null}
+
+        {analysis ? (
+          <section className="post-analysis-grid">
+            <div className="panel-block">
+              <PanelTitle icon={Newspaper} title="本轮新闻" subtitle={`${recentNews.length} 条`} />
+              <div className="compact-list">
+                {recentNews.length ? (
+                  recentNews.slice(0, 4).map((item) => (
+                    <article key={item.event_id}>
+                      <span>{item.source} · {formatDateTime(item.published_at)}</span>
+                      <strong>{item.title}</strong>
+                      <p>{item.summary}</p>
                     </article>
                   ))
-                )}
-              </motion.div>
-            </motion.section>
-
-            <motion.section className="panel" initial="hidden" animate="show" variants={containerVariants}>
-              <motion.div variants={itemVariants} className="panel-head">
-                <div>
-                  <h2>证据卡片</h2>
-                  <p>每张卡只讲一个观点，并且可以直接跳到对应引用，不让“结论”脱离证据。</p>
-                </div>
-                <FileSearch size={18} />
-              </motion.div>
-
-              <motion.div variants={itemVariants} className="evidence-grid">
-                {evidenceCards.length === 0 ? (
-                  <div className="placeholder-card">
-                    <FileSearch size={18} />
-                    分析完成后，这里会把市场、量化、新闻、历史和风险拆成独立证据卡。
-                  </div>
                 ) : (
-                  evidenceCards.map((card) => {
-                    const Icon = signalTypeMeta[card.signal_type]?.icon || FileSearch;
-                    return (
-                      <div key={card.id} className={`evidence-card ${card.direction}`}>
-                        <div className="evidence-head">
-                          <span className="evidence-label">
-                            <Icon size={14} />
-                            {signalTypeMeta[card.signal_type]?.label || card.signal_type}
-                          </span>
-                          <span className="evidence-direction">{card.direction}</span>
-                        </div>
-                        <h3>{card.title}</h3>
-                        <p>{card.takeaway}</p>
-                        <div className="citation-pills">
-                          {card.citation_ids.map((id) => (
-                            <button key={id} type="button" onClick={() => scrollToCitation(id)}>
-                              #{id}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-                    );
-                  })
+                  <p>本轮没有可展示的新闻条目。</p>
                 )}
-              </motion.div>
-            </motion.section>
-          </section>
-
-          <section className="panel citation-panel">
-            <div className="panel-head">
-              <div>
-                <h2>可追溯引用</h2>
-                <p>所有用户可见结论都能回到证据文本，而不是只留下一个模糊结论。</p>
               </div>
-              <ShieldCheck size={18} />
             </div>
-
-            <div className="citation-list">
-              {citations.length === 0 ? (
-                <div className="placeholder-card">
-                  <ShieldCheck size={18} />
-                  当分析结果返回后，引用会集中展示在这里。
-                </div>
-              ) : (
-                citations.map((citation) => (
-                  <article
-                    key={citation.id}
-                    id={`citation-${citation.id}`}
-                    className={`citation-item ${highlightedCitation === citation.id ? 'highlighted' : ''}`}
-                  >
-                    <div className="citation-meta">
-                      <span>{citation.id}</span>
-                      <span>{citation.source_type}</span>
-                    </div>
-                    <h3>{citation.label}</h3>
+            <div className="panel-block">
+              <PanelTitle icon={ShieldCheck} title="可追溯引用" subtitle={`${citations.length} 条`} />
+              <div className="compact-list">
+                {citations.map((citation) => (
+                  <article key={citation.id}>
+                    <span>{citation.id} · {citation.source_type}</span>
+                    <strong>{citation.label}</strong>
                     <p>{citation.excerpt}</p>
                     {citation.url ? (
                       <a href={citation.url} target="_blank" rel="noreferrer">
-                        打开原始来源
-                        <ExternalLink size={14} />
+                        打开来源
+                        <ExternalLink size={13} />
                       </a>
                     ) : null}
                   </article>
-                ))
-              )}
+                ))}
+              </div>
             </div>
           </section>
-        </div>
+        ) : null}
       </section>
+      <TerminalFooter
+        left="GoldenSense Agent Workbench"
+        right="问卷、门控、证据与引用统一在 Agent 页收口"
+      />
+    </main>
+  );
+}
+
+function CoreThesisPanel({ thesis }) {
+  return (
+    <section className={`thesis-panel tone-${thesis.tone}`}>
+      <PanelTitle icon={Target} title="今日核心结论" subtitle={thesis.kicker} />
+      <div className="thesis-body">
+        <strong>{thesis.headline}</strong>
+        <p>{thesis.summary}</p>
+      </div>
+      <div className="thesis-brief-list">
+        <MetricLine label="最强支撑" value={thesis.support} />
+        <MetricLine label="最大压制" value={thesis.pressure} />
+        <MetricLine label="关键失效" value={thesis.invalidator} />
+      </div>
+    </section>
+  );
+}
+
+function DriverMatrix({ drivers }) {
+  return (
+    <section className="driver-panel">
+      <PanelTitle icon={Crosshair} title="驱动贡献矩阵" subtitle="四类指标对黄金方向的净贡献" />
+      <div className="driver-list">
+        {drivers.map((driver) => (
+          <article key={driver.id} className={`driver-row ${driver.tone}`}>
+            <div>
+              <strong>{driver.title}</strong>
+              <span>{driver.summary}</span>
+            </div>
+            <div className="driver-meter" aria-label={`${driver.title} contribution ${driver.score}`}>
+              <i style={{ width: `${Math.max(8, Math.abs(driver.score) * 100)}%` }} />
+            </div>
+            <strong>{driver.scoreLabel}</strong>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function CatalystCalendar({ events }) {
+  return (
+    <section className="catalyst-panel">
+      <PanelTitle icon={CalendarDays} title="风险催化日历" subtitle="未来几天最容易改变黄金定价的事件" />
+      <div className="catalyst-list">
+        {events.map((event) => (
+          <article key={event.name} className={`catalyst-item impact-${event.impact}`}>
+            <span>{event.window}</span>
+            <strong>{event.name}</strong>
+            <p>{event.watch}</p>
+            <small>{event.impactLabel}</small>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ScenarioPanel({ scenarios }) {
+  return (
+    <section className="scenario-panel">
+      <PanelTitle icon={BookOpenCheck} title="三情景推演" subtitle="把单点预测拆成可观察路径" />
+      <div className="scenario-grid">
+        {scenarios.map((scenario) => (
+          <article key={scenario.name} className={`scenario-card ${scenario.tone}`}>
+            <span>{scenario.name}</span>
+            <strong>{scenario.path}</strong>
+            <p>{scenario.trigger}</p>
+            <small>{scenario.invalidator}</small>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function GoldTrendPanel({ history, loading }) {
+  const points = history?.points || [];
+  const keyNodes = history?.key_nodes || [];
+  const chart = useMemo(() => buildTrendChart(points, keyNodes), [points, keyNodes]);
+  const sourceLabel = history?.source || '等待数据';
+  const sourceTone = sourceLabel.includes('fallback') || sourceLabel.includes('synthetic') ? '降级行情源' : '真实行情源';
+
+  return (
+    <section className="gold-trend-panel">
+      <div className="trend-panel-head">
+        <PanelTitle icon={LineChart} title="黄金价格走势" subtitle={`${sourceTone} · ${sourceLabel}`} />
+        <div className="trend-stat-strip">
+          <MetricLine label="样本点" value={points.length ? `${points.length}` : loading ? '读取中' : 'N/A'} />
+          <MetricLine label="关键波动节点" value={`${keyNodes.length}`} />
+        </div>
+      </div>
+
+      {points.length >= 2 ? (
+        <div className="trend-chart-layout">
+          <div className="trend-chart-shell" aria-label="Gold price trend chart">
+            <svg viewBox="0 0 920 280" role="img" aria-label="黄金价格走势折线图">
+              <defs>
+                <linearGradient id="goldTrendFill" x1="0" x2="0" y1="0" y2="1">
+                  <stop offset="0%" stopColor="rgba(201,154,56,0.32)" />
+                  <stop offset="100%" stopColor="rgba(201,154,56,0)" />
+                </linearGradient>
+              </defs>
+              <path className="trend-area" d={chart.areaD} />
+              <path className="trend-line" d={chart.pathD} />
+              {chart.keyMarkers.map((marker) => (
+                <g key={`${marker.date}-${marker.price}`} className={`trend-marker ${marker.direction}`}>
+                  <line x1={marker.x} x2={marker.x} y1="24" y2="252" />
+                  <circle cx={marker.x} cy={marker.y} r="7">
+                    <title>{marker.reason}</title>
+                  </circle>
+                  <text x={marker.x} y={Math.max(18, marker.y - 14)} textAnchor="middle">
+                    {formatPercent(marker.change_pct)}
+                  </text>
+                </g>
+              ))}
+            </svg>
+            <div className="trend-axis">
+              <span>{points[0]?.date}</span>
+              <strong>{formatPrice(chart.latestPrice)}</strong>
+              <span>{points[points.length - 1]?.date}</span>
+            </div>
+          </div>
+          <div className="key-node-panel">
+            <strong>关键波动节点</strong>
+            <div className="key-node-list">
+              {keyNodes.length ? (
+                keyNodes.slice(0, 5).map((node) => (
+                  <article key={`${node.date}-${node.price}`} className={`key-node-card ${node.direction}`}>
+                    <span>{node.date} · {formatPercent(node.change_pct)} · {formatPrice(node.price)}</span>
+                    <p>{node.reason}</p>
+                    <div>
+                      {(node.factors || []).slice(0, 3).map((factor) => (
+                        <small key={factor}>{factor}</small>
+                      ))}
+                    </div>
+                  </article>
+                ))
+              ) : (
+                <p>当前样本期内没有单日超过 2% 的黄金价格变动。</p>
+              )}
+            </div>
+          </div>
+        </div>
+      ) : (
+        <PlaceholderPanel icon={LineChart} text={loading ? '正在读取真实黄金历史行情。' : '暂无可展示的黄金历史行情。'} />
+      )}
+    </section>
+  );
+}
+
+function RiskBudgetPanel({ budget, profile }) {
+  return (
+    <section className={`risk-budget-panel level-${budget.level}`}>
+      <PanelTitle icon={Calculator} title="风险预算计算器" subtitle="以 10 万资金估算本轮风险容量" />
+      <div className="budget-grid">
+        <MetricLine label="计划黄金暴露" value={formatCurrency(budget.plannedExposure)} />
+        <MetricLine label="最大可承受亏损" value={formatCurrency(budget.maxLoss)} />
+        <MetricLine label="建议暴露上限" value={formatCurrency(budget.suggestedExposure)} />
+        <MetricLine label="持仓模式" value={positionLabels[profile.current_position]} />
+      </div>
+      <p>{budget.guidance}</p>
+    </section>
+  );
+}
+
+function SuitabilityGatePanel({ gate }) {
+  return (
+    <section className={`suitability-gate-panel level-${gate.level}`}>
+      <PanelTitle icon={ShieldCheck} title="适当性门控预检" subtitle={gate.subtitle} />
+      <div className="gate-decision-row">
+        <strong>{gate.decision}</strong>
+        <span>{gate.scoreLabel}</span>
+      </div>
+      <p>{gate.summary}</p>
+      <div className="gate-rule-list">
+        {gate.rules.map((rule) => (
+          <span key={rule}>{rule}</span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function PositionModePanel({ budget, profile }) {
+  return (
+    <section className="position-mode-panel">
+      <PanelTitle icon={WalletCards} title="持仓模式" subtitle={positionLabels[profile.current_position]} />
+      <p>{budget.positionGuidance}</p>
+      <div className="position-rule-stack">
+        {budget.rules.map((rule) => (
+          <span key={rule}>{rule}</span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ExecutionScenarioPanel({ scenarios }) {
+  return (
+    <section className="execution-scenario-panel">
+      <SectionHeader
+        kicker="Execution Scenarios"
+        title="三情景执行框架"
+        description="把 Agent 结论转成可观察、可停止、可复盘的执行边界。"
+      />
+      <div className="execution-scenario-grid">
+        {scenarios.map((scenario) => (
+          <article key={scenario.name} className={`execution-card ${scenario.tone}`}>
+            <span>{scenario.name}</span>
+            <strong>{scenario.action}</strong>
+            <p>{scenario.condition}</p>
+            <small>{scenario.stop}</small>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ForecastCard({ forecast }) {
+  return (
+    <article className={`forecast-card ${stanceClass[forecast.stance] || 'tone-neutral'}`}>
+      <div>
+        <span>{horizonShortLabels[forecast.horizon] || forecast.horizon}</span>
+        <small>{forecastBasisLabel(forecast)}</small>
+      </div>
+      <strong>{forecast.stance}</strong>
+      <p>{forecast.action} · {forecast.confidence_band}置信度 · {(forecast.probability * 100).toFixed(1)}%</p>
+      <ul>
+        {(forecast.reasons || []).slice(0, 3).map((reason) => (
+          <li key={reason}>{reason}</li>
+        ))}
+      </ul>
+    </article>
+  );
+}
+
+function IndicatorGroupCard({ group }) {
+  const Icon = groupIcons[group.id] || Gauge;
+  const [openIndicatorId, setOpenIndicatorId] = useState(null);
+  return (
+    <article className={`indicator-card status-${group.status}`}>
+      <div className="indicator-card-head">
+        <span>
+          <Icon size={16} />
+          {group.title}
+        </span>
+        <QualityDot status={group.status} />
+      </div>
+      <p>{group.summary}</p>
+      <div className="score-line">
+        <span>score {group.score.toFixed(2)}</span>
+        <span>{group.freshness_seconds}s</span>
+      </div>
+      <div className="indicator-list">
+        {group.indicators.map((indicator) => {
+          const isOpen = openIndicatorId === indicator.id;
+          return (
+            <div key={indicator.id} className={`indicator-audit-shell direction-${indicator.direction}`}>
+              <button
+                type="button"
+                className="indicator-row"
+                aria-label={`审计 ${indicator.label}`}
+                aria-expanded={isOpen}
+                aria-controls={`indicator-audit-${indicator.id}`}
+                onClick={() => setOpenIndicatorId(isOpen ? null : indicator.id)}
+              >
+                <div>
+                  <strong>{indicator.label}</strong>
+                  <span>{indicator.source}</span>
+                </div>
+                <div>
+                  <strong>{indicator.value}</strong>
+                  <span>{indicatorDirectionLabel[indicator.direction] || indicator.direction}</span>
+                </div>
+                <span className="audit-trigger">
+                  <ChevronRight size={14} className={isOpen ? 'open' : ''} />
+                  审计
+                </span>
+              </button>
+              {isOpen ? <IndicatorAuditDetails group={group} indicator={indicator} /> : null}
+            </div>
+          );
+        })}
+      </div>
+    </article>
+  );
+}
+
+function IndicatorAuditDetails({ group, indicator }) {
+  const status = indicator.status || group.status || 'unknown';
+  const freshness = indicator.freshness_seconds ?? group.freshness_seconds;
+  const degradedReason = indicator.degraded_reason || group.degraded_reason || '无';
+
+  return (
+    <section id={`indicator-audit-${indicator.id}`} className="indicator-audit-drawer">
+      <div className="audit-drawer-head">
+        <div>
+          <span>{group.title}</span>
+          <h3>指标证据审计</h3>
+        </div>
+        <QualityDot status={status} />
+      </div>
+      <div className="audit-fact-grid">
+        <span>来源 {indicator.source || 'N/A'}</span>
+        <span>状态 {status}</span>
+        <span>新鲜度 {freshness != null ? `${freshness}s` : 'N/A'}</span>
+        <span>降级原因 {degradedReason}</span>
+        <span>研究口径 指标用于解释市场基线，不直接改写预测价格。</span>
+        <span>数值口径 {indicator.unit ? `${indicator.numeric_value ?? 'N/A'} ${indicator.unit}` : indicator.numeric_value ?? indicator.value ?? 'N/A'}</span>
+      </div>
+      {indicator.source_url ? (
+        <a className="audit-source-link" href={indicator.source_url} target="_blank" rel="noreferrer">
+          打开原始来源
+          <ExternalLink size={13} />
+        </a>
+      ) : (
+        <p className="muted-copy">该指标当前使用内部快照或代理数据，暂无外部链接。</p>
+      )}
+    </section>
+  );
+}
+
+function QualityPanel({ quality, flags }) {
+  return (
+    <section className="panel-block">
+      <PanelTitle icon={DatabaseZap} title="数据质量" subtitle={quality?.status || 'unknown'} />
+      <div className="quality-list">
+        <MetricLine label="指标状态" value={quality?.indicator_status || 'N/A'} />
+        <MetricLine label="新闻状态" value={quality?.news_status || 'N/A'} />
+        <MetricLine label="新鲜度" value={quality ? `${quality.freshness_seconds}s` : 'N/A'} />
+      </div>
+      {flags.length ? (
+        <div className="flag-stack">
+          {flags.slice(0, 5).map((flag) => (
+            <span key={flag}>{flag}</span>
+          ))}
+        </div>
+      ) : (
+        <p className="muted-copy">暂无降级标记。</p>
+      )}
+    </section>
+  );
+}
+
+function SourceHealthPanel({ sources, loading }) {
+  return (
+    <section className="source-health-panel">
+      <PanelTitle icon={LockKeyhole} title="数据源健康监控" subtitle={sources.length ? `${sources.length} 个来源` : '等待'} />
+      <div className="source-health-list">
+        {sources.length ? (
+          sources.map((source) => (
+            <article key={source.id} className={`source-health-row status-${source.status}`}>
+              <div className="source-health-topline">
+                <strong>{source.label}</strong>
+                <QualityDot status={source.status} />
+              </div>
+              <div className="source-health-meta">
+                <span>{source.cadence}</span>
+                <span>{source.freshness_seconds}s / SLA {source.expected_lag_seconds}s</span>
+              </div>
+              <div className="source-coverage">
+                {(source.coverage || []).slice(0, 3).map((item) => (
+                  <span key={item}>{item}</span>
+                ))}
+              </div>
+              {source.degraded_reason ? <p>{source.degraded_reason}</p> : <p>来源状态正常，暂无降级原因。</p>}
+              {source.url ? (
+                <a href={source.url} target="_blank" rel="noreferrer">
+                  来源入口
+                  <ExternalLink size={13} />
+                </a>
+              ) : null}
+            </article>
+          ))
+        ) : (
+          <p>{loading ? '正在读取数据源健康状态。' : 'dashboard 暂未返回 source_health。'}</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function NewsPanel({ news, loading }) {
+  return (
+    <section className="panel-block">
+      <PanelTitle icon={Newspaper} title="自动情报" subtitle={news.length ? `${news.length} 条` : '等待'} />
+      <div className="compact-list">
+        {news.length ? (
+          news.slice(0, 3).map((item) => (
+            <article key={item.event_id}>
+              <span>{item.source} · {formatDateTime(item.published_at)}</span>
+              <strong>{item.title}</strong>
+              <p>{item.summary}</p>
+            </article>
+          ))
+        ) : (
+          <p>{loading ? '正在读取近端新闻。' : '暂无新闻条目。'}</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function CitationPanel({ citations }) {
+  return (
+    <section className="panel-block">
+      <PanelTitle icon={FileSearch} title="指标引用" subtitle={`${citations.length} 条`} />
+      <div className="compact-list">
+        {citations.length ? (
+          citations.slice(0, 4).map((item) => (
+            <article key={item.id}>
+              <span>{item.source_type}</span>
+              <strong>{item.label}</strong>
+              <p>{item.excerpt}</p>
+              {item.url ? (
+                <a href={item.url} target="_blank" rel="noreferrer">
+                  来源
+                  <ExternalLink size={13} />
+                </a>
+              ) : null}
+            </article>
+          ))
+        ) : (
+          <p>指标接口返回后会展示引用。</p>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function TerminalFooter({ left, right }) {
+  return (
+    <footer className="terminal-footer">
+      <span>{left}</span>
+      <span>{right}</span>
+    </footer>
+  );
+}
+
+function SectionHeader({ kicker, title, description }) {
+  return (
+    <div className="section-head">
+      <div>
+        <span>{kicker}</span>
+        <h2>{title}</h2>
+        <p>{description}</p>
+      </div>
     </div>
   );
 }
 
-function SelectionBadge({ label, value }) {
+function PanelTitle({ icon: Icon, title, subtitle }) {
   return (
-    <div className="selection-badge">
+    <div className="panel-title">
+      <Icon size={16} />
+      <div>
+        <h2>{title}</h2>
+        <span>{subtitle}</span>
+      </div>
+    </div>
+  );
+}
+
+function MetricTile({ label, value, detail, tone, icon: Icon }) {
+  return (
+    <article className={`metric-tile tone-${tone}`}>
+      <span>
+        <Icon size={16} />
+        {label}
+      </span>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+    </article>
+  );
+}
+
+function MetricLine({ label, value }) {
+  return (
+    <div className="metric-line">
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
   );
 }
 
-function SegmentedControl({ label, value, options, description, disabled, onChange }) {
+function StatusBadge({ status, loading }) {
+  const Icon = loading ? Loader2 : status === 'error' ? AlertTriangle : status === 'degraded' ? AlertTriangle : CheckCircle2;
   return (
-    <div className="control-cluster">
-      <div className="control-head">
-        <span>{label}</span>
-        <strong>{options.find((item) => item.value === value)?.label}</strong>
+    <div className={`status-badge status-${status}`}>
+      <Icon size={16} className={loading ? 'spinning' : ''} />
+      {loading ? '读取中' : status === 'error' ? '接口异常' : status === 'degraded' ? '含降级' : '已就绪'}
+    </div>
+  );
+}
+
+function QualityDot({ status }) {
+  return (
+    <span className={`quality-dot status-${status}`}>
+      {status}
+    </span>
+  );
+}
+
+function ErrorPanel({ title, message }) {
+  return (
+    <div className="error-panel">
+      <AlertTriangle size={18} />
+      <div>
+        <strong>{title}</strong>
+        <p>{message}</p>
       </div>
+    </div>
+  );
+}
+
+function PlaceholderPanel({ icon: Icon, text, spinning = false }) {
+  return (
+    <div className="placeholder-panel">
+      <Icon size={20} className={spinning ? 'spinning' : ''} />
+      <span>{text}</span>
+    </div>
+  );
+}
+
+function SegmentedControl({ label, value, options, onChange }) {
+  return (
+    <div className="segmented-block">
+      <span>{label}</span>
       <div className="segmented-control">
-        {options.map((option) => (
+        {options.map(([optionValue, optionLabel]) => (
           <button
-            key={option.value}
+            key={optionValue}
             type="button"
-            className={value === option.value ? 'segmented-option active' : 'segmented-option'}
-            onClick={() => onChange(option.value)}
-            disabled={disabled}
+            className={value === optionValue ? 'active' : ''}
+            onClick={() => onChange(optionValue)}
           >
-            {option.label}
+            {optionLabel}
           </button>
         ))}
       </div>
-      <motion.p
-        key={value}
-        className="control-description"
-        initial={{ opacity: 0, y: 4 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.2 }}
-      >
-        {description}
-      </motion.p>
     </div>
   );
 }
 
-function InsightStat({ label, value, tone = 'light' }) {
+function SelectField({ label, value, options, onChange }) {
   return (
-    <div className={`insight-stat ${tone}`}>
+    <label className="field compact-field">
       <span>{label}</span>
-      <strong>
-        <AnimatedValue value={value} />
-      </strong>
-    </div>
+      <select value={value} onChange={(event) => onChange(event.target.value)}>
+        {options.map(([optionValue, optionLabel]) => (
+          <option key={optionValue} value={optionValue}>
+            {optionLabel}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 
-function AnimatedValue({ value }) {
-  const shouldReduceMotion = useReducedMotion();
-  const parsed = useMemo(() => parseNumericDisplay(value), [value]);
-  const [displayValue, setDisplayValue] = useState(value);
-
-  useEffect(() => {
-    if (!parsed || shouldReduceMotion) {
-      setDisplayValue(value);
-      return undefined;
-    }
-
-    let frameId = 0;
-    let startTime = 0;
-    const durationMs = 720;
-
-    const animate = (timestamp) => {
-      if (!startTime) startTime = timestamp;
-      const progress = Math.min((timestamp - startTime) / durationMs, 1);
-      const eased = 1 - (1 - progress) * (1 - progress);
-      const currentValue = parsed.target * eased;
-      setDisplayValue(formatNumericDisplay(parsed, currentValue));
-
-      if (progress < 1) {
-        frameId = window.requestAnimationFrame(animate);
-      }
-    };
-
-    frameId = window.requestAnimationFrame(animate);
-    return () => window.cancelAnimationFrame(frameId);
-  }, [parsed, shouldReduceMotion, value]);
-
-  return displayValue;
+function NumberField({ label, suffix, value, min, max, onChange }) {
+  return (
+    <label className="field compact-field">
+      <span>{label}</span>
+      <div className="number-input">
+        <input
+          type="number"
+          min={min}
+          max={max}
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+        />
+        <small>{suffix}</small>
+      </div>
+    </label>
+  );
 }
 
 function SummaryList({ title, items }) {
   return (
     <div className="summary-list">
-      <h4>{title}</h4>
+      <h3>{title}</h3>
       <ul>
         {items.map((item) => (
           <li key={item}>{item}</li>
@@ -1078,22 +1350,263 @@ function SummaryList({ title, items }) {
   );
 }
 
-function parseNumericDisplay(value) {
-  const match = /(-?\d+(?:\.\d+)?)/.exec(value);
-  if (!match) return null;
+function buildDashboardInsights({ market, forecasts, groups, news, dataQuality, degradationFlags }) {
+  const primary = forecasts?.[0];
+  const drivers = (groups || []).map((group) => {
+    const score = Number(group.score || 0);
+    const tone = score > 0.08 ? 'supportive' : score < -0.08 ? 'pressure' : group.status === 'degraded' ? 'watch' : 'neutral';
+    return {
+      id: group.id,
+      title: group.title,
+      score: Math.min(1, Math.abs(score)),
+      scoreLabel: `${score >= 0 ? '+' : ''}${score.toFixed(2)}`,
+      tone,
+      summary: group.status === 'degraded' ? '含代理/降级数据，降低权重' : group.summary,
+    };
+  });
+  const supportive = [...drivers].sort((a, b) => Number.parseFloat(b.scoreLabel) - Number.parseFloat(a.scoreLabel))[0];
+  const pressure = [...drivers].sort((a, b) => Number.parseFloat(a.scoreLabel) - Number.parseFloat(b.scoreLabel))[0];
+  const degraded = degradationFlags?.length || dataQuality?.status === 'degraded' || market?.is_stale;
+  const headline = primary
+    ? `${horizonShortLabels[primary.horizon]} ${primary.stance}，执行倾向：${primary.action}`
+    : '等待稳定预测基线';
+  const thesis = {
+    kicker: degraded ? '含降级数据，先看风险' : '稳定基线已就绪',
+    headline,
+    summary: primary
+      ? `当前核心不是追逐单点涨跌，而是围绕 ${primary.confidence_band} 置信度管理节奏。${primary.reasons?.[0] || ''}`
+      : '读取三周期预测后，这里会收敛为今日核心判断。',
+    support: supportive?.title || '等待指标',
+    pressure: pressure?.scoreLabel?.startsWith('-') ? pressure.title : degraded ? '数据质量' : '暂无明显压制',
+    invalidator: degraded ? '数据恢复前不放大仓位' : '美元与实际利率同步走强',
+    tone: primary ? toneName(primary.stance) : 'neutral',
+  };
 
-  const numericPortion = match[1];
+  const newsTitle = news?.[0]?.title || '近端新闻刷新';
+  const events = [
+    {
+      window: 'T-24h',
+      name: 'CPI / PCE 通胀数据',
+      watch: '若通胀高于预期，实际利率与美元可能压制黄金。',
+      impact: 'high',
+      impactLabel: '高敏感',
+    },
+    {
+      window: 'T-48h',
+      name: 'FOMC / Fed 讲话',
+      watch: '关注降息路径、点阵图和鹰鸽措辞变化。',
+      impact: 'high',
+      impactLabel: '政策敏感',
+    },
+    {
+      window: 'Weekly',
+      name: 'ETF / CFTC 资金流',
+      watch: '如果价格上行但资金不跟随，趋势可信度下降。',
+      impact: 'medium',
+      impactLabel: '资金确认',
+    },
+    {
+      window: 'Live',
+      name: newsTitle,
+      watch: '新闻冲击只作为解释层，不改写稳定预测基线。',
+      impact: 'medium',
+      impactLabel: '情绪扰动',
+    },
+  ];
+
+  const primaryPath = primary ? `${primary.action}，不突破风险预算` : '等待预测';
+  const scenarios = [
+    {
+      name: '基准情景',
+      path: primaryPath,
+      trigger: primary?.reasons?.[0] || '市场基线维持当前方向。',
+      invalidator: degraded ? '数据质量恢复前不扩大结论' : '证据冲突扩大则降级',
+      tone: 'base',
+    },
+    {
+      name: '偏多情景',
+      path: '分批观察上行延续',
+      trigger: '美元走弱、实际利率回落、ETF 或避险资金确认。',
+      invalidator: '冲高后资金不跟随，回到观望。',
+      tone: 'bull',
+    },
+    {
+      name: '偏空情景',
+      path: '降低暴露或等待回撤',
+      trigger: '美元与实际利率同步上行，技术面跌破关键区间。',
+      invalidator: '避险需求重新抬升且金价收复关键位。',
+      tone: 'bear',
+    },
+  ];
+  return { thesis, drivers, events, scenarios };
+}
+
+function buildRiskBudget(profile, profileScore) {
+  const allocation = Number(profile.capital_allocation_pct || 0);
+  const maxDrawdown = Number(profile.max_drawdown_pct || 0);
+  const plannedExposure = baseCapital * allocation / 100;
+  const maxLoss = baseCapital * maxDrawdown / 100;
+  const leverageHaircut = { none: 1, low: 0.75, medium: 0.5, high: 0.25 }[profile.leverage_attitude] || 1;
+  const scoreHaircut = profileScore >= 5 ? 0.35 : profileScore >= 2 ? 0.65 : 1;
+  const liquidityHaircut = profile.liquidity_need === 'high' ? 0.6 : profile.liquidity_need === 'medium' ? 0.85 : 1;
+  const suggestedExposure = plannedExposure * leverageHaircut * scoreHaircut * liquidityHaircut;
+  const level = profileScore >= 5 ? 'high' : profileScore >= 2 ? 'medium' : 'low';
+  const positionGuidance = {
+    none: '无持仓时先看触发条件，不用一次性把风险预算打满。',
+    long: '已有多头时先管理现有仓位，新增暴露必须等待确认信号。',
+    short: '已有空头时优先检查偏多失效条件，避免与基线方向硬扛。',
+    hedged: '已对冲时重点观察对冲是否过度，不急于拆腿。',
+  }[profile.current_position];
+  const rules = [
+    allocation >= 50 ? '禁止重仓追价' : '分批进入',
+    maxDrawdown <= 5 ? '回撤触线即停止' : '按失效条件复盘',
+    profile.leverage_attitude === 'high' ? '不建议使用高杠杆' : '不放大杠杆',
+  ];
+  const guidance = level === 'high'
+    ? '问卷风险偏高，建议把实际暴露压到计划值的一小部分，优先等待确认。'
+    : level === 'medium'
+      ? '风险预算可以使用，但需要分批和明确失效条件。'
+      : '问卷风险较低，可以把重点放在触发条件和复盘纪律。';
   return {
-    prefix: value.slice(0, match.index),
-    suffix: value.slice(match.index + numericPortion.length),
-    target: Number.parseFloat(numericPortion),
-    decimals: numericPortion.includes('.') ? numericPortion.split('.')[1].length : 0,
+    plannedExposure,
+    maxLoss,
+    suggestedExposure,
+    level,
+    guidance,
+    positionGuidance,
+    rules,
   };
 }
 
-function formatNumericDisplay(parsed, currentValue) {
-  const safeValue = currentValue > parsed.target ? parsed.target : currentValue;
-  return `${parsed.prefix}${safeValue.toFixed(parsed.decimals)}${parsed.suffix}`;
+function buildSuitabilityGate(profile, profileScore, riskBudget) {
+  const allocation = Number(profile.capital_allocation_pct || 0);
+  const maxDrawdown = Number(profile.max_drawdown_pct || 0);
+  const rules = [];
+
+  if (allocation >= 50) rules.push('禁止重仓追价');
+  if (maxDrawdown <= 5) rules.push('回撤触线即停止');
+  if (profile.leverage_attitude === 'high') rules.push('禁止加杠杆');
+  if (profile.experience_level === 'beginner') rules.push('新手账户只看确认信号');
+  if (profile.current_position === 'long') rules.push('已有多头先管存量');
+  if (profile.current_position === 'short') rules.push('已有空头先看偏多失效');
+  if (profile.liquidity_need === 'high') rules.push('保留流动性缓冲');
+  if (!rules.length) rules.push('允许继续分析但不自动执行');
+
+  const forceObservation =
+    profileScore >= 7 ||
+    (allocation >= 50 && maxDrawdown <= 5) ||
+    (profile.leverage_attitude === 'high' && profile.experience_level === 'beginner');
+  const level = forceObservation ? 'high' : profileScore >= 3 ? 'medium' : 'low';
+  const decision = forceObservation ? '强制观望' : level === 'medium' ? '降低暴露' : '可继续分析';
+  const subtitle = level === 'high' ? '高风险门控' : level === 'medium' ? '中风险限制' : '低风险预检';
+  const summary = forceObservation
+    ? `当前问卷组合超过执行边界，Agent 只能输出观察、失效条件和复盘线索，建议暴露上限 ${formatCurrency(riskBudget.suggestedExposure)}。`
+    : level === 'medium'
+      ? `当前风险预算需要折扣使用，建议暴露上限 ${formatCurrency(riskBudget.suggestedExposure)}，不得放大仓位。`
+      : `当前画像未触发强门控，但仍需等待证据确认，建议暴露上限 ${formatCurrency(riskBudget.suggestedExposure)}。`;
+
+  return {
+    level,
+    decision,
+    subtitle,
+    summary,
+    scoreLabel: `风险分 ${profileScore}`,
+    rules,
+  };
+}
+
+function buildTrendChart(points, keyNodes) {
+  const width = 920;
+  const height = 280;
+  const padX = 34;
+  const padY = 24;
+  const prices = points.map((point) => Number(point.price)).filter((value) => Number.isFinite(value));
+  const minPrice = Math.min(...prices);
+  const maxPrice = Math.max(...prices);
+  const span = Math.max(1, maxPrice - minPrice);
+  const lastIndex = Math.max(1, points.length - 1);
+
+  const coords = points.map((point, index) => {
+    const x = padX + (index / lastIndex) * (width - padX * 2);
+    const y = height - padY - ((Number(point.price) - minPrice) / span) * (height - padY * 2);
+    return { ...point, x, y };
+  });
+
+  const pathD = coords.map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(' ');
+  const areaD = `${pathD} L ${coords[coords.length - 1]?.x?.toFixed(2) || padX} ${height - padY} L ${padX} ${height - padY} Z`;
+  const coordByDate = new Map(coords.map((point) => [point.date, point]));
+  const keyMarkers = (keyNodes || [])
+    .map((node) => {
+      const coord = coordByDate.get(node.date);
+      if (!coord) return null;
+      return { ...node, x: coord.x, y: coord.y };
+    })
+    .filter(Boolean);
+
+  return {
+    pathD,
+    areaD,
+    keyMarkers,
+    latestPrice: coords[coords.length - 1]?.price,
+  };
+}
+
+function buildExecutionScenarios({ summary, selectedForecast, riskBudget, investorProfile }) {
+  const action = summary?.action || selectedForecast?.action || '观望';
+  const exposureText = formatCurrency(riskBudget.suggestedExposure);
+  return [
+    {
+      name: '基准执行',
+      action: action === '观望' ? '等待确认' : `${action}，上限 ${exposureText}`,
+      condition: summary?.reasons?.[0] || selectedForecast?.reasons?.[0] || '稳定预测维持当前方向。',
+      stop: '若触发任一失效条件，停止新增暴露。',
+      tone: 'base',
+    },
+    {
+      name: '偏多突破',
+      action: investorProfile.current_position === 'long' ? '只允许小幅加仓' : '先小仓试探',
+      condition: '美元走弱、实际利率回落、资金流确认后再行动。',
+      stop: '突破后无法站稳或新闻反转，取消追随。',
+      tone: 'bull',
+    },
+    {
+      name: '偏空防守',
+      action: investorProfile.current_position === 'long' ? '优先减仓' : '保持现金等待',
+      condition: '美元和实际利率同步上行，或技术面跌破关键区间。',
+      stop: '避险需求重新抬升时重新评估。',
+      tone: 'bear',
+    },
+  ];
+}
+
+function toneName(stance) {
+  if (stance === '偏多') return 'bull';
+  if (stance === '偏空') return 'bear';
+  if (stance === '高风险观望') return 'risk';
+  return 'neutral';
+}
+
+function formatCurrency(value) {
+  if (!Number.isFinite(Number(value))) return 'N/A';
+  return Number(value).toLocaleString('zh-CN', {
+    style: 'currency',
+    currency: 'CNY',
+    maximumFractionDigits: 0,
+  });
+}
+
+function formatPrice(value) {
+  if (value === null || value === undefined) return 'N/A';
+  return Number(value).toLocaleString('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    maximumFractionDigits: 2,
+  });
+}
+
+function formatPercent(value) {
+  if (value === null || value === undefined) return 'N/A';
+  return `${(Number(value) * 100).toFixed(2)}%`;
 }
 
 function formatDateTime(value) {

@@ -17,7 +17,12 @@ services:
     build: .
     command: python3 -m uvicorn inference_service:app --host 0.0.0.0 --port 8010
     environment:
+      APP_ENV: development
       REDIS_URL: redis://redis:6379/0
+      MARKET_DATA_PROVIDER: yfinance
+      NEWS_DATA_PROVIDER: rss
+      INFERENCE_MODEL_CHECKPOINTS_DIR_T1: model_checkpoints
+      INFERENCE_MODEL_CHECKPOINTS_DIR_T7: model_checkpoints
     ports:
       - "8010:8010"
     depends_on:
@@ -27,7 +32,9 @@ services:
     build: .
     command: python3 -m uvicorn memory_service:app --host 0.0.0.0 --port 8012
     environment:
+      APP_ENV: development
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      MEMORY_START_BACKGROUND_LOAD: "1"
     ports:
       - "8012:8012"
     depends_on:
@@ -37,8 +44,10 @@ services:
     build: .
     command: python3 -m uvicorn market_snapshot_service:app --host 0.0.0.0 --port 8014
     environment:
+      APP_ENV: development
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      MARKET_DATA_PROVIDER: yfinance
       MARKET_REFRESH_SECONDS: "60"
       MARKET_STALE_AFTER_SECONDS: "180"
     ports:
@@ -51,8 +60,10 @@ services:
     build: .
     command: python3 -m uvicorn news_ingest_service:app --host 0.0.0.0 --port 8016
     environment:
+      APP_ENV: development
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/postgres
+      NEWS_DATA_PROVIDER: rss
       NEWS_REFRESH_SECONDS: "300"
     ports:
       - "8016:8016"
@@ -69,6 +80,7 @@ services:
       FORECAST_URL: http://inference:8010/api/v1/forecast
       MEMORY_URL: http://memory:8012/api/v1/memory/search
       MARKET_SNAPSHOT_URL: http://market_ingest:8014/api/v1/market/snapshot/latest
+      MARKET_INDICATORS_URL: http://market_ingest:8014/api/v1/market/indicators/current
       RECENT_NEWS_URL: http://news_ingest:8016/api/v1/news/recent
       AGENT_DEFAULT_MODEL: gpt-5.4-mini
       AGENT_COMPLEX_MODEL: gpt-5.4
@@ -100,6 +112,7 @@ services:
     command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 4173"
     environment:
       VITE_AGENT_API_URL: http://localhost:8020/api/v1/agent/analyze
+      VITE_AGENT_DASHBOARD_URL: http://localhost:8020/api/v1/agent/dashboard/current
       VITE_AGENT_FEEDBACK_URL: http://localhost:8020/api/v1/agent/feedback
       VITE_AGENT_API_KEY: dev-public-key
     ports:

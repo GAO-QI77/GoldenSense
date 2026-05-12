@@ -1,7 +1,10 @@
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
-from typing import Dict, List, Optional, Sequence, Tuple
+from pathlib import Path
+import time
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import xgboost as xgb
@@ -11,7 +14,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from stacking_model import DynamicEnsemble
-from data_loader import MarketDataLoader, NewsDataLoader
+from data_loader import MarketDataProvider, NewsDataProvider, create_market_data_provider, create_news_data_provider
 from feature_engineer import FeatureEngineer
 
 
@@ -20,6 +23,14 @@ class ForecastRequest(BaseModel):
 
     asset_symbol: str = Field(min_length=1, max_length=20)
     horizon: str = Field(pattern=r"^T\+(1|7|30)$")
+    current_timestamp: datetime
+
+
+class ForecastBatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    asset_symbol: str = Field(min_length=1, max_length=20)
+    horizons: List[Literal["T+1", "T+7", "T+30"]] = Field(min_length=1, max_length=3)
     current_timestamp: datetime
 
 
@@ -48,7 +59,18 @@ class ForecastResponse(BaseModel):
     feature_importance_top_3: List[FeatureImportanceItem]
     attention_top_3_lags: List[AttentionLagItem]
     forecast_basis: str = "ensemble_model"
+    model_status: Literal["loaded", "loading", "unavailable", "heuristic_proxy", "not_applicable"] = "loaded"
+    model_loaded: bool = True
+    model_checkpoint_path: Optional[str] = None
     supporting_reasons: List[str] = Field(default_factory=list, max_length=4)
+
+
+class ForecastBatchResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    asset_symbol: str
+    current_timestamp: datetime
+    forecasts: Dict[str, ForecastResponse]
 
 
 class ErrorResponse(BaseModel):
@@ -56,6 +78,13 @@ class ErrorResponse(BaseModel):
 
     error_code: str
     message: str
+
+
+@dataclass
+class _PreparedInferenceInput:
+    market_df: pd.DataFrame
+    daily_signals: pd.DataFrame
+    X_features: pd.DataFrame
 
 
 def _prob_up_from_return(pred_return: float, scale: float) -> float:
@@ -219,6 +248,9 @@ def _heuristic_forecast_response(
     horizon: str,
     market_df: pd.DataFrame,
     daily_signals: pd.DataFrame,
+    model_status: Literal["loading", "unavailable", "heuristic_proxy", "not_applicable"] = "heuristic_proxy",
+    model_loaded: bool = False,
+    model_checkpoint_path: Optional[str] = None,
 ) -> ForecastResponse:
     signal_pack = _heuristic_signal_pack(market_df, daily_signals)
     configs = {
@@ -308,6 +340,9 @@ def _heuristic_forecast_response(
         feature_importance_top_3=feature_importance,
         attention_top_3_lags=[],
         forecast_basis="heuristic_proxy",
+        model_status=model_status,
+        model_loaded=model_loaded,
+        model_checkpoint_path=model_checkpoint_path,
         supporting_reasons=reasons[:4],
     )
 
@@ -315,20 +350,31 @@ def _heuristic_forecast_response(
 def create_app(
     model_t1: Optional[DynamicEnsemble] = None,
     model_t7: Optional[DynamicEnsemble] = None,
-    market_loader: Optional[MarketDataLoader] = None,
-    news_loader: Optional[NewsDataLoader] = None,
+    market_loader: Optional[MarketDataProvider] = None,
+    news_loader: Optional[NewsDataProvider] = None,
     feature_engineer: Optional[FeatureEngineer] = None,
     model_checkpoints_dir_t1: str = "model_checkpoints",
-    model_checkpoints_dir_t7: str = "model_checkpoints_t7",
+    model_checkpoints_dir_t7: str = "model_checkpoints",
 ) -> FastAPI:
     app = FastAPI()
+    app_env = os.environ.get("APP_ENV", "development").lower()
+    model_checkpoints_dir_t1 = os.environ.get("INFERENCE_MODEL_CHECKPOINTS_DIR_T1", model_checkpoints_dir_t1)
+    model_checkpoints_dir_t7 = os.environ.get("INFERENCE_MODEL_CHECKPOINTS_DIR_T7", model_checkpoints_dir_t7)
 
     svc_models: Dict[str, DynamicEnsemble] = {
         "T+1": model_t1 or DynamicEnsemble(tabular_input_dim=15, seq_input_dim=4),
         "T+7": model_t7 or DynamicEnsemble(tabular_input_dim=15, seq_input_dim=4),
     }
-    svc_market_loader = market_loader or MarketDataLoader()
-    svc_news_loader = news_loader or NewsDataLoader()
+    market_provider_name = os.environ.get(
+        "MARKET_DATA_PROVIDER",
+        "yfinance" if app_env == "development" else "external_required",
+    )
+    news_provider_name = os.environ.get(
+        "NEWS_DATA_PROVIDER",
+        "rss" if app_env == "development" else "external_required",
+    )
+    svc_market_loader = market_loader or create_market_data_provider(market_provider_name)
+    svc_news_loader = news_loader or create_news_data_provider(news_provider_name)
     svc_feature_engineer = feature_engineer or FeatureEngineer()
 
     model_dirs: Dict[str, str] = {
@@ -344,8 +390,27 @@ def create_app(
         "T+1": False,
         "T+7": False,
     }
+    model_load_errors: Dict[str, Optional[str]] = {
+        "T+1": None,
+        "T+7": None,
+    }
     model_load_timeout_s = float(os.environ.get("INFERENCE_MODEL_LOAD_TIMEOUT_SECONDS", "6.0"))
-    allow_synthetic_market_fallback = os.environ.get("INFERENCE_ALLOW_SYNTHETIC_FALLBACK", "1") != "0"
+    model_load_retry_cooldown_s = float(os.environ.get("INFERENCE_MODEL_LOAD_RETRY_COOLDOWN_SECONDS", "45.0"))
+    model_load_retry_after: Dict[str, float] = {
+        "T+1": 0.0,
+        "T+7": 0.0,
+    }
+    input_cache_ttl_s = float(os.environ.get("INFERENCE_INPUT_CACHE_TTL_SECONDS", "60.0"))
+    market_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
+    daily_signals_cache: Dict[str, Tuple[float, pd.DataFrame]] = {}
+    prepared_cache: Dict[str, Tuple[float, _PreparedInferenceInput]] = {}
+    market_cache_lock = asyncio.Lock()
+    daily_signals_cache_lock = asyncio.Lock()
+    prepared_cache_lock = asyncio.Lock()
+    allow_synthetic_market_fallback = os.environ.get(
+        "INFERENCE_ALLOW_SYNTHETIC_FALLBACK",
+        "1" if app_env == "development" else "0",
+    ) != "0"
 
     async def _load_model_async(horizon: str) -> None:
         async with model_load_lock:
@@ -358,8 +423,12 @@ def create_app(
                     lambda: svc_models[horizon].load_model(model_dir), timeout_s=model_load_timeout_s
                 )
                 model_loaded[horizon] = bool(loaded)
-            except Exception:
+                model_load_errors[horizon] = None if loaded else "model_checkpoint_load_returned_false"
+                model_load_retry_after[horizon] = 0.0 if loaded else time.monotonic() + model_load_retry_cooldown_s
+            except Exception as exc:
                 model_loaded[horizon] = False
+                model_load_errors[horizon] = f"{type(exc).__name__}:{exc}"
+                model_load_retry_after[horizon] = time.monotonic() + model_load_retry_cooldown_s
             finally:
                 model_loading_started[horizon] = False
 
@@ -367,6 +436,8 @@ def create_app(
         if horizon not in model_loaded:
             return
         if model_loaded[horizon] or model_loading_started[horizon]:
+            return
+        if time.monotonic() < model_load_retry_after.get(horizon, 0.0):
             return
         model_loading_started[horizon] = True
         asyncio.create_task(_load_model_async(horizon))
@@ -380,17 +451,186 @@ def create_app(
             return JSONResponse(status_code=exc.status_code, content=exc.detail)
         return JSONResponse(status_code=exc.status_code, content={"error_code": "http_error", "message": str(exc.detail)})
 
+    app.state.model_loaded = model_loaded
+    app.state.model_loading_started = model_loading_started
+    app.state.model_dirs = model_dirs
+    app.state.model_load_errors = model_load_errors
+    app.state.model_load_retry_after = model_load_retry_after
+    app.state.inference_input_cache = {
+        "market": market_cache,
+        "daily_signals": daily_signals_cache,
+        "prepared": prepared_cache,
+    }
+
+    def _model_runtime_status(horizon: str) -> Dict[str, object]:
+        checkpoint_path = model_dirs.get(horizon)
+        exists = bool(checkpoint_path and Path(checkpoint_path).exists())
+        return {
+            "loaded": bool(model_loaded.get(horizon, False)),
+            "loading": bool(model_loading_started.get(horizon, False)),
+            "checkpoint_path": checkpoint_path,
+            "checkpoint_exists": exists,
+            "last_error": model_load_errors.get(horizon),
+        }
+
     @app.get("/health")
     async def health():
-        return {"status": "ok"}
+        return {
+            "status": "ok",
+            "model_status": {h: _model_runtime_status(h) for h in ("T+1", "T+7")},
+        }
 
-    @app.post("/api/v1/forecast", response_model=ForecastResponse)
-    async def forecast(
-        req: ForecastRequest,
-        deps=Depends(_deps),
-    ):
-        svc_models_, svc_market_loader_, svc_news_loader_, svc_feature_engineer_ = deps
-        horizon = req.horizon
+    @app.get("/health/live")
+    async def health_live():
+        return {"status": "ok", "service": "inference"}
+
+    @app.get("/health/ready")
+    async def health_ready():
+        model_status = {h: _model_runtime_status(h) for h in ("T+1", "T+7")}
+        warnings = [
+            f"{h}_checkpoint_missing"
+            for h, state in model_status.items()
+            if not state["checkpoint_exists"]
+        ]
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ok",
+                "allow_synthetic_market_fallback": allow_synthetic_market_fallback,
+                "market_provider": getattr(svc_market_loader, "provider_name", market_provider_name),
+                "news_provider": getattr(svc_news_loader, "provider_name", news_provider_name),
+                "model_status": model_status,
+                "forecast_mode": {
+                    h: "ensemble_model" if state["loaded"] else "heuristic_proxy"
+                    for h, state in model_status.items()
+                },
+                "warnings": warnings,
+                "errors": [],
+            },
+        )
+
+    def _validate_asset(asset_symbol: str) -> None:
+        if asset_symbol.upper() not in {"XAUUSD", "XAU/USD"}:
+            raise HTTPException(
+                status_code=400,
+                detail=ErrorResponse(
+                    error_code="unsupported_asset",
+                    message="Only XAUUSD is supported in this service.",
+                ).model_dump(),
+            )
+
+    def _as_of_timestamp(value: datetime) -> pd.Timestamp:
+        ts = pd.Timestamp(value)
+        if ts.tz is not None:
+            return ts.tz_convert("UTC").tz_localize(None)
+        return ts.tz_localize(None)
+
+    async def _cached_market_df(current_timestamp: datetime) -> pd.DataFrame:
+        cache_key = "6mo:1d"
+        now = time.monotonic()
+        async with market_cache_lock:
+            cached = market_cache.get(cache_key)
+            if cached and now < cached[0]:
+                return cached[1].copy()
+
+            try:
+                market_df: pd.DataFrame = await _to_thread_with_timeout(
+                    lambda: svc_market_loader.fetch_data(period="6mo", interval="1d"),
+                    timeout_s=20.0,
+                )
+            except Exception:
+                if not allow_synthetic_market_fallback:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=ErrorResponse(
+                            error_code="market_data_unavailable",
+                            message="Market data fetch failed.",
+                        ).model_dump(),
+                    )
+                market_df = _synthetic_market_data(current_timestamp)
+
+            if market_df.empty or "Gold" not in market_df.columns:
+                if not allow_synthetic_market_fallback:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=ErrorResponse(
+                            error_code="market_data_unavailable",
+                            message="Insufficient market data for inference.",
+                        ).model_dump(),
+                    )
+                market_df = _synthetic_market_data(current_timestamp)
+
+            market_cache[cache_key] = (time.monotonic() + input_cache_ttl_s, market_df.copy())
+            return market_df.copy()
+
+    async def _cached_daily_signals() -> pd.DataFrame:
+        cache_key = "daily_signals"
+        now = time.monotonic()
+        async with daily_signals_cache_lock:
+            cached = daily_signals_cache.get(cache_key)
+            if cached and now < cached[0]:
+                return cached[1].copy()
+
+            daily_signals = pd.DataFrame()
+            try:
+                news_items = await _to_thread_with_timeout(svc_news_loader.fetch_news, timeout_s=10.0)
+                scored_news = svc_news_loader.analyze_causality(news_items)
+                daily_signals = svc_news_loader.get_daily_signals(scored_news)
+            except Exception:
+                daily_signals = pd.DataFrame()
+            daily_signals_cache[cache_key] = (time.monotonic() + input_cache_ttl_s, daily_signals.copy())
+            return daily_signals.copy()
+
+    async def _prepare_inference_input(current_timestamp: datetime) -> _PreparedInferenceInput:
+        as_of = _as_of_timestamp(current_timestamp)
+        cache_key = as_of.strftime("%Y-%m-%d")
+        now = time.monotonic()
+        async with prepared_cache_lock:
+            cached = prepared_cache.get(cache_key)
+            if cached and now < cached[0]:
+                prepared = cached[1]
+                return _PreparedInferenceInput(
+                    market_df=prepared.market_df.copy(),
+                    daily_signals=prepared.daily_signals.copy(),
+                    X_features=prepared.X_features.copy(),
+                )
+
+            market_df = await _cached_market_df(current_timestamp)
+            market_df = market_df.loc[market_df.index <= as_of].copy()
+            if len(market_df) < 90:
+                raise HTTPException(
+                    status_code=503,
+                    detail=ErrorResponse(
+                        error_code="insufficient_history",
+                        message="Not enough history to build inference features.",
+                    ).model_dump(),
+                )
+
+            daily_signals = await _cached_daily_signals()
+            recent_data = market_df.tail(140)
+            X_features = svc_feature_engineer.prepare_inference_data(recent_data, daily_signals, n_rows=60)
+            if X_features.empty or len(X_features) < 60:
+                raise HTTPException(
+                    status_code=503,
+                    detail=ErrorResponse(
+                        error_code="feature_generation_failed",
+                        message="Failed to generate inference features.",
+                    ).model_dump(),
+                )
+
+            prepared = _PreparedInferenceInput(
+                market_df=market_df,
+                daily_signals=daily_signals,
+                X_features=X_features,
+            )
+            prepared_cache[cache_key] = (time.monotonic() + input_cache_ttl_s, prepared)
+            return _PreparedInferenceInput(
+                market_df=prepared.market_df.copy(),
+                daily_signals=prepared.daily_signals.copy(),
+                X_features=prepared.X_features.copy(),
+            )
+
+    def _forecast_from_prepared(horizon: str, prepared: _PreparedInferenceInput) -> ForecastResponse:
         if horizon not in {"T+1", "T+7", "T+30"}:
             raise HTTPException(
                 status_code=400,
@@ -400,76 +640,10 @@ def create_app(
                 ).model_dump(),
             )
 
-        if horizon in {"T+1", "T+7"} and not model_loaded[horizon]:
-            await _kick_model_load(horizon)
-
-        if req.asset_symbol.upper() not in {"XAUUSD", "XAU/USD"}:
-            raise HTTPException(
-                status_code=400,
-                detail=ErrorResponse(
-                    error_code="unsupported_asset",
-                    message="Only XAUUSD is supported in this service.",
-                ).model_dump(),
-            )
-
-        svc_model_ = svc_models_.get(horizon)
-
-        try:
-            market_df: pd.DataFrame = await _to_thread_with_timeout(
-                lambda: svc_market_loader_.fetch_data(period="6mo", interval="1d"),
-                timeout_s=20.0,
-            )
-        except Exception:
-            if not allow_synthetic_market_fallback:
-                raise HTTPException(
-                    status_code=503,
-                    detail=ErrorResponse(
-                        error_code="market_data_unavailable",
-                        message="Market data fetch failed.",
-                    ).model_dump(),
-                )
-            market_df = _synthetic_market_data(req.current_timestamp)
-
-        if market_df.empty or "Gold" not in market_df.columns:
-            if not allow_synthetic_market_fallback:
-                raise HTTPException(
-                    status_code=503,
-                    detail=ErrorResponse(
-                        error_code="market_data_unavailable",
-                        message="Insufficient market data for inference.",
-                    ).model_dump(),
-                )
-            market_df = _synthetic_market_data(req.current_timestamp)
-
-        as_of = pd.Timestamp(req.current_timestamp).tz_localize(None)
-        market_df = market_df.loc[market_df.index <= as_of]
-        if len(market_df) < 90:
-            raise HTTPException(
-                status_code=503,
-                detail=ErrorResponse(
-                    error_code="insufficient_history",
-                    message="Not enough history to build inference features.",
-                ).model_dump(),
-            )
-
-        daily_signals = pd.DataFrame()
-        try:
-            news_items = await _to_thread_with_timeout(svc_news_loader_.fetch_news, timeout_s=10.0)
-            scored_news = svc_news_loader_.analyze_causality(news_items)
-            daily_signals = svc_news_loader_.get_daily_signals(scored_news)
-        except Exception:
-            daily_signals = pd.DataFrame()
-
-        recent_data = market_df.tail(140)
-        X_features = svc_feature_engineer_.prepare_inference_data(recent_data, daily_signals, n_rows=60)
-        if X_features.empty or len(X_features) < 60:
-            raise HTTPException(
-                status_code=503,
-                detail=ErrorResponse(
-                    error_code="feature_generation_failed",
-                    message="Failed to generate inference features.",
-                ).model_dump(),
-            )
+        svc_model_ = svc_models.get(horizon)
+        market_df = prepared.market_df
+        daily_signals = prepared.daily_signals
+        X_features = prepared.X_features
 
         seq_cols = ["Gold_ZScore", "Silver_ZScore", "Crude_Oil_ZScore", "USD_Index_ZScore"]
         if not all(c in X_features.columns for c in seq_cols):
@@ -488,7 +662,7 @@ def create_app(
         if svc_model_ is not None and hasattr(svc_model_.xgb, "feature_names_in_"):
             training_features = list(svc_model_.xgb.feature_names_in_)
         if not training_features:
-            training_features = svc_feature_engineer_.load_selected_features()
+            training_features = svc_feature_engineer.load_selected_features()
         if not training_features:
             training_features = list(X_features.columns)[:15]
 
@@ -496,10 +670,14 @@ def create_app(
         X_tab_df = pd.DataFrame([{f: float(last_row[f].iloc[0]) if f in last_row.columns else 0.0 for f in training_features}])
 
         if horizon == "T+30" or svc_model_ is None or not model_loaded.get(horizon, False):
+            model_status = "not_applicable" if horizon == "T+30" else "heuristic_proxy"
             return _heuristic_forecast_response(
                 horizon=horizon,
                 market_df=market_df,
                 daily_signals=daily_signals,
+                model_status=model_status,
+                model_loaded=bool(model_loaded.get(horizon, False)),
+                model_checkpoint_path=model_dirs.get(horizon),
             )
 
         try:
@@ -509,6 +687,9 @@ def create_app(
                 horizon=horizon,
                 market_df=market_df,
                 daily_signals=daily_signals,
+                model_status="unavailable",
+                model_loaded=False,
+                model_checkpoint_path=model_dirs.get(horizon),
             )
 
         weights = svc_model_.model_weights
@@ -552,7 +733,42 @@ def create_app(
             feature_importance_top_3=fi_top3,
             attention_top_3_lags=attn_top3,
             forecast_basis="ensemble_model",
+            model_status="loaded",
+            model_loaded=True,
+            model_checkpoint_path=model_dirs.get(horizon),
             supporting_reasons=[f"{item.feature} 是当前模型最关注的特征。" for item in fi_top3],
+        )
+
+    async def _forecast_response(req: ForecastRequest) -> ForecastResponse:
+        _validate_asset(req.asset_symbol)
+        if req.horizon in {"T+1", "T+7"} and not model_loaded[req.horizon]:
+            await _kick_model_load(req.horizon)
+        prepared = await _prepare_inference_input(req.current_timestamp)
+        return _forecast_from_prepared(req.horizon, prepared)
+
+    @app.post("/api/v1/forecast", response_model=ForecastResponse)
+    async def forecast(
+        req: ForecastRequest,
+        deps=Depends(_deps),
+    ):
+        return await _forecast_response(req)
+
+    @app.post("/api/v1/forecast/batch", response_model=ForecastBatchResponse)
+    async def forecast_batch(req: ForecastBatchRequest):
+        _validate_asset(req.asset_symbol)
+        horizons = list(dict.fromkeys(req.horizons))
+        for horizon in horizons:
+            if horizon in {"T+1", "T+7"} and not model_loaded[horizon]:
+                await _kick_model_load(horizon)
+        prepared = await _prepare_inference_input(req.current_timestamp)
+        forecasts = {
+            horizon: _forecast_from_prepared(horizon, prepared)
+            for horizon in horizons
+        }
+        return ForecastBatchResponse(
+            asset_symbol=req.asset_symbol.upper().replace("/", ""),
+            current_timestamp=req.current_timestamp,
+            forecasts=forecasts,
         )
 
     return app

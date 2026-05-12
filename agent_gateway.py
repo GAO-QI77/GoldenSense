@@ -17,9 +17,21 @@ import httpx
 import psycopg
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from service_contracts import MarketSnapshotResponse, NewsEventItem, RecentNewsResponse
+from service_contracts import (
+    GoldPriceHistoryPoint,
+    GoldPriceHistoryResponse,
+    GoldPriceKeyNode,
+    IndicatorCitation,
+    IndicatorGroup,
+    IndicatorItem,
+    MarketIndicatorsResponse,
+    MarketSnapshotResponse,
+    NewsEventItem,
+    RecentNewsResponse,
+)
 
 try:
     from openai import AsyncOpenAI
@@ -92,6 +104,20 @@ ConfidenceBand = Literal["低", "中", "高"]
 ForecastBasis = Literal["ensemble_model", "heuristic_proxy", "degraded_fallback"]
 
 
+class InvestorProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    risk_capacity: Literal["low", "medium", "high"]
+    trading_horizon: Literal["short", "medium", "long"]
+    experience_level: Literal["beginner", "intermediate", "advanced"]
+    capital_allocation_pct: float = Field(ge=0.0, le=100.0)
+    max_drawdown_pct: float = Field(ge=0.0, le=100.0)
+    current_position: Literal["none", "long", "short", "hedged"]
+    liquidity_need: Literal["low", "medium", "high"]
+    leverage_attitude: Literal["none", "low", "medium", "high"]
+    investment_goal: Literal["capital_preservation", "income", "event_trade", "trend_following", "speculation"]
+
+
 class AgentAnalyzeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -100,6 +126,7 @@ class AgentAnalyzeRequest(BaseModel):
     risk_profile: RiskProfile = "conservative"
     horizon: PublicHorizon = "24h"
     locale: Literal["zh-CN"] = "zh-CN"
+    investor_profile: Optional[InvestorProfile] = None
 
 
 class SummaryCard(BaseModel):
@@ -158,6 +185,47 @@ class AgentAnalyzeResponse(BaseModel):
     timing_ms: Dict[str, int]
 
 
+class AgentForecastsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    as_of: datetime
+    market_status: Dict[str, Any]
+    horizon_forecasts: List["HorizonForecastCard"] = Field(min_length=3, max_length=3)
+    degradation_flags: List[str] = Field(default_factory=list, max_length=8)
+    timing_ms: Dict[str, int]
+
+
+class DataSourceHealth(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    label: str
+    source_type: str
+    status: Literal["ok", "degraded", "unavailable"]
+    freshness_seconds: int = Field(ge=0)
+    expected_lag_seconds: int = Field(ge=1)
+    cadence: str
+    degraded_reason: Optional[str] = None
+    coverage: List[str] = Field(min_length=1)
+    url: Optional[str] = None
+
+
+class AgentDashboardResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    as_of: datetime
+    market_status: Dict[str, Any]
+    horizon_forecasts: List["HorizonForecastCard"] = Field(min_length=3, max_length=3)
+    indicator_groups: List[IndicatorGroup] = Field(min_length=4, max_length=4)
+    gold_history: Optional[GoldPriceHistoryResponse] = None
+    recent_news: List[NewsEventItem] = Field(default_factory=list, max_length=6)
+    citations: List[Dict[str, Any]] = Field(default_factory=list)
+    source_health: List[DataSourceHealth] = Field(default_factory=list)
+    data_quality: Dict[str, Any]
+    degradation_flags: List[str] = Field(default_factory=list, max_length=12)
+    timing_ms: Dict[str, int]
+
+
 class HorizonForecastCard(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -167,10 +235,15 @@ class HorizonForecastCard(BaseModel):
     action: SummaryAction
     probability: float = Field(ge=0.0, le=1.0)
     basis: ForecastBasis
+    model_status: str = "unknown"
+    model_loaded: bool = False
+    model_checkpoint_path: Optional[str] = None
     reasons: List[str] = Field(min_length=2, max_length=4)
 
 
 AgentAnalyzeResponse.model_rebuild()
+AgentForecastsResponse.model_rebuild()
+AgentDashboardResponse.model_rebuild()
 
 
 class AgentFeedbackRequest(BaseModel):
@@ -214,6 +287,8 @@ class AgentGatewayConfig:
     forecast_url: str
     memory_url: str
     market_snapshot_url: str
+    market_indicators_url: str
+    market_history_url: str
     recent_news_url: str
     default_model: str
     complex_model: str
@@ -237,6 +312,8 @@ class AnalysisBundle:
     evidence_query: str
     horizon: PublicHorizon
     risk_profile: Dict[str, Any]
+    investor_profile: Optional[Dict[str, Any]]
+    risk_gate: Dict[str, Any]
     snapshot: MarketSnapshotResponse
     forecast: Dict[str, Any]
     news: RecentNewsResponse
@@ -317,6 +394,9 @@ def _fallback_quant_forecast(reason: str) -> Dict[str, Any]:
         "xgboost_probability": 0.5,
         "service_status": "degraded",
         "forecast_basis": "degraded_fallback",
+        "model_status": "unavailable",
+        "model_loaded": False,
+        "model_checkpoint_path": None,
         "supporting_reasons": ["量化服务暂不可用，系统已切换为保守中性占位。"],
         "reason": reason,
     }
@@ -348,8 +428,208 @@ def _fallback_recent_news(query: str) -> RecentNewsResponse:
     )
 
 
+def _fallback_market_indicators(snapshot: MarketSnapshotResponse, reason: str) -> MarketIndicatorsResponse:
+    groups: List[IndicatorGroup] = []
+    for group_id, title in [
+        ("fundamental", "基本面"),
+        ("technical", "技术面"),
+        ("macro_policy", "宏观政策"),
+        ("flow_sentiment", "资金情绪"),
+    ]:
+        groups.append(
+            IndicatorGroup(
+                id=group_id,  # type: ignore[arg-type]
+                title=title,
+                summary=f"{title}指标服务暂不可用，首页仅保留降级占位。",
+                score=0.0,
+                status="degraded",
+                freshness_seconds=snapshot.freshness_seconds,
+                degraded_reason=reason,
+                indicators=[
+                    IndicatorItem(
+                        id=f"{group_id}-fallback-{idx}",
+                        label=label,
+                        value="unavailable",
+                        numeric_value=None,
+                        unit=None,
+                        direction="neutral",
+                        source="agent_gateway_fallback",
+                        source_url=None,
+                        freshness_seconds=snapshot.freshness_seconds,
+                        status="degraded",
+                        degraded_reason=reason,
+                    )
+                    for idx, label in enumerate(["数据源", "新鲜度", "方向", "风险"], start=1)
+                ],
+            )
+        )
+    return MarketIndicatorsResponse(
+        asset=snapshot.asset,
+        as_of=snapshot.as_of,
+        freshness_seconds=snapshot.freshness_seconds,
+        stale_after_seconds=snapshot.stale_after_seconds,
+        status="degraded",
+        degraded_reason=reason,
+        groups=groups,
+        citations=[
+            IndicatorCitation(
+                id="ind-fallback",
+                label="Market indicators fallback",
+                source_type="market_indicators",
+                excerpt=f"指标服务不可用，Agent Gateway 已生成降级占位：{reason}",
+                url=None,
+            )
+        ],
+    )
+
+
+def _fallback_gold_history(snapshot: MarketSnapshotResponse, reason: str) -> GoldPriceHistoryResponse:
+    base = snapshot.latest_price
+    as_of_date = snapshot.as_of.date()
+    points = [
+        GoldPriceHistoryPoint(date=as_of_date.isoformat(), price=base, change_pct=None),
+        GoldPriceHistoryPoint(date=as_of_date.isoformat(), price=base, change_pct=0.0),
+    ]
+    return GoldPriceHistoryResponse(
+        asset=snapshot.asset,
+        as_of=snapshot.as_of,
+        source=f"dashboard_fallback:{reason}",
+        points=points,
+        key_nodes=[],
+    )
+
+
+def _flatten_indicator_items(indicators: MarketIndicatorsResponse) -> List[IndicatorItem]:
+    return [item for group in indicators.groups for item in group.indicators]
+
+
+def _source_health_status(items: Sequence[IndicatorItem], fallback_status: str) -> str:
+    if not items:
+        return fallback_status if fallback_status in {"ok", "degraded", "unavailable"} else "unavailable"
+    if any(item.status == "unavailable" for item in items):
+        return "unavailable"
+    if any(item.status != "ok" for item in items):
+        return "degraded"
+    return "ok"
+
+
+def _source_health_freshness(items: Sequence[IndicatorItem], fallback_freshness: int) -> int:
+    if not items:
+        return max(0, fallback_freshness)
+    return max(item.freshness_seconds for item in items)
+
+
+def _source_health_reason(items: Sequence[IndicatorItem], fallback_reason: Optional[str]) -> Optional[str]:
+    return next((item.degraded_reason for item in items if item.degraded_reason), fallback_reason)
+
+
+def _build_dashboard_source_health(
+    *,
+    snapshot: MarketSnapshotResponse,
+    indicators: MarketIndicatorsResponse,
+    news: RecentNewsResponse,
+    news_expected_lag_seconds: int,
+) -> List[DataSourceHealth]:
+    items = _flatten_indicator_items(indicators)
+    wgc_items = [
+        item
+        for item in items
+        if "World Gold Council" in item.source or item.source.startswith("WGC") or item.source_url and "gold.org" in item.source_url
+    ]
+    cftc_items = [item for item in items if "CFTC" in item.label or "CFTC" in item.source]
+    cme_items = [item for item in items if "FedWatch" in item.label or "CME" in item.source]
+    macro_market_items = [
+        item
+        for item in items
+        if item.id in {"dxy-change-1d", "real-yield-10y", "yield-curve-spread"}
+    ]
+
+    market_status = snapshot.status
+    market_reason = snapshot.degraded_reason
+    if snapshot.is_stale and market_status == "ok":
+        market_status = "degraded"
+        market_reason = "market_snapshot_stale"
+
+    return [
+        DataSourceHealth(
+            id="market_snapshot",
+            label="Market Snapshot",
+            source_type="market_snapshot",
+            status=market_status,  # type: ignore[arg-type]
+            freshness_seconds=snapshot.freshness_seconds,
+            expected_lag_seconds=snapshot.stale_after_seconds,
+            cadence="日内/分钟级",
+            degraded_reason=market_reason,
+            coverage=[item.symbol for item in snapshot.instruments[:6]] or [snapshot.asset],
+            url=None,
+        ),
+        DataSourceHealth(
+            id="wgc_gold_demand",
+            label="WGC Gold Demand",
+            source_type="fundamental",
+            status=_source_health_status(wgc_items, indicators.status),  # type: ignore[arg-type]
+            freshness_seconds=_source_health_freshness(wgc_items, indicators.freshness_seconds),
+            expected_lag_seconds=2_678_400,
+            cadence="月度/季度",
+            degraded_reason=_source_health_reason(wgc_items, indicators.degraded_reason),
+            coverage=["央行购金", "ETF flows", "实物/投资需求"],
+            url="https://www.gold.org/goldhub/data/gold-etfs-holdings-and-flows",
+        ),
+        DataSourceHealth(
+            id="cftc_cot",
+            label="CFTC COT",
+            source_type="flow_sentiment",
+            status=_source_health_status(cftc_items, indicators.status),  # type: ignore[arg-type]
+            freshness_seconds=_source_health_freshness(cftc_items, indicators.freshness_seconds),
+            expected_lag_seconds=604_800,
+            cadence="周度",
+            degraded_reason=_source_health_reason(cftc_items, indicators.degraded_reason),
+            coverage=["Managed Money", "投机净仓位", "拥挤度"],
+            url="https://www.cftc.gov/MarketReports/CommitmentsofTraders/index.htm",
+        ),
+        DataSourceHealth(
+            id="cme_fedwatch",
+            label="CME FedWatch",
+            source_type="macro_policy",
+            status=_source_health_status(cme_items, indicators.status),  # type: ignore[arg-type]
+            freshness_seconds=_source_health_freshness(cme_items, indicators.freshness_seconds),
+            expected_lag_seconds=86_400,
+            cadence="日内",
+            degraded_reason=_source_health_reason(cme_items, indicators.degraded_reason),
+            coverage=["政策概率", "FOMC 路径", "降息预期"],
+            url="https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html",
+        ),
+        DataSourceHealth(
+            id="macro_market_rates",
+            label="DXY / Real Yield",
+            source_type="macro_policy",
+            status=_source_health_status(macro_market_items, snapshot.status),  # type: ignore[arg-type]
+            freshness_seconds=_source_health_freshness(macro_market_items, snapshot.freshness_seconds),
+            expected_lag_seconds=snapshot.stale_after_seconds,
+            cadence="日内",
+            degraded_reason=_source_health_reason(macro_market_items, snapshot.degraded_reason),
+            coverage=["DXY", "US10Y/US2Y", "10Y 实际利率代理"],
+            url="https://fred.stlouisfed.org/series/DFII10",
+        ),
+        DataSourceHealth(
+            id="recent_news",
+            label="Recent News",
+            source_type="news",
+            status=news.status,  # type: ignore[arg-type]
+            freshness_seconds=news.freshness_seconds,
+            expected_lag_seconds=max(1, news_expected_lag_seconds),
+            cadence="近实时",
+            degraded_reason=news.degraded_reason,
+            coverage=["宏观新闻", "政策语境", "地缘风险"],
+            url=None,
+        ),
+    ]
+
+
 def _forecast_is_degraded(payload: Dict[str, Any]) -> bool:
-    return str(payload.get("service_status", "ok")) != "ok"
+    if str(payload.get("service_status", "ok")) != "ok":
+        return True
+    return str(payload.get("model_status", "")) in {"loading", "unavailable"}
 
 
 def _forecast_basis(payload: Dict[str, Any]) -> ForecastBasis:
@@ -368,7 +648,7 @@ def _public_to_internal_horizon(horizon: PublicHorizon) -> str:
 
 
 def _snapshot_uses_fallback(snapshot: MarketSnapshotResponse) -> bool:
-    return any(item.source == "synthetic_fallback" for item in snapshot.instruments)
+    return snapshot.status != "ok" or any(item.source == "synthetic_fallback" for item in snapshot.instruments)
 
 
 def _news_uses_fallback(news: RecentNewsResponse) -> bool:
@@ -402,6 +682,95 @@ def _risk_profile_dict(profile: RiskProfile) -> Dict[str, Any]:
     return mapping[profile]
 
 
+def _investor_profile_gate(profile: Optional[InvestorProfile], question: str = "") -> Dict[str, Any]:
+    lowered_question = question.lower()
+    prompt_safety_hits = [
+        token
+        for token in [
+            "ignore previous",
+            "ignore all",
+            "system prompt",
+            "隐藏风险",
+            "忽略",
+            "保证",
+            "稳赚",
+            "必赚",
+            "无风险",
+            "guarantee",
+            "guaranteed",
+            "risk-free",
+            "hide risk",
+        ]
+        if token in lowered_question or token in question
+    ]
+    if profile is None:
+        force_prompt_guard = bool(prompt_safety_hits)
+        return {
+            "investor_profile": None,
+            "score": 5 if force_prompt_guard else 0,
+            "level": "high" if force_prompt_guard else "low",
+            "force_observation": force_prompt_guard,
+            "notes": (
+                ["安全护栏检测到提示注入或确定性收益语言，系统禁止输出激进建议。"]
+                if force_prompt_guard
+                else ["未填写完整问卷，系统仅使用基础风险偏好。"]
+            ),
+            "prompt_safety_hits": prompt_safety_hits,
+        }
+
+    payload = profile.model_dump()
+    score = 0
+    notes: List[str] = []
+    allocation = profile.capital_allocation_pct
+    drawdown = profile.max_drawdown_pct
+    if allocation >= 50:
+        score += 3
+        notes.append("黄金计划资金占比过高。")
+    elif allocation >= 25:
+        score += 2
+        notes.append("黄金计划资金占比偏高。")
+    elif allocation >= 10:
+        score += 1
+        notes.append("黄金计划资金占比需要分步执行。")
+
+    if drawdown <= 5:
+        score += 2
+        notes.append("最大可承受回撤很低。")
+    elif drawdown <= 10:
+        score += 1
+        notes.append("最大可承受回撤偏低。")
+
+    leverage_points = {"none": 0, "low": 1, "medium": 2, "high": 3}[profile.leverage_attitude]
+    score += leverage_points
+    if leverage_points:
+        notes.append("问卷显示存在杠杆意愿。")
+    if profile.experience_level == "beginner":
+        score += 1
+        notes.append("交易经验不足，需要降低执行强度。")
+    if profile.liquidity_need == "high":
+        score += 2
+        notes.append("流动性需求较高，不适合激进暴露。")
+    if profile.current_position in {"long", "short"}:
+        score += 1
+        notes.append("已有方向性持仓，需要先管理现有风险。")
+    if profile.investment_goal == "speculation":
+        score += 1
+        notes.append("投资目标偏投机，需限制追涨杀跌。")
+    if prompt_safety_hits:
+        score += 5
+        notes.append("安全护栏检测到提示注入或确定性收益语言。")
+
+    level = "high" if score >= 5 else "medium" if score >= 2 else "low"
+    return {
+        "investor_profile": payload,
+        "score": score,
+        "level": level,
+        "force_observation": score >= 5,
+        "notes": notes or ["完整问卷未触发额外风险门控。"],
+        "prompt_safety_hits": prompt_safety_hits,
+    }
+
+
 LOGGER = logging.getLogger("goldensense.agent_gateway")
 
 
@@ -416,6 +785,21 @@ def _evidence_query(req: AgentAnalyzeRequest) -> str:
     if primary:
         return primary
     return req.question.strip()
+
+
+def _news_search_query(req: AgentAnalyzeRequest) -> str:
+    primary = (req.optional_news_text or "").strip()
+    if primary:
+        return primary
+    base = req.question.strip()
+    gold_research_terms = "黄金 金价 美元 利率 美联储 ETF CFTC"
+    return f"{base} {gold_research_terms}".strip()
+
+
+def _memory_unavailable_copy(status: str, reason: Optional[str]) -> str:
+    if status == "unavailable" and reason and ("not_started" in reason or "not_loaded" in reason):
+        return "历史类比未启用：尚未初始化 historical_events 检索库，本轮不把它作为方向证据。"
+    return f"历史记忆检索当前处于 {status} 状态，原因：{reason or '未返回'}。"
 
 
 def _degradation_flags(
@@ -438,6 +822,21 @@ def _degradation_flags(
         flags.append("news_synthetic_fallback")
     if memory_lookup.status != "ok":
         flags.append(f"historical_memory_{memory_lookup.status}")
+    return flags
+
+
+def _forecast_degradation_flags(
+    *,
+    snapshot: MarketSnapshotResponse,
+    forecast_map: Dict[PublicHorizon, Dict[str, Any]],
+) -> List[str]:
+    flags: List[str] = []
+    if snapshot.is_stale:
+        flags.append("market_snapshot_stale")
+    if _snapshot_uses_fallback(snapshot):
+        flags.append("market_snapshot_synthetic_fallback")
+    if any(_forecast_is_degraded(item) for item in forecast_map.values()):
+        flags.append("quant_forecast_degraded")
     return flags
 
 
@@ -698,6 +1097,14 @@ class AgentTraceStore:
                 return None
             raise TraceStoreUnavailableError("trace_store_load_failed") from exc
 
+    def health(self) -> Dict[str, Any]:
+        self._prune_memory()
+        return {
+            "db_ready": self._db_ready,
+            "allow_memory_fallback": self._allow_memory_fallback,
+            "memory_items": len(self._memory),
+        }
+
     def _persist_analysis_sync(self, row: Dict[str, Any]) -> None:
         with psycopg.connect(self._database_url) as conn:
             with conn.cursor() as cur:
@@ -910,6 +1317,16 @@ class HttpResearchToolbox:
             resp.raise_for_status()
             return MarketSnapshotResponse(**resp.json())
 
+    async def get_market_indicators(self) -> MarketIndicatorsResponse:
+        resp = await self._http.get(self._cfg.market_indicators_url)
+        resp.raise_for_status()
+        return MarketIndicatorsResponse(**resp.json())
+
+    async def get_gold_history(self) -> GoldPriceHistoryResponse:
+        resp = await self._http.get(self._cfg.market_history_url)
+        resp.raise_for_status()
+        return GoldPriceHistoryResponse(**resp.json())
+
     async def get_quant_forecast(self, horizon: PublicHorizon) -> Dict[str, Any]:
         mapped = _public_to_internal_horizon(horizon)
         payload = {
@@ -920,6 +1337,30 @@ class HttpResearchToolbox:
         resp = await self._http.post(self._cfg.forecast_url, json=payload)
         resp.raise_for_status()
         return resp.json()
+
+    async def get_quant_forecasts(self, horizons: List[PublicHorizon]) -> Dict[PublicHorizon, Dict[str, Any]]:
+        batch_url = (
+            self._cfg.forecast_url.replace("/api/v1/forecast", "/api/v1/forecast/batch")
+            if "/api/v1/forecast" in self._cfg.forecast_url
+            else f"{self._cfg.forecast_url.rstrip('/')}/batch"
+        )
+        mapped_horizons = [_public_to_internal_horizon(horizon) for horizon in horizons]
+        payload = {
+            "asset_symbol": "XAUUSD",
+            "horizons": mapped_horizons,
+            "current_timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        resp = await self._http.post(batch_url, json=payload)
+        if resp.status_code in {404, 405}:
+            return {horizon: await self.get_quant_forecast(horizon) for horizon in horizons}
+        resp.raise_for_status()
+        data = resp.json()
+        forecasts = data.get("forecasts", {})
+        return {
+            horizon: forecasts[_public_to_internal_horizon(horizon)]
+            for horizon in horizons
+            if _public_to_internal_horizon(horizon) in forecasts
+        }
 
     async def search_recent_news(self, query: str, limit: int = 6) -> RecentNewsResponse:
         cached: Optional[RecentNewsResponse] = None
@@ -1029,6 +1470,7 @@ class OpenAINarrator:
             "recent_news": bundle.news.model_dump(mode="json"),
             "rag_events": [event.model_dump() for event in bundle.rag_events],
             "macro_context": bundle.macro_context,
+            "risk_gate": bundle.risk_gate,
             "draft": draft.model_dump(),
         }
         schema = NarrativeOutput.model_json_schema()
@@ -1092,10 +1534,27 @@ class AgentAnalysisService:
     async def analyze_internal(self, req: AgentAnalyzeRequest) -> AnalysisComputation:
         t0 = datetime.now(timezone.utc)
         evidence_query = _evidence_query(req)
-        snapshot, forecast_map, news, memory_lookup, tool_trace = await self._gather(req, evidence_query=evidence_query)
+        news_query = _news_search_query(req)
+        snapshot, forecast_map, news, memory_lookup, tool_trace = await self._gather(
+            req,
+            evidence_query=evidence_query,
+            news_query=news_query,
+        )
         rag_events = memory_lookup.items
         news_sentiment = self._derive_news_sentiment(req, news)
         risk_profile = self._toolbox.get_user_risk_profile(req.risk_profile)
+        risk_gate = _investor_profile_gate(req.investor_profile, req.question)
+        if req.investor_profile is not None:
+            risk_profile = dict(risk_profile)
+            risk_profile["investor_profile"] = risk_gate["investor_profile"]
+            risk_profile["force_observation"] = risk_gate["force_observation"]
+            risk_profile["gate_level"] = risk_gate["level"]
+            risk_profile["description"] = (
+                f"{risk_profile['description']} 完整问卷："
+                f"资金占比 {req.investor_profile.capital_allocation_pct:.1f}%，"
+                f"最大可承受回撤 {req.investor_profile.max_drawdown_pct:.1f}%，"
+                f"杠杆态度 {req.investor_profile.leverage_attitude}。"
+            )
         macro_context = self._toolbox.get_macro_context(snapshot, news)
         selected_forecast = forecast_map[req.horizon]
         selected_outlook = self._evaluate_horizon_outlook(
@@ -1110,16 +1569,10 @@ class AgentAnalysisService:
             risk_profile=risk_profile,
         )
         horizon_forecasts = [
-            self._build_horizon_forecast_card(
+            self._build_stable_horizon_forecast_card(
                 horizon=horizon,
                 forecast=forecast_map[horizon],
                 snapshot=snapshot,
-                news=news,
-                news_sentiment=news_sentiment,
-                rag_events=rag_events,
-                memory_lookup=memory_lookup,
-                macro_context=macro_context,
-                risk_profile=risk_profile,
             )
             for horizon in ("24h", "7d", "30d")
         ]
@@ -1136,6 +1589,8 @@ class AgentAnalysisService:
             evidence_query=evidence_query,
             horizon=req.horizon,
             risk_profile=risk_profile,
+            investor_profile=risk_gate["investor_profile"],
+            risk_gate=risk_gate,
             snapshot=snapshot,
             forecast=selected_forecast,
             news=news,
@@ -1209,7 +1664,9 @@ class AgentAnalysisService:
                         "memory_status": bundle.memory_status,
                         "memory_degraded_reason": bundle.memory_degraded_reason,
                         "macro_context": bundle.macro_context,
+                        "investor_profile": bundle.investor_profile,
                     },
+                    "risk_gate": bundle.risk_gate,
                     "evidence_cards": [card.model_dump() for card in evidence_cards],
                     "citations": [citation.model_dump() for citation in citations],
                 },
@@ -1233,30 +1690,264 @@ class AgentAnalysisService:
             citations=citations,
         )
 
+    async def current_forecasts(self) -> AgentForecastsResponse:
+        t0 = datetime.now(timezone.utc)
+        snapshot, forecast_map, tool_trace = await self._gather_forecast_baseline()
+        horizon_forecasts = [
+            self._build_stable_horizon_forecast_card(
+                horizon=horizon,
+                forecast=forecast_map[horizon],
+                snapshot=snapshot,
+            )
+            for horizon in ("24h", "7d", "30d")
+        ]
+        elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
+        return AgentForecastsResponse(
+            as_of=snapshot.as_of,
+            market_status={
+                "asset": snapshot.asset,
+                "as_of": snapshot.as_of.isoformat(),
+                "latest_price": snapshot.latest_price,
+                "price_change_pct_1d": snapshot.price_change_pct_1d,
+                "freshness_seconds": snapshot.freshness_seconds,
+                "is_stale": snapshot.is_stale,
+                "status": snapshot.status,
+                "degraded_reason": snapshot.degraded_reason,
+            },
+            horizon_forecasts=horizon_forecasts,
+            degradation_flags=_forecast_degradation_flags(snapshot=snapshot, forecast_map=forecast_map),
+            timing_ms={
+                "total": elapsed_ms,
+                **{str(item["tool"]): int(item["elapsed_ms"]) for item in tool_trace},
+            },
+        )
+
+    async def current_dashboard(self) -> AgentDashboardResponse:
+        t0 = datetime.now(timezone.utc)
+        snapshot, forecast_map, forecast_trace = await self._gather_forecast_baseline()
+        horizon_forecasts = [
+            self._build_stable_horizon_forecast_card(
+                horizon=horizon,
+                forecast=forecast_map[horizon],
+                snapshot=snapshot,
+            )
+            for horizon in ("24h", "7d", "30d")
+        ]
+        indicators_started = datetime.now(timezone.utc)
+        try:
+            indicators = await self._toolbox.get_market_indicators()
+            indicators_elapsed = int((datetime.now(timezone.utc) - indicators_started).total_seconds() * 1000)
+            indicators_trace = self._tool_trace_entry(
+                "get_market_indicators",
+                indicators.model_dump(mode="json"),
+                elapsed_ms=indicators_elapsed,
+                status="degraded" if indicators.status != "ok" else "ok",
+            )
+            indicators_trace["source_status"] = indicators.status
+            indicators_trace["degraded"] = indicators.status != "ok"
+            indicators_trace["fallback_reason"] = indicators.degraded_reason
+        except Exception as exc:
+            indicators_elapsed = int((datetime.now(timezone.utc) - indicators_started).total_seconds() * 1000)
+            indicators = _fallback_market_indicators(snapshot, f"{type(exc).__name__}:{exc}")
+            indicators_trace = self._tool_trace_entry(
+                "get_market_indicators",
+                indicators.model_dump(mode="json"),
+                elapsed_ms=indicators_elapsed,
+                status="fallback",
+                error=f"{type(exc).__name__}:{exc}",
+            )
+            indicators_trace["source_status"] = indicators.status
+            indicators_trace["degraded"] = True
+            indicators_trace["fallback_reason"] = indicators.degraded_reason
+
+        history_started = datetime.now(timezone.utc)
+        try:
+            gold_history = await self._toolbox.get_gold_history()
+            history_elapsed = int((datetime.now(timezone.utc) - history_started).total_seconds() * 1000)
+            history_trace = self._tool_trace_entry(
+                "get_gold_history",
+                gold_history.model_dump(mode="json"),
+                elapsed_ms=history_elapsed,
+                status="ok" if not gold_history.source.startswith("synthetic_fallback") else "degraded",
+            )
+            history_trace["source_status"] = "ok"
+            history_trace["degraded"] = gold_history.source.startswith("synthetic_fallback")
+            history_trace["fallback_reason"] = None if not history_trace["degraded"] else gold_history.source
+        except Exception as exc:
+            history_elapsed = int((datetime.now(timezone.utc) - history_started).total_seconds() * 1000)
+            gold_history = _fallback_gold_history(snapshot, f"{type(exc).__name__}:{exc}")
+            history_trace = self._tool_trace_entry(
+                "get_gold_history",
+                gold_history.model_dump(mode="json"),
+                elapsed_ms=history_elapsed,
+                status="fallback",
+                error=f"{type(exc).__name__}:{exc}",
+            )
+            history_trace["source_status"] = "degraded"
+            history_trace["degraded"] = True
+            history_trace["fallback_reason"] = gold_history.source
+
+        news_started = datetime.now(timezone.utc)
+        try:
+            news = await self._toolbox.search_recent_news("黄金 美元 利率 ETF CFTC", limit=6)
+            news_elapsed = int((datetime.now(timezone.utc) - news_started).total_seconds() * 1000)
+            news_trace = self._tool_trace_entry(
+                "search_dashboard_news",
+                news,
+                elapsed_ms=news_elapsed,
+                status="degraded" if news.status != "ok" else "ok",
+            )
+        except Exception as exc:
+            news_elapsed = int((datetime.now(timezone.utc) - news_started).total_seconds() * 1000)
+            news = _fallback_recent_news("黄金市场")
+            news_trace = self._tool_trace_entry(
+                "search_dashboard_news",
+                news,
+                elapsed_ms=news_elapsed,
+                status="fallback",
+                error=f"{type(exc).__name__}:{exc}",
+            )
+
+        degradation_flags = _forecast_degradation_flags(snapshot=snapshot, forecast_map=forecast_map)
+        if indicators.status != "ok":
+            degradation_flags.append("market_indicators_degraded")
+        if history_trace.get("degraded") or history_trace.get("status") == "fallback":
+            degradation_flags.append("gold_history_degraded")
+        if news.status != "ok":
+            degradation_flags.append(f"news_{news.status}")
+        degradation_flags = list(dict.fromkeys(degradation_flags))
+        tool_trace = [*forecast_trace, indicators_trace, history_trace, news_trace]
+        elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
+        degraded_tools = [item["tool"] for item in tool_trace if item.get("degraded") or item.get("status") == "fallback"]
+        quality_status = "degraded" if degradation_flags or degraded_tools else "ok"
+        source_health = _build_dashboard_source_health(
+            snapshot=snapshot,
+            indicators=indicators,
+            news=news,
+            news_expected_lag_seconds=self._cfg.news_stale_after_seconds,
+        )
+        return AgentDashboardResponse(
+            as_of=snapshot.as_of,
+            market_status={
+                "asset": snapshot.asset,
+                "as_of": snapshot.as_of.isoformat(),
+                "latest_price": snapshot.latest_price,
+                "price_change_pct_1d": snapshot.price_change_pct_1d,
+                "freshness_seconds": snapshot.freshness_seconds,
+                "is_stale": snapshot.is_stale,
+                "status": snapshot.status,
+                "degraded_reason": snapshot.degraded_reason,
+            },
+            horizon_forecasts=horizon_forecasts,
+            indicator_groups=indicators.groups,
+            gold_history=gold_history,
+            recent_news=news.items[:6],
+            citations=[item.model_dump(mode="json") for item in indicators.citations],
+            source_health=source_health,
+            data_quality={
+                "status": quality_status,
+                "degraded_tools": degraded_tools,
+                "freshness_seconds": snapshot.freshness_seconds,
+                "indicator_status": indicators.status,
+                "news_status": news.status,
+            },
+            degradation_flags=degradation_flags,
+            timing_ms={
+                "total": elapsed_ms,
+                **{str(item["tool"]): int(item["elapsed_ms"]) for item in tool_trace},
+            },
+        )
+
+    def _forecast_trace_entry(
+        self,
+        horizon: PublicHorizon,
+        payload: Dict[str, Any],
+        *,
+        elapsed_ms: int,
+        status: str,
+        error: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        trace = self._tool_trace_entry(
+            f"get_quant_forecast_{horizon}",
+            payload,
+            elapsed_ms=elapsed_ms,
+            status=status,
+            error=error,
+        )
+        trace["status"] = "degraded" if trace["degraded"] and status == "ok" else status
+        return trace
+
+    async def _gather_quant_forecasts(
+        self, horizons: Sequence[PublicHorizon]
+    ) -> Tuple[Dict[PublicHorizon, Dict[str, Any]], List[Dict[str, Any]]]:
+        batch_method = getattr(self._toolbox, "get_quant_forecasts", None)
+        if callable(batch_method):
+            started = datetime.now(timezone.utc)
+            try:
+                payload = await batch_method(list(horizons))
+                elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+                forecast_map: Dict[PublicHorizon, Dict[str, Any]] = {}
+                traces: List[Dict[str, Any]] = []
+                for horizon in horizons:
+                    forecast = payload.get(horizon)
+                    if forecast is None:
+                        forecast = _fallback_quant_forecast("batch_missing_horizon")
+                        status = "fallback"
+                        error = "batch_missing_horizon"
+                    else:
+                        status = "ok"
+                        error = None
+                    forecast_map[horizon] = forecast
+                    traces.append(
+                        self._forecast_trace_entry(
+                            horizon,
+                            forecast,
+                            elapsed_ms=elapsed_ms,
+                            status=status,
+                            error=error,
+                        )
+                    )
+                return forecast_map, traces
+            except Exception as exc:
+                elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+                reason = f"{type(exc).__name__}:{exc}"
+                forecast_map = {horizon: _fallback_quant_forecast(reason) for horizon in horizons}
+                traces = [
+                    self._forecast_trace_entry(
+                        horizon,
+                        forecast_map[horizon],
+                        elapsed_ms=elapsed_ms,
+                        status="fallback",
+                        error=reason,
+                    )
+                    for horizon in horizons
+                ]
+                return forecast_map, traces
+
+        timed = await asyncio.gather(
+            *[
+                self._timed_optional_tool(
+                    f"get_quant_forecast_{horizon}",
+                    self._toolbox.get_quant_forecast(horizon),
+                    lambda exc: _fallback_quant_forecast(f"{type(exc).__name__}:{exc}"),
+                )
+                for horizon in horizons
+            ]
+        )
+        forecast_map = {horizon: timed[idx][0] for idx, horizon in enumerate(horizons)}
+        traces = [item[1] for item in timed]
+        return forecast_map, traces
+
     async def _gather(
-        self, req: AgentAnalyzeRequest, *, evidence_query: str
+        self, req: AgentAnalyzeRequest, *, evidence_query: str, news_query: str
     ) -> Tuple[MarketSnapshotResponse, Dict[PublicHorizon, Dict[str, Any]], RecentNewsResponse, HistoricalEventsLookup, List[Dict[str, Any]]]:
         try:
-            timed_snapshot, timed_forecast_24h, timed_forecast_7d, timed_forecast_30d, timed_news, timed_rag = await asyncio.gather(
+            timed_snapshot, timed_forecasts, timed_news, timed_rag = await asyncio.gather(
                 self._timed_tool("get_market_snapshot", self._toolbox.get_market_snapshot()),
-                self._timed_optional_tool(
-                    "get_quant_forecast_24h",
-                    self._toolbox.get_quant_forecast("24h"),
-                    lambda exc: _fallback_quant_forecast(f"{type(exc).__name__}:{exc}"),
-                ),
-                self._timed_optional_tool(
-                    "get_quant_forecast_7d",
-                    self._toolbox.get_quant_forecast("7d"),
-                    lambda exc: _fallback_quant_forecast(f"{type(exc).__name__}:{exc}"),
-                ),
-                self._timed_optional_tool(
-                    "get_quant_forecast_30d",
-                    self._toolbox.get_quant_forecast("30d"),
-                    lambda exc: _fallback_quant_forecast(f"{type(exc).__name__}:{exc}"),
-                ),
+                self._gather_quant_forecasts(("24h", "7d", "30d")),
                 self._timed_optional_tool(
                     "search_recent_news",
-                    self._toolbox.search_recent_news(evidence_query, limit=6),
+                    self._toolbox.search_recent_news(news_query, limit=6),
                     lambda exc: _fallback_recent_news(evidence_query),
                 ),
                 self._timed_optional_tool(
@@ -1278,21 +1969,37 @@ class AgentAnalysisService:
                     "message": f"Upstream tool failed: {type(exc).__name__}: {exc}",
                 },
             ) from exc
+        forecast_map, forecast_trace = timed_forecasts
         tool_trace = [
             timed_snapshot[1],
-            timed_forecast_24h[1],
-            timed_forecast_7d[1],
-            timed_forecast_30d[1],
+            *forecast_trace,
             timed_news[1],
             timed_rag[1],
         ]
         snapshot, news, memory_lookup = timed_snapshot[0], timed_news[0], _normalize_memory_lookup(timed_rag[0])
-        forecast_map: Dict[PublicHorizon, Dict[str, Any]] = {
-            "24h": timed_forecast_24h[0],
-            "7d": timed_forecast_7d[0],
-            "30d": timed_forecast_30d[0],
-        }
         return snapshot, forecast_map, news, memory_lookup, tool_trace
+
+    async def _gather_forecast_baseline(self) -> Tuple[MarketSnapshotResponse, Dict[PublicHorizon, Dict[str, Any]], List[Dict[str, Any]]]:
+        try:
+            timed_snapshot, timed_forecasts = await asyncio.gather(
+                self._timed_tool("get_market_snapshot", self._toolbox.get_market_snapshot()),
+                self._gather_quant_forecasts(("24h", "7d", "30d")),
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_code": "upstream_unavailable",
+                    "message": f"Forecast baseline failed: {type(exc).__name__}: {exc}",
+                },
+            ) from exc
+
+        forecast_map, forecast_trace = timed_forecasts
+        tool_trace = [
+            timed_snapshot[1],
+            *forecast_trace,
+        ]
+        return timed_snapshot[0], forecast_map, tool_trace
 
     def _tool_trace_entry(self, name: str, payload: Any, *, elapsed_ms: int, status: str, error: Optional[str] = None) -> Dict[str, Any]:
         source_status = "ok"
@@ -1300,7 +2007,12 @@ class AgentAnalysisService:
         fallback_reason = None
         source_freshness_seconds = None
 
-        if isinstance(payload, RecentNewsResponse):
+        if isinstance(payload, MarketSnapshotResponse):
+            source_status = payload.status
+            degraded = payload.status != "ok"
+            fallback_reason = payload.degraded_reason
+            source_freshness_seconds = payload.source_freshness_seconds
+        elif isinstance(payload, RecentNewsResponse):
             source_status = payload.status
             degraded = payload.status != "ok"
             fallback_reason = payload.degraded_reason
@@ -1325,6 +2037,12 @@ class AgentAnalysisService:
             "fallback_reason": fallback_reason,
             "source_freshness_seconds": source_freshness_seconds,
         }
+        if isinstance(payload, dict) and "model_status" in payload:
+            trace["model_status"] = payload.get("model_status")
+            trace["model_loaded"] = payload.get("model_loaded")
+            trace["model_checkpoint_path"] = payload.get("model_checkpoint_path")
+        if isinstance(payload, dict) and "forecast_basis" in payload:
+            trace["forecast_basis"] = payload.get("forecast_basis")
         if error is not None:
             trace["error"] = error
         return trace
@@ -1444,7 +2162,7 @@ class AgentAnalysisService:
             _snapshot_uses_fallback(snapshot)
             or _forecast_is_degraded(forecast)
             or _news_uses_fallback(news)
-            or memory_lookup.status != "ok"
+            or news.status != "ok"
         )
         basis = _forecast_basis(forecast)
         low_confidence_threshold = {"24h": 0.56, "7d": 0.58, "30d": 0.6}[horizon]
@@ -1452,6 +2170,7 @@ class AgentAnalysisService:
         is_high_risk = bool(
             snapshot.is_stale
             or has_degraded_inputs
+            or bool(risk_profile.get("force_observation"))
             or (vix_value is not None and vix_value >= self._cfg.vix_circuit_breaker_threshold)
         )
 
@@ -1474,6 +2193,8 @@ class AgentAnalysisService:
         horizon_label = {"24h": "T+1", "7d": "T+7", "30d": "T+30"}[horizon]
         if basis == "degraded_fallback":
             basis_reason = f"{horizon_label} 量化暂不可用，当前已退回保守中性判断。"
+        elif risk_profile.get("force_observation"):
+            basis_reason = f"{horizon_label} 方向基线存在，但完整问卷触发风险门控，本轮只能观望。"
         elif basis == "heuristic_proxy":
             basis_reason = f"{horizon_label} 当前使用代理预测，主要参考趋势、美元、利率和自动抓取的新闻环境。"
         else:
@@ -1516,6 +2237,76 @@ class AgentAnalysisService:
             ][:4],
         }
 
+    def _build_stable_horizon_forecast_card(
+        self,
+        *,
+        horizon: PublicHorizon,
+        forecast: Dict[str, Any],
+        snapshot: MarketSnapshotResponse,
+    ) -> HorizonForecastCard:
+        probability = _safe_float(forecast.get("probability")) or 0.5
+        quant_direction = int(forecast.get("direction_prediction", 0) or 0)
+        basis = _forecast_basis(forecast)
+        vix_value = next((item.price for item in snapshot.instruments if item.symbol == "VIX"), None)
+        is_high_risk = bool(
+            snapshot.is_stale
+            or _snapshot_uses_fallback(snapshot)
+            or _forecast_is_degraded(forecast)
+            or (vix_value is not None and vix_value >= self._cfg.vix_circuit_breaker_threshold)
+        )
+        low_confidence_threshold = {"24h": 0.56, "7d": 0.58, "30d": 0.6}[horizon]
+
+        stance: SummaryStance = "中性"
+        action: SummaryAction = "观望"
+        confidence_band: ConfidenceBand = "低"
+        if is_high_risk or probability < low_confidence_threshold:
+            stance = "高风险观望" if is_high_risk else "中性"
+            action = "观望"
+            confidence_band = "低"
+        elif quant_direction > 0:
+            stance = "偏多"
+            action = "小仓试探"
+            confidence_band = "高" if probability >= 0.67 and basis == "ensemble_model" else "中"
+        elif quant_direction < 0:
+            stance = "偏空"
+            action = "降低暴露"
+            confidence_band = "高" if probability >= 0.67 and basis == "ensemble_model" else "中"
+
+        horizon_label = {"24h": "T+1", "7d": "T+7", "30d": "T+30"}[horizon]
+        if basis == "degraded_fallback":
+            basis_reason = f"{horizon_label} 量化预测暂不可用，当前只保留保守占位。"
+        elif basis == "heuristic_proxy":
+            basis_reason = f"{horizon_label} 使用代理预测，未读取用户问题文本。"
+        else:
+            basis_reason = f"{horizon_label} 稳定量化方向为 {'偏多' if quant_direction > 0 else '偏空' if quant_direction < 0 else '中性'}，概率约 {probability * 100:.1f}%。"
+
+        market_reason = (
+            f"市场快照截至 {snapshot.as_of.isoformat()}，XAUUSD 最新价约 {snapshot.latest_price:.2f}。"
+        )
+        freshness_reason = (
+            "行情快照或模型处于降级状态，因此该预测需要按低置信度处理。"
+            if is_high_risk
+            else "该卡只使用行情快照和量化模型输出，不随聊天输入改写。"
+        )
+        horizon_reason = {
+            "24h": "T+1 用于短线方向基线，适合和即时新闻解释分开阅读。",
+            "7d": "T+7 用于一周方向基线，避免单条问题改变市场预测。",
+            "30d": "T+30 用于中期参考，不等同于独立长期交易建议。",
+        }[horizon]
+
+        return HorizonForecastCard(
+            horizon=horizon,
+            stance=stance,
+            confidence_band=confidence_band,
+            action=action,
+            probability=probability,
+            basis=basis,
+            model_status=str(forecast.get("model_status", "unknown")),
+            model_loaded=bool(forecast.get("model_loaded", False)),
+            model_checkpoint_path=forecast.get("model_checkpoint_path"),
+            reasons=[basis_reason, market_reason, freshness_reason, horizon_reason],
+        )
+
     def _build_horizon_forecast_card(
         self,
         *,
@@ -1547,6 +2338,9 @@ class AgentAnalysisService:
             action=outlook["action"],
             probability=float(outlook["probability"]),
             basis=outlook["basis"],
+            model_status=str(forecast.get("model_status", "unknown")),
+            model_loaded=bool(forecast.get("model_loaded", False)),
+            model_checkpoint_path=forecast.get("model_checkpoint_path"),
             reasons=outlook["reasons"],
         )
 
@@ -1623,7 +2417,7 @@ class AgentAnalysisService:
                     id="cit-memory",
                     label="历史相似事件",
                     source_type="historical_analogs",
-                    excerpt=f"历史记忆检索当前处于 {bundle.memory_status} 状态：{bundle.memory_degraded_reason or '无可用原因'}。",
+                    excerpt=_memory_unavailable_copy(bundle.memory_status, bundle.memory_degraded_reason),
                 )
             )
         citations.append(
@@ -1639,7 +2433,10 @@ class AgentAnalysisService:
                 id="cit-risk",
                 label="用户风险画像",
                 source_type="risk_profile",
-                excerpt=str(bundle.risk_profile["description"]),
+                excerpt=(
+                    f"{bundle.risk_profile['description']} 风险门控："
+                    f"{bundle.risk_gate.get('level')} / {', '.join(bundle.risk_gate.get('notes', []))}"
+                ),
             )
         )
         return citations
@@ -1723,7 +2520,7 @@ class AgentAnalysisService:
                 title="历史相似事件",
                 signal_type="memory",
                 takeaway=(
-                    f"历史记忆检索当前处于 {bundle.memory_status} 状态，原因：{bundle.memory_degraded_reason or '未返回'}。"
+                    _memory_unavailable_copy(bundle.memory_status, bundle.memory_degraded_reason)
                     if bundle.memory_status != "ok"
                     else (
                         "历史相似事件均值表现 "
@@ -1752,7 +2549,10 @@ class AgentAnalysisService:
                 id="ev-risk",
                 title="用户风险画像",
                 signal_type="risk",
-                takeaway=f"{bundle.risk_profile['label']}：{bundle.risk_profile['description']}",
+                takeaway=(
+                    f"{bundle.risk_profile['label']}：{bundle.risk_profile['description']} "
+                    f"问卷门控等级 {bundle.risk_gate.get('level')}。"
+                ),
                 direction="neutral",
                 citation_ids=["cit-risk"],
             )
@@ -1765,7 +2565,7 @@ class AgentAnalysisService:
         confidence_band: ConfidenceBand = "低"
 
         bullish = bundle.quant_direction > 0
-        if bundle.is_high_risk or bundle.has_conflict or bundle.is_low_confidence:
+        if bundle.risk_gate.get("force_observation") or bundle.is_high_risk or bundle.has_conflict or bundle.is_low_confidence:
             stance = "高风险观望"
             action = "观望"
             confidence_band = "低"
@@ -1785,6 +2585,11 @@ class AgentAnalysisService:
 
         reasons = [
             (
+                f"完整问卷触发风险画像门控：{' '.join(bundle.risk_gate.get('notes', []))}"
+                if bundle.risk_gate.get("force_observation")
+                else ""
+            ),
+            (
                 "量化引擎当前不可用，系统已切换为保守中性处理。"
                 if _forecast_is_degraded(bundle.forecast)
                 else (
@@ -1796,6 +2601,7 @@ class AgentAnalysisService:
             bundle.macro_context["dollar_message"],
             bundle.macro_context["news_message"],
         ]
+        reasons = [reason for reason in reasons if reason][:4]
         invalidators = [
             "如果美元和实际利率同步快速走强，当前观点需要重新评估。",
             "如果接下来 1-2 个交易时段新闻方向反转，历史类比可能失效。",
@@ -1803,7 +2609,13 @@ class AgentAnalysisService:
         ]
         disclaimer = "本内容仅用于帮助理解黄金市场，不构成个性化投资建议，也不替代你自己的风险决策。"
 
-        if bundle.has_degraded_inputs:
+        if bundle.risk_gate.get("force_observation"):
+            risk_banner = RiskBanner(
+                level="high",
+                title="问卷风险门控",
+                message="完整风险问卷显示本轮暴露与承受能力不匹配，系统只输出观望和风险边界。",
+            )
+        elif bundle.has_degraded_inputs:
             risk_banner = RiskBanner(
                 level="high",
                 title="降级模式",
@@ -1891,6 +2703,11 @@ def _legacy_risk_result(resp: AgentAnalyzeResponse, vix_value: Optional[float], 
     }
 
 
+def _health_url(service_url: str) -> str:
+    base = service_url.split("/api/", 1)[0].rstrip("/")
+    return f"{base}/health/ready"
+
+
 def create_app(
     *,
     toolbox: Optional[HttpResearchToolbox] = None,
@@ -1899,13 +2716,15 @@ def create_app(
     trace_store: Optional[AgentTraceStore] = None,
     http_client: Optional[httpx.AsyncClient] = None,
 ) -> FastAPI:
-    tool_timeout_seconds = float(_env("AGENT_TOOL_TIMEOUT_SECONDS", "4.0"))
+    tool_timeout_seconds = float(_env("AGENT_TOOL_TIMEOUT_SECONDS", "35.0"))
     tool_connect_timeout_seconds = float(_env("AGENT_TOOL_CONNECT_TIMEOUT_SECONDS", "1.5"))
     app_env = _env("APP_ENV", "development").lower()
     cfg = AgentGatewayConfig(
         forecast_url=_env("FORECAST_URL", "http://localhost:8010/api/v1/forecast"),
         memory_url=_env("MEMORY_URL", "http://localhost:8012/api/v1/memory/search"),
         market_snapshot_url=_env("MARKET_SNAPSHOT_URL", "http://localhost:8014/api/v1/market/snapshot/latest"),
+        market_indicators_url=_env("MARKET_INDICATORS_URL", "http://localhost:8014/api/v1/market/indicators/current"),
+        market_history_url=_env("MARKET_HISTORY_URL", "http://localhost:8014/api/v1/market/gold/history"),
         recent_news_url=_env("RECENT_NEWS_URL", "http://localhost:8016/api/v1/news/recent"),
         default_model=_env("AGENT_DEFAULT_MODEL", "gpt-5.4-mini"),
         complex_model=_env("AGENT_COMPLEX_MODEL", "gpt-5.4"),
@@ -1916,14 +2735,18 @@ def create_app(
     database_url = _env("DATABASE_URL", "postgresql://localhost/postgres")
     public_keys_raw = os.environ.get("AGENT_PUBLIC_API_KEYS")
     internal_keys_raw = os.environ.get("AGENT_INTERNAL_API_KEYS")
-    if app_env == "production" and (not public_keys_raw or not internal_keys_raw):
-        raise RuntimeError("AGENT_PUBLIC_API_KEYS and AGENT_INTERNAL_API_KEYS must be set in production.")
+    if app_env != "development" and (not public_keys_raw or not internal_keys_raw):
+        raise RuntimeError("AGENT_PUBLIC_API_KEYS and AGENT_INTERNAL_API_KEYS must be set outside development.")
     public_api_keys = _split_csv(public_keys_raw or "dev-public-key")
     internal_api_keys = _split_csv(internal_keys_raw or "dev-internal-key")
+    if app_env != "development" and (
+        "dev-public-key" in public_api_keys or "dev-internal-key" in internal_api_keys
+    ):
+        raise RuntimeError("Default development API keys are not allowed outside development.")
     analyze_rate_limit_per_minute = int(_env("AGENT_ANALYZE_RATE_LIMIT_PER_MINUTE", "60"))
     analyze_rate_limit_window_seconds = int(_env("AGENT_ANALYZE_RATE_LIMIT_WINDOW_SECONDS", "60"))
     allow_trace_memory_fallback = (
-        os.environ.get("AGENT_ALLOW_TRACE_MEMORY_FALLBACK", "1" if app_env != "production" else "0") != "0"
+        os.environ.get("AGENT_ALLOW_TRACE_MEMORY_FALLBACK", "1" if app_env == "development" else "0") != "0"
     )
     trace_memory_ttl_seconds = int(_env("AGENT_TRACE_MEMORY_TTL_SECONDS", "3600"))
     trace_memory_max_items = int(_env("AGENT_TRACE_MEMORY_MAX_ITEMS", "200"))
@@ -1934,6 +2757,9 @@ def create_app(
         http = http_client or httpx.AsyncClient(
             timeout=httpx.Timeout(tool_timeout_seconds, connect=tool_connect_timeout_seconds)
         )
+        app.state.http = http
+        app.state.cfg = cfg
+        app.state.uses_injected_toolbox = toolbox is not None
         app.state.toolbox = toolbox or HttpResearchToolbox(http, cfg)
         app.state.narrator = narrator or OpenAINarrator(cfg)
         app.state.sentiment_scorer = sentiment_scorer or KeywordSentimentScorer()
@@ -1980,11 +2806,62 @@ def create_app(
 
     @app.get("/health")
     async def health() -> Dict[str, Any]:
+        trace_health = app.state.trace_store.health() if hasattr(app.state.trace_store, "health") else {}
         return {
             "status": "ok",
             "mode": "educational-retail-agent",
             "auth": "api-key",
+            "trace_store": trace_health,
         }
+
+    @app.get("/health/live")
+    async def health_live() -> Dict[str, str]:
+        return {"status": "ok", "service": "agent_gateway"}
+
+    @app.get("/health/ready")
+    async def health_ready() -> Response:
+        trace_health = app.state.trace_store.health() if hasattr(app.state.trace_store, "health") else {}
+        errors: List[str] = []
+        if not trace_health.get("db_ready") and not trace_health.get("allow_memory_fallback"):
+            errors.append("trace_store_unavailable")
+
+        downstream: Dict[str, Any] = {}
+        if getattr(app.state, "uses_injected_toolbox", False):
+            downstream["toolbox"] = {"status": "skipped", "reason": "injected_toolbox"}
+        else:
+            http: httpx.AsyncClient = app.state.http
+            health_targets = {
+                "forecast": _health_url(cfg.forecast_url),
+                "memory": _health_url(cfg.memory_url),
+                "market": _health_url(cfg.market_snapshot_url),
+                "indicators": _health_url(cfg.market_indicators_url),
+                "history": _health_url(cfg.market_history_url),
+                "news": _health_url(cfg.recent_news_url),
+            }
+            for name, url in health_targets.items():
+                try:
+                    resp = await http.get(url)
+                    ok = resp.status_code < 400
+                    downstream[name] = {
+                        "status_code": resp.status_code,
+                        "status": "ok" if ok else "unavailable",
+                    }
+                    if not ok:
+                        errors.append(f"{name}_unavailable")
+                except Exception as exc:
+                    downstream[name] = {"status": "unavailable", "error": f"{type(exc).__name__}:{exc}"}
+                    errors.append(f"{name}_unavailable")
+
+        status = "ok" if not errors else "unavailable"
+        return JSONResponse(
+            status_code=200 if not errors else 503,
+            content={
+                "status": status,
+                "trace_store": trace_health,
+                "downstream": downstream,
+                "errors": errors,
+            },
+        )
 
     @app.post("/api/v1/agent/analyze", response_model=AgentAnalyzeResponse)
     async def analyze(req: AgentAnalyzeRequest, request: Request) -> AgentAnalyzeResponse:
@@ -1992,6 +2869,20 @@ def create_app(
         await app.state.rate_limiter.check(auth_ctx["client_id"])
         service: AgentAnalysisService = app.state.analysis_service
         return await service.analyze(req)
+
+    @app.get("/api/v1/agent/forecasts/current", response_model=AgentForecastsResponse)
+    async def current_forecasts(request: Request) -> AgentForecastsResponse:
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        service: AgentAnalysisService = app.state.analysis_service
+        return await service.current_forecasts()
+
+    @app.get("/api/v1/agent/dashboard/current", response_model=AgentDashboardResponse)
+    async def current_dashboard(request: Request) -> AgentDashboardResponse:
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        service: AgentAnalysisService = app.state.analysis_service
+        return await service.current_dashboard()
 
     @app.post("/api/v1/agent/feedback", response_model=AgentFeedbackResponse)
     async def feedback(req: AgentFeedbackRequest, request: Request) -> AgentFeedbackResponse:

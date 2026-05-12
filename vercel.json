@@ -1,1 +1,11 @@
-{"rewrites":[{"source":"/(.*)","destination":"/index.html"}]}
+{
+  "installCommand": "cd modern_showcase_site && npm install",
+  "buildCommand": "cd modern_showcase_site && npm run build",
+  "outputDirectory": "modern_showcase_site/dist",
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}

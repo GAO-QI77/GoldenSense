@@ -1,40 +1,32 @@
-# Deployment Guide 🌍
+# GoldenSense Frontend Deployment
 
-Follow these steps to deploy your site to popular hosting platforms.
+This Vite app is the public retail-facing UI only. Deploy it to Vercel as a static frontend and point it at the Python Agent Gateway running on Docker or a container platform.
 
-## Option 1: Vercel (Recommended)
-1. Push your code to GitHub.
-2. Go to [Vercel.com](https://vercel.com).
-3. Click "New Project" and import your repository.
-4. Vercel will automatically detect Vite. Click "Deploy".
+## Vercel Settings
 
-## Option 2: Netlify
-1. Login to [Netlify.com](https://netlify.com).
-2. Choose "Import from git".
-3. Select your repository.
-4. Build settings:
-   - Build command: `npm run build`
-   - Publish directory: `dist`
-5. Click "Deploy site".
+- Root directory: `modern_showcase_site`
+- Build command: `npm run build`
+- Output directory: `dist`
+- Node.js: `20`
 
-## Option 3: GitHub Pages
-1. Install the `gh-pages` package:
-   ```bash
-   npm install gh-pages --save-dev
-   ```
-2. Add the following to `package.json`:
-   ```json
-   "homepage": "https://yourusername.github.io/your-repo-name",
-   "scripts": {
-     "predeploy": "npm run build",
-     "deploy": "gh-pages -d dist"
-   }
-   ```
-3. Run `npm run deploy`.
+## Required Environment Variables
 
-## Local Preview
-To test the production build locally before deploying:
 ```bash
-npm run build
-npm run preview
+VITE_AGENT_API_URL=https://your-backend.example.com/api/v1/agent/analyze
+VITE_AGENT_DASHBOARD_URL=https://your-backend.example.com/api/v1/agent/dashboard/current
+VITE_AGENT_FEEDBACK_URL=https://your-backend.example.com/api/v1/agent/feedback
+VITE_AGENT_API_KEY=your-public-api-key
 ```
+
+The backend must include the Vercel domain in `AGENT_ALLOW_ORIGINS`.
+
+## Backend Readiness
+
+Before routing user traffic to the frontend, verify the backend:
+
+```bash
+curl https://your-backend.example.com/health/live
+curl https://your-backend.example.com/health/ready
+```
+
+If `/health/ready` fails, keep the frontend deployed but do not treat the system as production-ready.
