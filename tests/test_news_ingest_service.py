@@ -74,6 +74,47 @@ def test_recent_news_endpoint_contract():
     assert data["items"][0]["source"] == "reuters.com"
 
 
+def test_recent_news_query_matches_chinese_macro_aliases():
+    app = create_app(news_loader=_FakeNewsLoader(), start_background_task=False)
+    with TestClient(app) as client:
+        refresh = client.post("/api/v1/news/refresh")
+        assert refresh.status_code == 200
+
+        resp = client.get("/api/v1/news/recent", params={"limit": 5, "q": "黄金 利率"})
+        assert resp.status_code == 200
+        data = resp.json()
+    assert data["status"] == "ok"
+    assert len(data["items"]) == 1
+    assert "Fed" in data["items"][0]["title"]
+
+
+def test_recent_news_query_matches_chinese_terms_inside_natural_question():
+    app = create_app(news_loader=_FakeNewsLoader(), start_background_task=False)
+    with TestClient(app) as client:
+        refresh = client.post("/api/v1/news/refresh")
+        assert refresh.status_code == 200
+
+        resp = client.get("/api/v1/news/recent", params={"limit": 5, "q": "我想知道黄金在利率上行时怎么看"})
+        assert resp.status_code == 200
+        data = resp.json()
+    assert data["status"] == "ok"
+    assert len(data["items"]) == 1
+    assert "Fed" in data["items"][0]["title"]
+
+
+def test_recent_news_query_without_matches_returns_empty_items():
+    app = create_app(news_loader=_FakeNewsLoader(), start_background_task=False)
+    with TestClient(app) as client:
+        refresh = client.post("/api/v1/news/refresh")
+        assert refresh.status_code == 200
+
+        resp = client.get("/api/v1/news/recent", params={"limit": 5, "q": "no-such-topic"})
+        assert resp.status_code == 200
+        data = resp.json()
+    assert data["status"] == "ok"
+    assert data["items"] == []
+
+
 def test_recent_news_refresh_uses_sample_fallback_when_upstream_fails():
     app = create_app(news_loader=_FailingNewsLoader(), start_background_task=False)
     with TestClient(app) as client:
@@ -105,3 +146,17 @@ def test_recent_news_refresh_prefers_cached_payload_before_sample_fallback():
     assert data["status"] == "degraded"
     assert data["degraded_reason"].startswith("cache_fallback:")
     assert data["items"][0]["source"] == "reuters.com"
+
+
+def test_news_readiness_fails_without_payload_when_fallback_disabled():
+    app = create_app(
+        news_loader=_FailingNewsLoader(),
+        config=NewsIngestConfig(allow_sample_fallback=False),
+        start_background_task=False,
+    )
+    with TestClient(app) as client:
+        resp = client.get("/health/ready")
+        data = resp.json()
+    assert resp.status_code == 503
+    assert data["status"] == "unavailable"
+    assert "recent_news_unavailable" in data["errors"]

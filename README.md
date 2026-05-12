@@ -40,8 +40,9 @@ flowchart LR
 | `inference_service.py` | `8010` | 输出 `T+1 / T+7 / T+30` 预测、概率和解释特征 | `POST /api/v1/forecast` |
 | `memory_service.py` | `8012` | 返回历史相似事件及其后验金价表现 | `POST /api/v1/memory/search` |
 | `market_snapshot_service.py` | `8014` | 统一市场快照、技术状态、波动率与新鲜度信息 | `GET /api/v1/market/snapshot/latest` |
+| `market_snapshot_service.py` | `8014` | 基本面、技术面、宏观政策、资金情绪四类指标契约 | `GET /api/v1/market/indicators/current` |
 | `news_ingest_service.py` | `8016` | 最近新闻归一化、去噪与新鲜度标注 | `GET /api/v1/news/recent` |
-| `agent_gateway.py` | `8020` | 编排各工具并输出正式 Agent 响应 | `POST /api/v1/agent/analyze` |
+| `agent_gateway.py` | `8020` | 编排各工具并输出正式 Agent 响应与首页 BFF | `POST /api/v1/agent/analyze` / `GET /api/v1/agent/dashboard/current` |
 | `frontend/dashboard.py` | `8501` | 内部 QA / 运营面板 | 走内部 `trigger` 接口 |
 | `modern_showcase_site/` | `4173` | 面向终端用户的消费者前台 | 调用正式 `analyze` / `feedback` |
 
@@ -169,18 +170,20 @@ export AGENT_INTERNAL_API_KEYS=dev-internal-key
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `APP_ENV` | `development` | 生产环境会强制要求显式配置 public / internal keys |
+| `APP_ENV` | `development` | 除 `development` 外都会强制要求显式配置非默认 public / internal keys |
 | `AGENT_PUBLIC_API_KEYS` | `dev-public-key`（仅 dev） | 逗号分隔的对外 API key 列表 |
 | `AGENT_INTERNAL_API_KEYS` | `dev-internal-key`（仅 dev） | 逗号分隔的内部 API key 列表 |
 | `AGENT_ANALYZE_RATE_LIMIT_PER_MINUTE` | `60` | `analyze` 限流阈值 |
 | `AGENT_ANALYZE_RATE_LIMIT_WINDOW_SECONDS` | `60` | `analyze` 限流窗口 |
 | `AGENT_ALLOW_ORIGINS` | 本地前端域名列表 | CORS 白名单 |
-| `AGENT_TOOL_TIMEOUT_SECONDS` | `4.0` | 单工具总超时 |
+| `AGENT_TOOL_TIMEOUT_SECONDS` | `35.0` | 单工具总超时；需覆盖推理服务冷启动首次行情抓取 |
 | `AGENT_TOOL_CONNECT_TIMEOUT_SECONDS` | `1.5` | 单工具连接超时 |
 | `AGENT_ALLOW_TRACE_MEMORY_FALLBACK` | dev 默认 `1`，prod 默认 `0` | Trace store 数据库故障时是否允许退回进程内存 |
 | `AGENT_TRACE_MEMORY_TTL_SECONDS` | `3600` | dev 内存审计缓存 TTL |
 | `AGENT_TRACE_MEMORY_MAX_ITEMS` | `200` | dev 内存审计缓存上限 |
 | `VIX_CIRCUIT_BREAKER_THRESHOLD` | `30` | 风险熔断阈值 |
+| `INFERENCE_MODEL_CHECKPOINTS_DIR_T1` | `model_checkpoints` | T+1 模型 checkpoint 目录 |
+| `INFERENCE_MODEL_CHECKPOINTS_DIR_T7` | `model_checkpoints` | T+7 模型 checkpoint 目录；默认不再指向不存在的目录 |
 
 ### 下游服务地址
 
@@ -189,6 +192,7 @@ export AGENT_INTERNAL_API_KEYS=dev-internal-key
 | `FORECAST_URL` | `http://localhost:8010/api/v1/forecast` |
 | `MEMORY_URL` | `http://localhost:8012/api/v1/memory/search` |
 | `MARKET_SNAPSHOT_URL` | `http://localhost:8014/api/v1/market/snapshot/latest` |
+| `MARKET_INDICATORS_URL` | `http://localhost:8014/api/v1/market/indicators/current` |
 | `RECENT_NEWS_URL` | `http://localhost:8016/api/v1/news/recent` |
 
 ### 数据与回退
@@ -197,14 +201,17 @@ export AGENT_INTERNAL_API_KEYS=dev-internal-key
 | --- | --- | --- |
 | `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/postgres` | Postgres 连接串 |
 | `REDIS_URL` | `redis://localhost:6379/0` | Redis 连接串 |
-| `MARKET_ALLOW_SYNTHETIC_FALLBACK` | `1` | 行情失败时生成样本快照 |
-| `NEWS_ALLOW_SAMPLE_FALLBACK` | `1` | 新闻失败时回退缓存或样本流 |
+| `MARKET_DATA_PROVIDER` | dev 默认 `yfinance`，非 dev 默认 `external_required` | 行情 provider；生产应接入真实供应商 |
+| `NEWS_DATA_PROVIDER` | dev 默认 `rss`，非 dev 默认 `external_required` | 新闻 provider；生产应接入真实供应商 |
+| `MARKET_ALLOW_SYNTHETIC_FALLBACK` | dev 默认 `1`，非 dev 默认 `0` | 行情失败时是否允许生成样本快照 |
+| `NEWS_ALLOW_SAMPLE_FALLBACK` | dev 默认 `1`，非 dev 默认 `0` | 新闻失败时是否允许回退缓存或样本流 |
 | `MARKET_START_BACKGROUND_TASK` | `0` | 本地调试默认关闭后台刷新 |
 | `NEWS_START_BACKGROUND_TASK` | `0` | 本地调试默认关闭后台刷新 |
 | `NEWS_FETCH_TIMEOUT_SECONDS` | `4.0` | 新闻抓取超时 |
 | `NEWS_STALE_AFTER_SECONDS` | `300` | 新闻陈旧阈值 |
 | `NEWS_STALE_CACHE_GRACE_SECONDS` | `1800` | 陈旧缓存可接受窗口 |
-| `INFERENCE_ALLOW_SYNTHETIC_FALLBACK` | `1` | 量化预测无法拉取原始输入时退回启发式代理 |
+| `INFERENCE_ALLOW_SYNTHETIC_FALLBACK` | dev 默认 `1`，非 dev 默认 `0` | 量化预测无法拉取原始输入时是否退回启发式代理 |
+| `MEMORY_START_BACKGROUND_LOAD` | `0` | 是否在后台加载 embedding 模型；不会阻塞服务启动 |
 
 ### OpenAI 叙事层
 
@@ -237,7 +244,7 @@ python3 memory_ingestion.py \
 
 ### 量化预测
 
-`inference_service.py` 优先加载 checkpoint 进行真实预测；当模型不可用、输入准备失败或市场数据无法正常取得时，会退回启发式代理结果，并在响应中把 `forecast_basis` 标成 `heuristic_proxy`。
+`inference_service.py` 优先加载 checkpoint 进行真实预测；当模型不可用、输入准备失败或市场数据无法正常取得时，会退回启发式代理结果，并在响应中把 `forecast_basis` 标成 `heuristic_proxy`。响应还包含 `model_status`、`model_loaded` 和 `model_checkpoint_path`，用于区分真实模型输出与代理预测。
 
 这意味着：
 
@@ -247,9 +254,9 @@ python3 memory_ingestion.py \
 
 ### 市场与新闻
 
-- `market_snapshot_service.py` 可以在源故障时输出 `synthetic_fallback`
-- `news_ingest_service.py` 可以在源故障时回退缓存，再不行才退回样本新闻
-- `news` 和 `memory` 的服务契约都带有 `status`、`degraded_reason`、`source_freshness_seconds`
+- `market_snapshot_service.py` 在 development 可输出 `synthetic_fallback`，非 development 默认不允许伪装为真实行情
+- `news_ingest_service.py` 在 development 可回退缓存或样本新闻，非 development 默认必须显式配置数据源或返回不可用
+- `market`、`news` 和 `memory` 的服务契约都带有 `status`、`degraded_reason`、`source_freshness_seconds`
 
 ### Agent 输出
 
@@ -290,6 +297,7 @@ X-API-Key: <public-or-internal-key>
 - `risk_profile`：`conservative | balanced | aggressive`
 - `horizon`：`24h | 7d | 30d`
 - `locale`：当前固定 `zh-CN`
+- `investor_profile`：可选完整问卷；包含风险容量、周期、经验、资金占比、最大回撤、已有持仓、流动性需求、杠杆态度和投资目标。该字段只影响风险适配和建议强度，不改写三周期预测基线。
 
 核心响应字段：
 
@@ -308,6 +316,17 @@ X-API-Key: <public-or-internal-key>
 
 ### 2. 反馈入口
 
+### 2. 首页研究 BFF
+
+```http
+GET /api/v1/agent/dashboard/current
+X-API-Key: <public-or-internal-key>
+```
+
+返回首页所需的稳定三周期预测、四类指标、近端新闻、数据质量和指标引用。该接口是消费者前台 `/` 的唯一研究首页入口。
+
+### 3. 反馈入口
+
 ```http
 POST /api/v1/agent/feedback
 Content-Type: application/json
@@ -322,7 +341,7 @@ X-API-Key: <public-or-internal-key>
 }
 ```
 
-### 3. 调试 / 审计入口
+### 4. 调试 / 审计入口
 
 ```http
 GET /api/v1/agent/traces/{analysis_id}
@@ -339,7 +358,7 @@ X-API-Key: <internal-key>
 
 这是内部运维接口，不应暴露给匿名公网。
 
-### 4. 内部 QA 入口
+### 5. 内部 QA 入口
 
 ```http
 POST /api/v1/agent/trigger
@@ -412,11 +431,14 @@ CI 当前包含两层保障：
 ## 生产部署建议
 
 - 把 `APP_ENV` 设为 `production`
-- 显式配置 `AGENT_PUBLIC_API_KEYS` 和 `AGENT_INTERNAL_API_KEYS`
+- 显式配置非默认的 `AGENT_PUBLIC_API_KEYS` 和 `AGENT_INTERNAL_API_KEYS`
+- 显式配置生产级 `MARKET_DATA_PROVIDER` 与 `NEWS_DATA_PROVIDER`，不要依赖 dev provider
+- 保持 `MARKET_ALLOW_SYNTHETIC_FALLBACK=0`、`NEWS_ALLOW_SAMPLE_FALLBACK=0`、`INFERENCE_ALLOW_SYNTHETIC_FALLBACK=0`
 - 仅允许受信来源访问 `traces` 与 `trigger`
 - 在反向代理或 API Gateway 层补充 TLS、IP 约束和速率限制
 - 使用真实 Postgres / Redis，不依赖 dev 内存 trace fallback
 - 将 OpenAI key 视为可选增强，而不是系统可用性的前提
+- 部署后检查 `/health/live` 和 `/health/ready`；`ready` 失败时不应接入前端流量
 
 ## 已知限制
 

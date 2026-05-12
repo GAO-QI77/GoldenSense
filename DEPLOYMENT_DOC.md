@@ -51,8 +51,10 @@ export AGENT_PUBLIC_API_KEYS=dev-public-key
 export AGENT_INTERNAL_API_KEYS=dev-internal-key
 ```
 
-- `POST /api/v1/agent/analyze` 与 `POST /api/v1/agent/feedback`：接受 public 或 internal key
+- `GET /api/v1/agent/dashboard/current`、`POST /api/v1/agent/analyze` 与 `POST /api/v1/agent/feedback`：接受 public 或 internal key
 - `GET /api/v1/agent/traces/{analysis_id}` 与 `POST /api/v1/agent/trigger`：只接受 internal key
+
+除 `development` 之外，服务会拒绝缺失 API key 或继续使用 `dev-public-key` / `dev-internal-key` 的启动配置。
 
 ## 4. 前端启动
 
@@ -68,6 +70,7 @@ npm run dev
 
 ```bash
 VITE_AGENT_API_URL=http://localhost:8020/api/v1/agent/analyze
+VITE_AGENT_DASHBOARD_URL=http://localhost:8020/api/v1/agent/dashboard/current
 VITE_AGENT_FEEDBACK_URL=http://localhost:8020/api/v1/agent/feedback
 VITE_AGENT_API_KEY=dev-public-key
 ```
@@ -82,6 +85,41 @@ python3 -m streamlit run frontend/dashboard.py
 
 ```bash
 export AGENT_GATEWAY_INTERNAL_API_KEY=dev-internal-key
+```
+
+## 4.1 Vercel 前端 + Docker 后端
+
+推荐公开散户助手时只把 `modern_showcase_site/` 部署到 Vercel，并把 Python 服务栈部署到 Docker / 容器平台。
+
+前端环境变量：
+
+```bash
+VITE_AGENT_API_URL=https://your-backend.example.com/api/v1/agent/analyze
+VITE_AGENT_DASHBOARD_URL=https://your-backend.example.com/api/v1/agent/dashboard/current
+VITE_AGENT_FEEDBACK_URL=https://your-backend.example.com/api/v1/agent/feedback
+VITE_AGENT_API_KEY=your-public-key
+```
+
+后端生产环境至少需要：
+
+```bash
+APP_ENV=production
+AGENT_PUBLIC_API_KEYS=your-public-key
+AGENT_INTERNAL_API_KEYS=your-internal-key
+AGENT_ALLOW_ORIGINS=https://your-vercel-domain.vercel.app
+MARKET_DATA_PROVIDER=your-market-provider
+NEWS_DATA_PROVIDER=your-news-provider
+MARKET_ALLOW_SYNTHETIC_FALLBACK=0
+NEWS_ALLOW_SAMPLE_FALLBACK=0
+INFERENCE_ALLOW_SYNTHETIC_FALLBACK=0
+AGENT_ALLOW_TRACE_MEMORY_FALLBACK=0
+```
+
+发布前检查：
+
+```bash
+curl https://your-backend.example.com/health/live
+curl https://your-backend.example.com/health/ready
 ```
 
 ## 5. Docker Compose

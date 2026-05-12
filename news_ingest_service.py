@@ -13,8 +13,9 @@ from typing import Any, Dict, List, Optional
 import psycopg
 import redis
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 
-from data_loader import NewsDataLoader
+from data_loader import NewsDataProvider, create_news_data_provider
 from service_contracts import NewsEventItem, RecentNewsResponse
 
 
@@ -29,6 +30,7 @@ class NewsIngestConfig:
     refresh_timeout_seconds: float = 5.0
     stale_cache_grace_seconds: int = 1800
     allow_sample_fallback: bool = True
+    provider_name: str = "rss"
 
 
 class NewsPersistence:
@@ -288,8 +290,38 @@ def _is_cache_usable(payload: Optional[RecentNewsResponse], max_age_seconds: int
     return _with_freshness(payload).freshness_seconds <= max_age_seconds
 
 
+def _news_query_terms(query: str) -> list[str]:
+    aliases = {
+        "黄金": ["gold", "xau", "bullion"],
+        "金价": ["gold", "xau", "bullion"],
+        "美元": ["dollar", "usd", "dxy"],
+        "利率": ["rate", "rates", "fed", "yield"],
+        "美联储": ["fed", "fomc", "rate", "rates"],
+        "通胀": ["inflation", "cpi", "ppi"],
+        "避险": ["risk", "safe haven", "geopolitical"],
+    }
+    lowered = (query or "").strip().lower()
+    terms = [token for token in re.split(r"[\s,，;；]+", lowered) if len(token) >= 2]
+    expanded: list[str] = []
+    for term in terms:
+        expanded.append(term)
+        expanded.extend(aliases.get(term, []))
+    for term, mapped in aliases.items():
+        if term in lowered:
+            expanded.append(term)
+            expanded.extend(mapped)
+    return list(dict.fromkeys(expanded))
+
+
+def _news_item_matches_query(item: NewsEventItem, terms: list[str]) -> bool:
+    if not terms:
+        return True
+    haystack = " ".join([item.title, item.summary, item.normalized_event, " ".join(item.categories)]).lower()
+    return any(term in haystack for term in terms)
+
+
 async def _resolve_recent_news(
-    loader: NewsDataLoader,
+    loader: NewsDataProvider,
     cfg: NewsIngestConfig,
     cached: Optional[RecentNewsResponse] = None,
 ) -> tuple[RecentNewsResponse, Optional[str]]:
@@ -314,7 +346,7 @@ async def _resolve_recent_news(
 
 
 async def _refresh_loop(app: FastAPI) -> None:
-    loader: NewsDataLoader = app.state.news_loader
+    loader: NewsDataProvider = app.state.news_loader
     persistence: NewsPersistence = app.state.persistence
     refresh_seconds: int = app.state.cfg.refresh_seconds
     while True:
@@ -331,25 +363,33 @@ async def _refresh_loop(app: FastAPI) -> None:
 
 def create_app(
     *,
-    news_loader: Optional[NewsDataLoader] = None,
+    news_loader: Optional[NewsDataProvider] = None,
     persistence: Optional[NewsPersistence] = None,
     config: Optional[NewsIngestConfig] = None,
     start_background_task: Optional[bool] = None,
 ) -> FastAPI:
+    app_env = os.environ.get("APP_ENV", "development").lower()
     cfg = config or NewsIngestConfig(
         redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
         database_url=os.environ.get("DATABASE_URL", "postgresql://localhost/postgres"),
         refresh_seconds=int(os.environ.get("NEWS_REFRESH_SECONDS", "300")),
         refresh_timeout_seconds=float(os.environ.get("NEWS_FETCH_TIMEOUT_SECONDS", "5.0")),
         stale_cache_grace_seconds=int(os.environ.get("NEWS_STALE_CACHE_GRACE_SECONDS", "1800")),
-        allow_sample_fallback=os.environ.get("NEWS_ALLOW_SAMPLE_FALLBACK", "1") != "0",
+        allow_sample_fallback=os.environ.get(
+            "NEWS_ALLOW_SAMPLE_FALLBACK",
+            "1" if app_env == "development" else "0",
+        ) != "0",
+        provider_name=os.environ.get(
+            "NEWS_DATA_PROVIDER",
+            "rss" if app_env == "development" else "external_required",
+        ),
     )
     background_enabled = (
         os.environ.get("NEWS_START_BACKGROUND_TASK", "1") != "0"
         if start_background_task is None
         else start_background_task
     )
-    loader = news_loader or NewsDataLoader()
+    loader = news_loader or create_news_data_provider(cfg.provider_name)
     persistence = persistence or NewsPersistence(cfg.redis_url, cfg.database_url)
 
     @asynccontextmanager
@@ -376,9 +416,33 @@ def create_app(
     async def health() -> Dict[str, Any]:
         return {
             "status": "ok",
+            "provider": getattr(loader, "provider_name", cfg.provider_name),
             "has_news": getattr(app.state, "latest_news", None) is not None,
             "last_error": getattr(app.state, "last_error", None),
         }
+
+    @app.get("/health/live")
+    async def health_live() -> Dict[str, str]:
+        return {"status": "ok", "service": "news_ingest"}
+
+    @app.get("/health/ready")
+    async def health_ready() -> JSONResponse:
+        payload = getattr(app.state, "latest_news", None) or persistence.load()
+        errors = []
+        if payload is None and not cfg.allow_sample_fallback:
+            errors.append("recent_news_unavailable")
+        status = "ok" if not errors else "unavailable"
+        return JSONResponse(
+            status_code=200 if not errors else 503,
+            content={
+                "status": status,
+                "provider": getattr(loader, "provider_name", cfg.provider_name),
+                "allow_sample_fallback": cfg.allow_sample_fallback,
+                "has_news": payload is not None,
+                "last_error": getattr(app.state, "last_error", None),
+                "errors": errors,
+            },
+        )
 
     @app.post("/api/v1/news/refresh", response_model=RecentNewsResponse)
     async def refresh_recent_news() -> RecentNewsResponse:
@@ -411,14 +475,9 @@ def create_app(
         query = (q or "").strip().lower()
         items = payload.items
         if query:
-            filtered = [
-                item
-                for item in items
-                if query in item.title.lower()
-                or query in item.summary.lower()
-                or query in item.normalized_event.lower()
-            ]
-            items = filtered or items
+            terms = _news_query_terms(query)
+            filtered = [item for item in items if _news_item_matches_query(item, terms)]
+            items = filtered
         data = payload.model_dump()
         data["items"] = [item.model_dump() for item in items[:limit]]
         return _with_freshness(RecentNewsResponse(**data))
