@@ -127,7 +127,7 @@ def evaluate_regime(
     reasons = [
         f"多周期趋势({horizon_lbl}日)综合得分 {trend_score:.2f}，判定为{regime}。",
         f"波动状态 {vol_state}，按 Moreira-Muir 波动率管理对暴露打 {vol_scale:.0%} 折扣。",
-        f"{profile} 画像建议黄金暴露上限 {cap:.0f}%，本轮目标暴露约 {target_exposure_pct:.0f}%。",
+        f"{profile} 画像的研究参考黄金暴露上限 {cap:.0f}%，本轮参考暴露约 {target_exposure_pct:.0f}%（非投资建议）。",
     ]
     if not sufficient:
         reasons.append("历史样本不足以稳定估计长周期趋势，已按低置信度处理。")

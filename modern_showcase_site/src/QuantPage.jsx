@@ -583,15 +583,15 @@ function AllocationPanel({ allocation, degraded }) {
     <PanelShell
       id="panel-allocation"
       icon={PieChart}
-      title="战略配置区间 · BL-lite"
-      subtitle="风险画像先验 × 状态观点 × 估值观点（观点只倾斜先验，上限 ±25%）"
+      title="战略配置参考区间 · BL-lite"
+      subtitle="风险画像先验 × 状态观点 × 估值观点（观点只倾斜先验，上限 ±25%）· 研究参考，非投资建议"
       degraded={degraded}
     >
       <div className="alloc-table">
         {profiles.map((profile) => {
           const advice = allocation[profile];
           const [pLo, pHi] = advice.prior_range_pct;
-          const [rLo, rHi] = advice.recommended_range_pct;
+          const [rLo, rHi] = advice.reference_range_pct || advice.recommended_range_pct;
           return (
             <div key={profile} className="alloc-row">
               <span className="alloc-label">{PROFILE_LABELS[profile]}</span>
@@ -614,8 +614,11 @@ function AllocationPanel({ allocation, degraded }) {
       </div>
       <div className="alloc-legend">
         <span><i className="legend-prior" />画像先验区间</span>
-        <span><i className="legend-recommended" />观点倾斜后建议区间</span>
+        <span><i className="legend-recommended" />观点倾斜后参考区间</span>
       </div>
+      {allocation?.balanced?.disclaimer && (
+        <p className="alloc-disclaimer">{allocation.balanced.disclaimer}</p>
+      )}
       {allocation?.balanced?.rationale && (
         <ul className="alloc-rationale">
           {allocation.balanced.rationale.map((line, i) => (

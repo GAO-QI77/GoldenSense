@@ -108,12 +108,12 @@ def test_allocation_range_tilts_prior_not_replaces():
     )
     neutral = allocation_range("balanced")
 
-    assert calm_cheap.recommended_range_pct[1] > neutral.recommended_range_pct[1]
-    assert stress_rich.recommended_range_pct[1] < neutral.recommended_range_pct[1]
+    assert calm_cheap.reference_range_pct[1] > neutral.reference_range_pct[1]
+    assert stress_rich.reference_range_pct[1] < neutral.reference_range_pct[1]
     # Combined multiplier is clipped to [0.5, 1.5] of the prior.
     lo, hi = neutral.prior_range_pct
-    assert stress_rich.recommended_range_pct[0] >= lo * 0.5 - 1e-9
-    assert calm_cheap.recommended_range_pct[1] <= hi * 1.5 + 1e-9
+    assert stress_rich.reference_range_pct[0] >= lo * 0.5 - 1e-9
+    assert calm_cheap.reference_range_pct[1] <= hi * 1.5 + 1e-9
 
 
 def test_allocation_unknown_profile_falls_back_to_balanced():

@@ -38,11 +38,18 @@ MAX_REGIME_TILT = 0.25
 MAX_VALUATION_TILT = 0.25
 
 
+# Fixed de-advice disclaimer attached to every allocation output.
+ALLOCATION_DISCLAIMER = (
+    "以下为教育型研究参考区间，基于公开宏观关系与历史统计，"
+    "不构成任何投资建议、要约或个性化理财意见；实际决策请咨询持牌顾问并自担风险。"
+)
+
+
 @dataclass
 class AllocationAdvice:
     profile: str
     prior_range_pct: Sequence[float]
-    recommended_range_pct: Sequence[float]
+    reference_range_pct: Sequence[float]
     regime_tilt: float
     valuation_tilt: float
     rationale: List[str] = field(default_factory=list)
@@ -51,10 +58,14 @@ class AllocationAdvice:
         return {
             "profile": self.profile,
             "prior_range_pct": [round(x, 1) for x in self.prior_range_pct],
-            "recommended_range_pct": [round(x, 1) for x in self.recommended_range_pct],
+            # Kept under the legacy key for API compatibility, but framed as a
+            # research reference range (not a recommendation) everywhere in copy.
+            "reference_range_pct": [round(x, 1) for x in self.reference_range_pct],
+            "recommended_range_pct": [round(x, 1) for x in self.reference_range_pct],
             "regime_tilt": round(self.regime_tilt, 4),
             "valuation_tilt": round(self.valuation_tilt, 4),
             "rationale": list(self.rationale),
+            "disclaimer": ALLOCATION_DISCLAIMER,
         }
 
 
@@ -113,13 +124,14 @@ def allocation_range(
             f"估值观点带来 {v_tilt:+.0%} 倾斜（±30% 偏离饱和）。"
         )
     rationale.append(
-        f"综合建议区间 {rec_lo:.1f}%–{rec_hi:.1f}%；观点只倾斜先验、不替代先验（BL 纪律）。"
+        f"综合研究参考区间 {rec_lo:.1f}%–{rec_hi:.1f}%；观点只倾斜先验、不替代先验（BL 纪律）。"
+        "该区间为研究口径，非投资建议。"
     )
 
     return AllocationAdvice(
         profile=profile,
         prior_range_pct=(lo, hi),
-        recommended_range_pct=(rec_lo, rec_hi),
+        reference_range_pct=(rec_lo, rec_hi),
         regime_tilt=r_tilt,
         valuation_tilt=v_tilt,
         rationale=rationale,

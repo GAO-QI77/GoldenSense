@@ -80,9 +80,12 @@ C) 可搜索、美观、金色科技感的前端产品（modern_showcase_site �
   - [x] 硬化收尾: HMM/公允价值数值路径 np.errstate 抑制退化告警（日志洁净）
   - [x] 前端: 校准面板 GovernanceBadge（冠军/观察/降级/样本不足）
 - 结果: pytest 195 passed；前端 build 通过；/quant 治理徽章浏览器实测正常
-- 需你决策（非代码，无法自动完成）:
-  - [ ] B5 数据源 SLA: 是否签付费黄金现货/新闻 API（成本 vs 实时性）
-  - [ ] B6 法务/合规审查: "公允价值/配置区间"措辞的监管边界确认
+- 用户决策已回复:
+  - [x] B5 → 保持免费源 + 诚实标注: README 已知限制补显式声明；机制(非实时横幅/
+        is_realtime=false/降级标记)已在 A 档落地，无需新数据源
+  - [x] B6 → 加强产品内免责 + 去建议化: allocation 改"研究参考区间"+ 免责字段，
+        前端标题/图例/免责横幅去建议化，regime reason 去指令化，README 补免责。
+        recommended_range_pct → reference_range_pct（as_dict 保留旧键兼容）
 
 ## Errors Encountered
 | Error | Attempt | Resolution |

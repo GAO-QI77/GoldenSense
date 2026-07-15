@@ -2631,3 +2631,14 @@ select {
   font-size: 0.72rem;
   white-space: nowrap;
 }
+
+.alloc-disclaimer {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(236, 211, 154, 0.16);
+  background: rgba(0, 0, 0, 0.22);
+  color: rgba(245, 240, 230, 0.62);
+  font-size: 0.76rem;
+  line-height: 1.55;
+}
