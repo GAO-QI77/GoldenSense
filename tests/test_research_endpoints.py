@@ -57,6 +57,25 @@ def test_research_current_reports_data_freshness(client):
     assert payload["data_source"] in {"extended", "base"}
 
 
+def test_research_current_includes_flagship_backtest(client):
+    payload = client.get(
+        "/api/v1/agent/research/current", headers=PUBLIC_HEADERS
+    ).json()
+    flagship = payload.get("flagship")
+    if flagship is None:
+        assert "flagship" in payload.get("degraded", {})
+        return
+    for key in ("sharpe", "sortino", "max_drawdown", "calmar", "dsr"):
+        assert key in flagship["metrics"]
+        assert key in flagship["benchmark"]
+    curve = flagship["curve"]
+    assert len(curve["dates"]) == len(curve["flagship"]) == len(curve["benchmark"])
+    assert curve["flagship"] and curve["benchmark"]
+    # Drawdown-aware sleeve: the flagship's max drawdown is shallower than B&H.
+    assert flagship["metrics"]["max_drawdown"] > flagship["benchmark"]["max_drawdown"]
+    assert 0.0 <= flagship["metrics"]["dsr"] <= 1.0
+
+
 def test_research_current_regime_posterior_shape(client):
     payload = client.get(
         "/api/v1/agent/research/current", headers=PUBLIC_HEADERS

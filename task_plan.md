@@ -87,6 +87,16 @@ C) 可搜索、美观、金色科技感的前端产品（modern_showcase_site �
         前端标题/图例/免责横幅去建议化，regime reason 去指令化，README 补免责。
         recommended_range_pct → reference_range_pct（as_dict 保留旧键兼容）
 
+### Phase 11: 旗舰策略（真实提升）+ 抓眼球前端
+- Status: complete
+- 真实结果(2004-2026, 2bps, 全因果): 旗舰 Sharpe 0.70 / Sortino 1.01 / 回撤 -21.0% /
+  Calmar 0.24 / DSR 0.95  vs  买入持有 0.64 / 0.90 / -44.4% / 0.24
+- 关键诚实修正: HMM 从平滑后验(含未来)改为 filter_posterior 前向滤波 +
+  causal_regime_stress 走前重拟合(expanding window)，零前视
+- 产物: strategy_integrated.py, regime_probabilistic.filter_posterior/causal_regime_stress,
+  research_context.flagship, 网关启动预热线程, QuantPage FlagshipHero(回撤/净值切换+动效)
+- 测试: 204 passed（+9）；前端 build 通过；浏览器实测回撤/净值双视图+动效+无控制台错误
+
 ## Errors Encountered
 | Error | Attempt | Resolution |
 |-------|---------|------------|

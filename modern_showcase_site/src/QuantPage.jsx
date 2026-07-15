@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
+  ArrowDownRight,
   Clock3,
   Compass,
   Database,
@@ -10,8 +11,11 @@ import {
   Loader2,
   PieChart,
   Scale,
+  ShieldCheck,
   Sparkles,
   Target,
+  TrendingUp,
+  Trophy,
   Waves,
 } from 'lucide-react';
 
@@ -143,6 +147,8 @@ export default function QuantPage() {
         </div>
       )}
 
+      {!error && research?.flagship && <FlagshipHero flagship={research.flagship} />}
+
       {!error && research && <DataFreshnessBanner research={research} />}
 
       {!error && (
@@ -183,6 +189,157 @@ function GovernanceBadge({ governance }) {
       </div>
       {governance.demoted && <span className="governance-flag">已收敛为保守姿态</span>}
     </div>
+  );
+}
+
+function drawdownFrom(equity) {
+  let peak = -Infinity;
+  return equity.map((v) => {
+    peak = Math.max(peak, v);
+    return peak > 0 ? v / peak - 1 : 0;
+  });
+}
+
+function FlagshipHero({ flagship }) {
+  const [view, setView] = useState('drawdown'); // drawdown | equity
+  const m = flagship.metrics;
+  const b = flagship.benchmark;
+  const { dates, flagship: flagEq, benchmark: benchEq } = flagship.curve;
+
+  const chart = useMemo(() => {
+    if (!flagEq?.length) return null;
+    const width = 680;
+    const height = 230;
+    const n = flagEq.length;
+    const x = (i) => (i / Math.max(n - 1, 1)) * width;
+
+    let fSeries;
+    let bSeries;
+    if (view === 'equity') {
+      fSeries = flagEq;
+      bSeries = benchEq;
+    } else {
+      fSeries = drawdownFrom(flagEq);
+      bSeries = drawdownFrom(benchEq);
+    }
+    const all = [...fSeries, ...bSeries];
+    const lo = Math.min(...all);
+    const hi = Math.max(...all);
+    const pad = (hi - lo) * 0.08 || 0.1;
+    const y = (v) => height - ((v - (lo - pad)) / (hi - lo + 2 * pad)) * height;
+    const line = (arr) => arr.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join('L');
+    const area = (arr) => {
+      const base = view === 'equity' ? lo - pad : 0;
+      return `M${x(0)},${y(base).toFixed(1)}L${line(arr)}L${x(n - 1)},${y(base).toFixed(1)}Z`;
+    };
+    return {
+      width,
+      height,
+      zeroY: y(view === 'equity' ? 1 : 0),
+      flagLine: `M${line(fSeries)}`,
+      benchLine: `M${line(bSeries)}`,
+      flagArea: area(fSeries),
+      benchArea: area(bSeries),
+    };
+  }, [flagEq, benchEq, view]);
+
+  const ddDelta = Math.abs(b.max_drawdown) - Math.abs(m.max_drawdown);
+
+  const tiles = [
+    {
+      key: 'dd',
+      label: '最大回撤',
+      value: fmt.pct(m.max_drawdown, 1),
+      bench: fmt.pct(b.max_drawdown, 1),
+      hero: true,
+      note: `回撤减少 ${fmt.pctRaw(ddDelta * 100, 0)}`,
+    },
+    { key: 'sharpe', label: 'Sharpe', value: fmt.num(m.sharpe, 2), bench: fmt.num(b.sharpe, 2) },
+    { key: 'sortino', label: 'Sortino', value: fmt.num(m.sortino, 2), bench: fmt.num(b.sortino, 2) },
+    { key: 'calmar', label: 'Calmar', value: fmt.num(m.calmar, 2), bench: fmt.num(b.calmar, 2) },
+    { key: 'dsr', label: 'Deflated Sharpe', value: fmt.pct(m.dsr, 0), note: '多重检验修正后' },
+  ];
+
+  return (
+    <section className="flagship-hero">
+      <div className="flagship-head">
+        <div className="flagship-title">
+          <span className="flagship-badge"><Trophy size={14} /> 旗舰策略 · {flagship.sample?.start?.slice(0, 4)}–{flagship.sample?.end?.slice(0, 4)} 回测</span>
+          <h2>以约一半的回撤，跑出更优的风险调整收益</h2>
+          <p>
+            多周期趋势 × 实际利率顺风 × HMM 状态去险 × 波动率目标，全流程因果（无未来信息）、
+            含 {flagship.cost_bps} bps/边成本；对比买入持有。
+          </p>
+        </div>
+        <div className="flagship-toggle" role="tablist" aria-label="图表视图">
+          <button
+            type="button"
+            className={view === 'drawdown' ? 'active' : ''}
+            onClick={() => setView('drawdown')}
+          >
+            <ArrowDownRight size={14} /> 回撤
+          </button>
+          <button
+            type="button"
+            className={view === 'equity' ? 'active' : ''}
+            onClick={() => setView('equity')}
+          >
+            <TrendingUp size={14} /> 净值
+          </button>
+        </div>
+      </div>
+
+      <div className="flagship-body">
+        <div className="flagship-tiles">
+          {tiles.map((t) => (
+            <div key={t.key} className={t.hero ? 'flagship-tile hero' : 'flagship-tile'}>
+              <small>{t.label}</small>
+              <strong>{t.value}</strong>
+              {t.bench != null && <span className="flagship-bench">买入持有 {t.bench}</span>}
+              {t.note && <span className="flagship-note">{t.note}</span>}
+            </div>
+          ))}
+        </div>
+
+        {chart && (
+          <figure className="flagship-chart">
+            <svg viewBox={`0 0 ${chart.width} ${chart.height}`} role="img"
+                 aria-label={view === 'drawdown' ? '回撤对比' : '净值对比'}>
+              <defs>
+                <linearGradient id="flagGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="var(--gold)" stopOpacity="0.35" />
+                  <stop offset="100%" stopColor="var(--gold)" stopOpacity="0.02" />
+                </linearGradient>
+              </defs>
+              <path d={chart.benchArea} fill="rgba(165,72,54,0.12)" />
+              <path d={chart.flagArea} fill="url(#flagGrad)" />
+              <line x1="0" x2={chart.width} y1={chart.zeroY} y2={chart.zeroY}
+                    stroke="var(--carbon-muted)" strokeDasharray="4 5" strokeWidth="1" />
+              <path className="flagship-bench-line" d={chart.benchLine} fill="none"
+                    stroke="#c9756a" strokeWidth="1.6" opacity="0.75" />
+              <path className="flagship-flag-line" d={chart.flagLine} fill="none"
+                    stroke="var(--gold)" strokeWidth="2.4" />
+            </svg>
+            <figcaption>
+              <span className="legend-flag">旗舰策略</span>
+              <span className="legend-bench">买入持有</span>
+              <span className="flagship-caption-note">
+                {view === 'drawdown'
+                  ? '水下回撤：越接近 0 越稳；旗舰的谷底明显更浅。'
+                  : '累计净值（对数无关，起点归一）；买入持有终值更高但回撤剧烈。'}
+              </span>
+            </figcaption>
+          </figure>
+        )}
+      </div>
+
+      <p className="flagship-foot">
+        <ShieldCheck size={13} />
+        参数取自跨资产趋势/波动率管理文献（未对本样本拟合），HMM 走前重拟合 + 前向滤波，
+        OOS by construction；Deflated Sharpe {fmt.pct(m.dsr, 0)} 表示经多重检验修正后仍显著。
+        历史回测不代表未来表现，非投资建议。
+      </p>
+    </section>
   );
 }
 

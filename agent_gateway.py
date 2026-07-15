@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 import uuid
 from collections import deque
@@ -3172,6 +3173,17 @@ def create_app(
             cfg=cfg,
         )
         app.state.analysis_service.metrics = app.state.metrics
+        # Warm the quant research context in the background so the first /quant
+        # request does not pay the flagship walk-forward cost (~10s). Best
+        # effort: failures are swallowed and recomputed lazily on demand.
+        def _warm_quant_context() -> None:
+            try:
+                quant_research_context.get_context()
+            except Exception as exc:  # pragma: no cover - defensive
+                LOGGER.warning("quant_context_warmup_failed error=%s", f"{type(exc).__name__}:{exc}")
+
+        if _env("AGENT_WARM_QUANT_CONTEXT", "1") == "1":
+            threading.Thread(target=_warm_quant_context, name="quant-warmup", daemon=True).start()
         yield
         if own_http:
             await http.aclose()

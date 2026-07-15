@@ -162,7 +162,12 @@ class GaussianHMM:
         return self
 
     def posterior(self, X: np.ndarray) -> np.ndarray:
-        """Smoothed per-date state probabilities, shape (T, K)."""
+        """Smoothed per-date state probabilities, shape (T, K).
+
+        Uses the backward pass, so a value at t depends on future data -- fine
+        for describing history, but NOT causal. Use ``filter_posterior`` for
+        anything that feeds a backtest position.
+        """
         f = self.fit_
         if f is None:
             raise RuntimeError("model is not fitted")
@@ -172,6 +177,33 @@ class GaussianHMM:
         )
         gamma, _, _ = self._forward_backward(log_b, f.transition, f.initial)
         return gamma
+
+    def filter_posterior(self, X: np.ndarray) -> np.ndarray:
+        """Causal forward-filtered probabilities P(state_t | X_{1..t}), (T, K).
+
+        Only the forward pass -- the value at t uses data up to and including t,
+        never the future. This is the honest input for a position series.
+        """
+        f = self.fit_
+        if f is None:
+            raise RuntimeError("model is not fitted")
+        X = np.asarray(X, dtype=float)
+        T = len(X)
+        K = self.n_states
+        log_A = np.log(np.maximum(f.transition, _EPS))
+        log_pi = np.log(np.maximum(f.initial, _EPS))
+        log_b = np.column_stack(
+            [_log_gaussian(X, f.means[k], f.variances[k]) for k in range(K)]
+        )
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            log_alpha = np.zeros((T, K))
+            log_alpha[0] = log_pi + log_b[0]
+            for t in range(1, T):
+                prev = log_alpha[t - 1][:, None] + log_A
+                log_alpha[t] = log_b[t] + _logsumexp_rows(prev.T)
+            # Normalize each row to a proper filtered distribution.
+            filtered = np.exp(log_alpha - log_alpha.max(axis=1, keepdims=True))
+        return filtered / filtered.sum(axis=1, keepdims=True)
 
 
 def _logsumexp(v: np.ndarray) -> float:
@@ -209,6 +241,50 @@ def fit_gold_regime_posterior(
     gamma = model.posterior(feats.values)
     labels = [STATE_LABELS.get(k, f"state_{k}") for k in range(n_states)]
     return pd.DataFrame(gamma, index=feats.index, columns=labels)
+
+
+def causal_regime_stress(
+    prices: pd.Series,
+    *,
+    n_states: int = 3,
+    min_train: int = 756,
+    refit_every: int = 126,
+) -> Optional[pd.Series]:
+    """Causal P(stress) series for backtests: no look-ahead anywhere.
+
+    Walk forward: refit the HMM on data up to time t (expanding window, every
+    ``refit_every`` days), then take the *filtered* stress probability at t.
+    Both the parameter estimation and the inference use only past data, so the
+    resulting series can drive a position without leakage.
+
+    Returns None when history is shorter than ``min_train``.
+    """
+    feats = regime_features(prices)
+    if len(feats) < min_train + refit_every:
+        return None
+
+    values = feats.values
+    idx = feats.index
+    stress_col = n_states - 1  # states relabelled by ascending vol -> last = stress
+    out = pd.Series(index=idx, dtype=float)
+
+    start = min_train
+    model = None
+    while start < len(feats):
+        end = min(start + refit_every, len(feats))
+        # Refit on everything strictly before this block.
+        try:
+            model = GaussianHMM(n_states=n_states, max_iter=40).fit(values[:start])
+        except Exception:
+            if model is None:
+                start = end
+                continue
+        # Filter over history+block, read only this block's filtered stress prob.
+        filt = model.filter_posterior(values[:end])
+        out.iloc[start:end] = filt[start:end, stress_col]
+        start = end
+
+    return out.dropna()
 
 
 def blended_exposure(

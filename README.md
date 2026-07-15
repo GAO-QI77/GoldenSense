@@ -84,6 +84,7 @@ flowchart LR
 | [`vol_models.py`](vol_models.py) | 短期层：HAR-RV 波动率预测 + P10/P50/P90 经验分位收益带 |
 | [`regime_probabilistic.py`](regime_probabilistic.py) | 三状态 Gaussian HMM（numpy EM），输出 calm/elevated/stress 后验概率 |
 | [`strategy_macro.py`](strategy_macro.py) | 中期层：实际利率/美元/通胀预期/资金流代理四因子组合（先验参数、含成本回测） |
+| [`strategy_integrated.py`](strategy_integrated.py) | **旗舰策略**：趋势×实际利率×HMM去险×波动率目标（全因果），22年回测 Sharpe 0.70/回撤-21% vs 买入持有 0.64/-44%，DSR 0.95 |
 | [`fair_value.py`](fair_value.py) | 长期层：实际利率+美元误差修正公允价值锚（滚动十年窗口） |
 | [`allocation.py`](allocation.py) | BL-lite 配置区间（观点只倾斜画像先验）+ HMM 蒙特卡洛情景锥 |
 | [`validation.py`](validation.py) | Purged walk-forward（带 embargo）+ PSR / Deflated Sharpe Ratio |
@@ -301,6 +302,21 @@ python3 memory_ingestion.py \
 | 短期 (T+1~T+5) | 不预测方向（已被走前验证证伪），改为 HAR-RV 波动率预测 + 经验分位收益带 | `vol_models.py` |
 | 中期 (数周~数月) | 三状态 HMM 概率状态机 + 实际利率/美元/通胀预期/资金流四因子组合，概率加权暴露 | `regime_probabilistic.py`, `strategy_macro.py`, `regime_strategy.evaluate_regime_v2` |
 | 长期 (6 个月+) | 公允价值锚（误差修正）+ BL-lite 配置区间 + regime-switching 蒙特卡洛情景锥 | `fair_value.py`, `allocation.py` |
+
+**旗舰策略**（`strategy_integrated.py`）把上述各因果模块组合为单一暴露：多周期趋势 × 实际利率顺风 ×
+HMM 状态去险（走前重拟合 + 前向滤波，无未来信息）× 波动率目标。2004–2026 含成本回测对比买入持有：
+
+| 指标 | 旗舰 | 买入持有 |
+| --- | --- | --- |
+| Sharpe | **0.70** | 0.64 |
+| Sortino | **1.01** | 0.90 |
+| 最大回撤 | **-21.0%** | -44.4% |
+| Calmar | 0.24 | 0.24 |
+| Deflated Sharpe | **0.95** | — |
+
+即以约一半的回撤换取更优的风险调整收益；DSR 0.95 表示经多重检验修正后 Sharpe 仍显著。趋势/利率/波动率
+目标参数取自文献（未拟合本样本），HMM 走前重拟合，OOS by construction。结果经 `/api/v1/agent/research/current`
+的 `flagship` 字段暴露，并驱动 `/quant` 页面的英雄级业绩对比图。历史回测不代表未来表现。
 
 数据基线：`python3 data_sources.py` 会从 FRED（无需 key）与 yfinance 拉取 2004 年起的扩展数据集
 （含 10Y TIPS 实际利率、盈亏平衡通胀、GLD 成交额代理）写入 `raw_market_data_extended.csv`；

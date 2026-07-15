@@ -178,6 +178,20 @@ class LocalQuantContext:
         except Exception as exc:
             context["degraded"]["scenario_cone"] = f"{type(exc).__name__}: {exc}"
 
+        # --- Flagship strategy backtest (causal, drawdown-aware) -----------
+        # Walk-forward HMM refit makes this the heaviest block (~10s); the TTL
+        # cache means users never pay it on the request path.
+        try:
+            from strategy_integrated import evaluate_flagship
+
+            flagship = evaluate_flagship(raw)
+            if flagship is not None:
+                context["flagship"] = flagship.as_dict()
+            else:
+                context["degraded"]["flagship"] = "insufficient_history"
+        except Exception as exc:
+            context["degraded"]["flagship"] = f"{type(exc).__name__}: {exc}"
+
         # --- Allocation advice per profile ---------------------------------
         try:
             from allocation import allocation_range
