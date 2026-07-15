@@ -11,6 +11,9 @@ venv/
 .trae/
 .vercel/
 model_checkpoints_backup/
+# Local FRED/yfinance fetch cache; the committed extended CSV is the shipped
+# baseline (regenerate with `python3 data_sources.py`).
+data_cache/
 node_modules/
 dist/
 modern_showcase_site/node_modules/

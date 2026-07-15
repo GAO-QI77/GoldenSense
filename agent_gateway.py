@@ -16,6 +16,7 @@ from typing import Any, Deque, Dict, List, Literal, Optional, Sequence, Tuple, T
 import httpx
 import psycopg
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -32,6 +33,15 @@ from service_contracts import (
     NewsEventItem,
     RecentNewsResponse,
 )
+from analyst_committee import build_committee
+from narrative_critic import verify_narrative
+from outcome_tracker import (
+    backfill_outcomes,
+    calibration_summary,
+    committee_weight_adjustments,
+)
+from regime_strategy import evaluate_regime, evaluate_regime_v2
+from research_context import shared_context as quant_research_context
 
 try:
     from openai import AsyncOpenAI
@@ -333,6 +343,9 @@ class AnalysisBundle:
     has_degraded_inputs: bool
     degradation_flags: List[str]
     tool_trace: List[Dict[str, Any]]
+    gold_history: Optional[GoldPriceHistoryResponse] = None
+    regime: Optional[Dict[str, Any]] = None
+    committee: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1097,6 +1110,50 @@ class AgentTraceStore:
                 return None
             raise TraceStoreUnavailableError("trace_store_load_failed") from exc
 
+    async def load_recent_analyses(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """Recent analyses for outcome tracking. DB first, else dev memory."""
+        if self._db_ready:
+            try:
+                return await asyncio.to_thread(self._load_recent_sync, limit)
+            except Exception as exc:
+                LOGGER.warning(
+                    "agent_trace_recent_failed allow_memory_fallback=%s error=%s",
+                    self._allow_memory_fallback,
+                    f"{type(exc).__name__}:{exc}",
+                )
+                if not self._allow_memory_fallback:
+                    raise TraceStoreUnavailableError("trace_store_recent_failed") from exc
+        self._prune_memory()
+        rows = [
+            {k: v for k, v in row.items() if k != "created_at_epoch"}
+            for row in self._memory.values()
+        ]
+        rows.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+        return rows[:limit]
+
+    def _load_recent_sync(self, limit: int) -> List[Dict[str, Any]]:
+        with psycopg.connect(self._database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    select analysis_id, request_payload, response_payload, created_at
+                    from agent_analysis_traces
+                    order by created_at desc
+                    limit %s
+                    """,
+                    (int(limit),),
+                )
+                fetched = cur.fetchall()
+        return [
+            {
+                "analysis_id": row[0],
+                "request_payload": row[1],
+                "response_payload": row[2],
+                "created_at": row[3].isoformat() if hasattr(row[3], "isoformat") else str(row[3]),
+            }
+            for row in fetched
+        ]
+
     def health(self) -> Dict[str, Any]:
         self._prune_memory()
         return {
@@ -1452,16 +1509,58 @@ class HttpResearchToolbox:
 
 
 class OpenAINarrator:
-    def __init__(self, cfg: AgentGatewayConfig):
+    def __init__(
+        self,
+        cfg: AgentGatewayConfig,
+        *,
+        provider: Optional[str] = None,
+        client: Any = None,
+        timeout_seconds: Optional[float] = None,
+    ):
         self._cfg = cfg
-        self._client = AsyncOpenAI() if AsyncOpenAI is not None and os.environ.get("OPENAI_API_KEY") else None
+        self._provider = (provider or _env("LLM_PROVIDER", "deepseek")).strip().lower()
+        self._timeout_seconds = (
+            float(timeout_seconds)
+            if timeout_seconds is not None
+            else float(_env("LLM_TIMEOUT_SECONDS", "12.0"))
+        )
+        self._client = client or self._build_client()
 
     async def narrate(self, bundle: AnalysisBundle, draft: NarrativeOutput) -> NarrativeOutput:
+        committee_disagrees = bool((bundle.committee or {}).get("has_material_disagreement"))
+        model = (
+            self._cfg.complex_model
+            if bundle.has_conflict or bundle.is_high_risk or committee_disagrees
+            else self._cfg.default_model
+        )
         if self._client is None:
+            LOGGER.warning(
+                "agent_narrator_degraded provider=%s model=%s reason=no_client_configured",
+                self._provider,
+                model,
+            )
             return draft
 
-        model = self._cfg.complex_model if bundle.has_conflict or bundle.is_high_risk else self._cfg.default_model
-        prompt_payload = {
+        if self._provider == "deepseek":
+            return await self._narrate_deepseek(bundle, draft, model)
+        if self._provider == "openai":
+            return await self._narrate_openai(bundle, draft, model)
+        LOGGER.warning("agent_narrator_degraded provider=%s model=%s reason=unsupported_provider", self._provider, model)
+        return draft
+
+    def _build_client(self) -> Any:
+        if AsyncOpenAI is None:
+            return None
+        if self._provider == "deepseek":
+            api_key = os.environ.get("DEEPSEEK_API_KEY")
+            return AsyncOpenAI(api_key=api_key, base_url="https://api.deepseek.com") if api_key else None
+        if self._provider == "openai":
+            api_key = os.environ.get("OPENAI_API_KEY")
+            return AsyncOpenAI(api_key=api_key) if api_key else None
+        return None
+
+    def _prompt_payload(self, bundle: AnalysisBundle, draft: NarrativeOutput) -> Dict[str, Any]:
+        return {
             "question": bundle.question,
             "optional_news_text": bundle.optional_news_text,
             "risk_profile": bundle.risk_profile,
@@ -1473,8 +1572,50 @@ class OpenAINarrator:
             "risk_gate": bundle.risk_gate,
             "draft": draft.model_dump(),
         }
+
+    async def _narrate_deepseek(
+        self,
+        bundle: AnalysisBundle,
+        draft: NarrativeOutput,
+        model: str,
+    ) -> NarrativeOutput:
         schema = NarrativeOutput.model_json_schema()
-        try:
+        system_prompt = (
+            "你是 GoldenSense 的中文教育型黄金投资助手。"
+            "你只能基于给定证据做结构化总结，不得编造来源，不得给出确定性喊单。"
+            "如果证据冲突、数据陈旧或风险过高，必须保持保守措辞。"
+            "请严格输出符合以下 JSON Schema 的 json 对象，不要输出 markdown："
+            f"{json.dumps(schema, ensure_ascii=False)}"
+        )
+
+        async def _request() -> str:
+            response = await self._client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": json.dumps(self._prompt_payload(bundle, draft), ensure_ascii=False),
+                    },
+                ],
+                response_format={"type": "json_object"},
+            )
+            choices = getattr(response, "choices", [])
+            if not choices:
+                return ""
+            return str(getattr(getattr(choices[0], "message", None), "content", "") or "")
+
+        return await self._request_narrative(_request, draft=draft, model=model)
+
+    async def _narrate_openai(
+        self,
+        bundle: AnalysisBundle,
+        draft: NarrativeOutput,
+        model: str,
+    ) -> NarrativeOutput:
+        schema = NarrativeOutput.model_json_schema()
+
+        async def _request() -> str:
             response = await self._client.responses.create(
                 model=model,
                 input=[
@@ -1493,7 +1634,12 @@ class OpenAINarrator:
                     },
                     {
                         "role": "user",
-                        "content": [{"type": "input_text", "text": json.dumps(prompt_payload, ensure_ascii=False)}],
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": json.dumps(self._prompt_payload(bundle, draft), ensure_ascii=False),
+                            }
+                        ],
                     },
                 ],
                 text={
@@ -1504,12 +1650,33 @@ class OpenAINarrator:
                     }
                 },
             )
-            output_text = getattr(response, "output_text", "")
-            if not output_text:
-                return draft
-            return NarrativeOutput(**json.loads(output_text))
-        except Exception:
-            return draft
+            return str(getattr(response, "output_text", "") or "")
+
+        return await self._request_narrative(_request, draft=draft, model=model)
+
+    async def _request_narrative(
+        self,
+        request: Any,
+        *,
+        draft: NarrativeOutput,
+        model: str,
+    ) -> NarrativeOutput:
+        for attempt in range(1, 3):
+            try:
+                output_text = await asyncio.wait_for(request(), timeout=self._timeout_seconds)
+                if not output_text:
+                    raise ValueError("empty_output")
+                return NarrativeOutput(**json.loads(output_text))
+            except Exception as exc:
+                LOGGER.warning(
+                    "agent_narrator_degraded provider=%s model=%s attempt=%s reason=%s:%s",
+                    self._provider,
+                    model,
+                    attempt,
+                    type(exc).__name__,
+                    exc,
+                )
+        return draft
 
 
 class AgentAnalysisService:
@@ -1541,6 +1708,39 @@ class AgentAnalysisService:
             news_query=news_query,
         )
         rag_events = memory_lookup.items
+        gold_history, history_trace = await self._timed_optional_tool(
+            "get_gold_history",
+            self._toolbox.get_gold_history(),
+            lambda exc: _fallback_gold_history(snapshot, f"{type(exc).__name__}:{exc}"),
+        )
+        tool_trace = [*tool_trace, history_trace]
+        # Long-horizon quant context (HMM posterior, factors, fair value...)
+        # comes from the repo-local dataset with a TTL cache; per-request tool
+        # history is far too short for those models. Failure degrades softly.
+        try:
+            quant_ctx = await asyncio.to_thread(quant_research_context.get_context)
+        except Exception as exc:  # pragma: no cover - defensive
+            quant_ctx = {"degraded": {"local_context": f"{type(exc).__name__}:{exc}"}}
+        state_posterior = (quant_ctx.get("regime_posterior") or {}).get("latest")
+        regime_decision = evaluate_regime_v2(
+            [point.price for point in gold_history.points],
+            risk_profile=req.risk_profile,
+            vol_state=snapshot.feature_summary.volatility_regime,
+            state_posterior=state_posterior,
+        )
+        regime_payload: Dict[str, Any] = {
+            "regime": regime_decision.regime,
+            "trend_score": regime_decision.trend_score,
+            "vol_state": regime_decision.vol_state,
+            "stance": regime_decision.stance,
+            "action": regime_decision.action,
+            "target_exposure_pct": regime_decision.target_exposure_pct,
+            "confidence_band": regime_decision.confidence_band,
+            "sufficient_history": regime_decision.sufficient_history,
+            "reasons": regime_decision.reasons,
+            "regime_model": regime_decision.regime_model,
+            "state_probabilities": regime_decision.state_probabilities,
+        }
         news_sentiment = self._derive_news_sentiment(req, news)
         risk_profile = self._toolbox.get_user_risk_profile(req.risk_profile)
         risk_gate = _investor_profile_gate(req.investor_profile, req.question)
@@ -1583,6 +1783,20 @@ class AgentAnalysisService:
             memory_lookup=memory_lookup,
         )
 
+        # Deterministic analyst committee: four specialist views fused with
+        # regime-conditional weights; disagreement feeds the conflict router.
+        # Committee disagreement routes narration to the stronger model and is
+        # recorded in the trace; it does NOT flip the stance gate -- stance
+        # gating stays with the validated risk/conflict rules.
+        committee = build_committee(
+            regime=regime_payload,
+            macro_factors=quant_ctx.get("macro_factors"),
+            fair_value=quant_ctx.get("fair_value"),
+            news_sentiment=news_sentiment,
+            vix_value=selected_outlook["vix_value"],
+            vix_threshold=self._cfg.vix_circuit_breaker_threshold,
+        )
+
         bundle = AnalysisBundle(
             question=req.question,
             optional_news_text=req.optional_news_text,
@@ -1610,6 +1824,9 @@ class AgentAnalysisService:
             has_degraded_inputs=selected_outlook["has_degraded_inputs"],
             degradation_flags=degradation_flags,
             tool_trace=tool_trace,
+            gold_history=gold_history,
+            regime=regime_payload,
+            committee=committee,
         )
 
         citations = self._build_citations(bundle)
@@ -1625,6 +1842,49 @@ class AgentAnalysisService:
 
         draft = self._build_draft_narrative(req, bundle)
         narrative = await self._narrator.narrate(bundle, draft)
+
+        # Narrative critic: every number the LLM narrates must be grounded in
+        # the evidence bundle. Rule-based drafts are grounded by construction,
+        # so the gate only runs when the LLM actually rewrote the draft.
+        if narrative is not draft:
+            critic_texts = [
+                *narrative.summary_card.reasons,
+                *narrative.summary_card.invalidators,
+                narrative.risk_banner.title,
+                narrative.risk_banner.message,
+                *narrative.follow_up_questions,
+            ]
+            critic_evidence = [
+                bundle.snapshot.model_dump(mode="json"),
+                bundle.forecast,
+                bundle.news.model_dump(mode="json"),
+                [event.model_dump() for event in bundle.rag_events],
+                bundle.macro_context,
+                bundle.risk_profile,
+                regime_payload,
+                committee,
+                quant_ctx,
+                [card.model_dump() for card in evidence_cards],
+                [citation.model_dump() for citation in citations],
+                [card.model_dump(mode="json") for card in horizon_forecasts],
+                [
+                    draft.summary_card.model_dump(mode="json"),
+                    draft.risk_banner.model_dump(mode="json"),
+                ],
+            ]
+            critic_passed, critic_report = verify_narrative(critic_texts, critic_evidence)
+            tool_trace = [
+                *tool_trace,
+                {
+                    "tool": "narrative_critic",
+                    "status": "ok" if critic_passed else "reverted",
+                    "report": critic_report,
+                },
+            ]
+            if not critic_passed:
+                narrative = draft
+                degradation_flags.append("narrative_critic_reverted")
+
         if not evidence_cards:
             raise HTTPException(
                 status_code=503,
@@ -1665,6 +1925,8 @@ class AgentAnalysisService:
                         "memory_degraded_reason": bundle.memory_degraded_reason,
                         "macro_context": bundle.macro_context,
                         "investor_profile": bundle.investor_profile,
+                        "regime": regime_payload,
+                        "committee": committee,
                     },
                     "risk_gate": bundle.risk_gate,
                     "evidence_cards": [card.model_dump() for card in evidence_cards],
@@ -1763,6 +2025,7 @@ class AgentAnalysisService:
         history_started = datetime.now(timezone.utc)
         try:
             gold_history = await self._toolbox.get_gold_history()
+            gold_history = _trim_gold_history(gold_history, max_points=180, max_key_nodes=12)
             history_elapsed = int((datetime.now(timezone.utc) - history_started).total_seconds() * 1000)
             history_trace = self._tool_trace_entry(
                 "get_gold_history",
@@ -1776,6 +2039,7 @@ class AgentAnalysisService:
         except Exception as exc:
             history_elapsed = int((datetime.now(timezone.utc) - history_started).total_seconds() * 1000)
             gold_history = _fallback_gold_history(snapshot, f"{type(exc).__name__}:{exc}")
+            gold_history = _trim_gold_history(gold_history, max_points=180, max_key_nodes=12)
             history_trace = self._tool_trace_entry(
                 "get_gold_history",
                 gold_history.model_dump(mode="json"),
@@ -2564,40 +2828,55 @@ class AgentAnalysisService:
         action: SummaryAction = "观望"
         confidence_band: ConfidenceBand = "低"
 
-        bullish = bundle.quant_direction > 0
+        regime = bundle.regime or {}
+        # The regime only drives the headline stance when it has enough price
+        # history to compute a trustworthy multi-timescale trend. On thin history
+        # (cold start) we fall back to the existing evidence-based stance.
+        use_regime = bool(regime.get("sufficient_history"))
         if bundle.risk_gate.get("force_observation") or bundle.is_high_risk or bundle.has_conflict or bundle.is_low_confidence:
             stance = "高风险观望"
             action = "观望"
             confidence_band = "低"
+        elif use_regime:
+            # Stance/action come from the BACKTESTED trend + volatility regime
+            # mapped to the user's risk profile -- not the negative-edge quant
+            # direction or the uncalibrated probability.
+            stance = regime["stance"]
+            action = regime["action"]
+            confidence_band = regime["confidence_band"]
         else:
-            if bullish:
+            if bundle.quant_direction > 0:
                 stance = "偏多"
-                confidence_band = "高" if (bundle.quant_probability or 0.0) >= 0.66 else "中"
+                confidence_band = "中"
                 action = "小仓试探" if req.risk_profile == "conservative" else "分批布局"
             elif bundle.quant_direction < 0:
                 stance = "偏空"
-                confidence_band = "高" if (bundle.quant_probability or 0.0) >= 0.66 else "中"
+                confidence_band = "中"
                 action = "降低暴露"
             else:
                 stance = "中性"
                 action = "观望"
                 confidence_band = "低"
 
+        if bundle.risk_gate.get("force_observation"):
+            primary_reason = f"完整问卷触发风险画像门控：{' '.join(bundle.risk_gate.get('notes', []))}"
+        elif use_regime:
+            primary_reason = (
+                f"多周期趋势判定为{regime['regime']}（综合得分 {regime['trend_score']:.2f}，波动状态 {regime['vol_state']}），"
+                f"{req.risk_profile} 画像建议黄金目标暴露约 {regime['target_exposure_pct']:.0f}%。"
+                "该结论来自带交易成本回测的趋势+波动率管理策略，不依赖未校准的涨跌概率。"
+            )
+        elif _forecast_is_degraded(bundle.forecast):
+            primary_reason = "量化引擎当前不可用，系统已切换为保守中性处理。"
+        else:
+            primary_reason = (
+                f"{bundle.horizon} 当前采用代理预测，主要参考趋势、美元、利率和自动抓取的新闻环境。"
+                if _forecast_basis(bundle.forecast) == "heuristic_proxy"
+                else f"量化层方向为 {'偏多' if bundle.quant_direction > 0 else '偏空' if bundle.quant_direction < 0 else '中性'}（仅作参考）。"
+            )
+
         reasons = [
-            (
-                f"完整问卷触发风险画像门控：{' '.join(bundle.risk_gate.get('notes', []))}"
-                if bundle.risk_gate.get("force_observation")
-                else ""
-            ),
-            (
-                "量化引擎当前不可用，系统已切换为保守中性处理。"
-                if _forecast_is_degraded(bundle.forecast)
-                else (
-                    f"{bundle.horizon} 当前采用代理预测，主要参考趋势、美元、利率和自动抓取的新闻环境。"
-                    if _forecast_basis(bundle.forecast) == "heuristic_proxy"
-                    else f"量化层给出的主方向是 {'偏多' if bundle.quant_direction > 0 else '偏空' if bundle.quant_direction < 0 else '中性'}，概率约 {(bundle.quant_probability or 0.0) * 100:.1f}%。"
-                )
-            ),
+            primary_reason,
             bundle.macro_context["dollar_message"],
             bundle.macro_context["news_message"],
         ]
@@ -2708,6 +2987,26 @@ def _health_url(service_url: str) -> str:
     return f"{base}/health/ready"
 
 
+def _trim_gold_history(
+    history: GoldPriceHistoryResponse,
+    *,
+    max_points: int,
+    max_key_nodes: int,
+) -> GoldPriceHistoryResponse:
+    safe_max_points = max(2, int(max_points))
+    safe_max_key_nodes = max(0, int(max_key_nodes))
+    points = history.points[-safe_max_points:] if len(history.points) > safe_max_points else history.points
+    key_nodes = history.key_nodes[-safe_max_key_nodes:] if len(history.key_nodes) > safe_max_key_nodes else history.key_nodes
+    return GoldPriceHistoryResponse(
+        asset=history.asset,
+        as_of=history.as_of,
+        source=history.source,
+        points=points,
+        key_nodes=key_nodes,
+    )
+
+
+
 def create_app(
     *,
     toolbox: Optional[HttpResearchToolbox] = None,
@@ -2726,8 +3025,8 @@ def create_app(
         market_indicators_url=_env("MARKET_INDICATORS_URL", "http://localhost:8014/api/v1/market/indicators/current"),
         market_history_url=_env("MARKET_HISTORY_URL", "http://localhost:8014/api/v1/market/gold/history"),
         recent_news_url=_env("RECENT_NEWS_URL", "http://localhost:8016/api/v1/news/recent"),
-        default_model=_env("AGENT_DEFAULT_MODEL", "gpt-5.4-mini"),
-        complex_model=_env("AGENT_COMPLEX_MODEL", "gpt-5.4"),
+        default_model=_env("AGENT_DEFAULT_MODEL", "deepseek-v4-flash"),
+        complex_model=_env("AGENT_COMPLEX_MODEL", "deepseek-v4-pro"),
         vix_circuit_breaker_threshold=float(_env("VIX_CIRCUIT_BREAKER_THRESHOLD", "30")),
         stale_after_seconds=int(_env("MARKET_STALE_AFTER_SECONDS", "180")),
         news_stale_after_seconds=int(_env("NEWS_STALE_AFTER_SECONDS", "300")),
@@ -2803,6 +3102,19 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def authorize_internal_trigger(request: Request, call_next: Any) -> Response:
+        if request.url.path == "/api/v1/agent/trigger":
+            try:
+                app.state.authorizer.authorize(request, internal_only=True)
+            except HTTPException as exc:
+                return JSONResponse(
+                    status_code=exc.status_code,
+                    content={"detail": exc.detail},
+                    headers=exc.headers,
+                )
+        return await call_next(request)
 
     @app.get("/health")
     async def health() -> Dict[str, Any]:
@@ -2883,6 +3195,79 @@ def create_app(
         await app.state.rate_limiter.check(auth_ctx["client_id"])
         service: AgentAnalysisService = app.state.analysis_service
         return await service.current_dashboard()
+
+    @app.get("/api/v1/agent/research/current")
+    async def research_current(request: Request) -> JSONResponse:
+        """Long-horizon quant research context: HMM regime posterior, macro
+        factor snapshot, fair-value anchor, vol bands, scenario cone, and
+        allocation tilts -- computed from the repo-local long dataset with a
+        TTL cache. Read-only; consumed by the research frontend."""
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        try:
+            ctx = await asyncio.to_thread(quant_research_context.get_context)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_code": "research_context_unavailable",
+                    "message": f"{type(exc).__name__}: {exc}",
+                },
+            ) from exc
+        return JSONResponse(content=jsonable_encoder(ctx))
+
+    @app.get("/api/v1/agent/calibration")
+    async def calibration(request: Request) -> JSONResponse:
+        """The agent's public scorecard: realized outcomes of past stance
+        calls (hit rate, Brier score) plus the bounded committee-confidence
+        adjustment derived from them."""
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        store: AgentTraceStore = app.state.trace_store
+        try:
+            rows = await store.load_recent_analyses(limit=500)
+        except TraceStoreUnavailableError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_code": "trace_store_unavailable",
+                    "message": f"Analysis trace store unavailable: {exc}",
+                },
+            ) from exc
+
+        def _score() -> Dict[str, Any]:
+            from data_sources import load_market_data
+
+            raw, source = load_market_data()
+            outcomes = backfill_outcomes(rows, raw["Gold"])
+            summary = calibration_summary(outcomes)
+            summary["price_data_source"] = source
+            summary["weight_adjustment"] = committee_weight_adjustments(summary)
+            summary["recent_outcomes"] = [
+                {
+                    "analysis_id": o["analysis_id"],
+                    "created_at": o["created_at"].isoformat(),
+                    "horizon": o["horizon"],
+                    "stance": o["stance"],
+                    "confidence_band": o["confidence_band"],
+                    "realized_return": o["realized_return"],
+                    "hit": o.get("hit"),
+                }
+                for o in outcomes[-30:]
+            ]
+            return summary
+
+        try:
+            payload = await asyncio.to_thread(_score)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_code": "calibration_unavailable",
+                    "message": f"{type(exc).__name__}: {exc}",
+                },
+            ) from exc
+        return JSONResponse(content=jsonable_encoder(payload))
 
     @app.post("/api/v1/agent/feedback", response_model=AgentFeedbackResponse)
     async def feedback(req: AgentFeedbackRequest, request: Request) -> AgentFeedbackResponse:

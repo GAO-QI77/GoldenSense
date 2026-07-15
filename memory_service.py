@@ -61,6 +61,11 @@ def _status_response(
         results=[],
     )
 
+
+def _allow_unavailable_ready() -> bool:
+    return os.environ.get("MEMORY_ALLOW_UNAVAILABLE_READY", "0") == "1"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global retriever, retriever_status, retriever_error
@@ -140,13 +145,15 @@ def health_live():
 @app.get("/health/ready")
 def health_ready():
     ready = retriever is not None and retriever_status == "ready"
+    allow_unavailable = _allow_unavailable_ready()
     return JSONResponse(
-        status_code=200 if ready else 503,
+        status_code=200 if ready or allow_unavailable else 503,
         content={
             "status": "ok" if ready else "unavailable",
             "retriever_status": retriever_status,
             "retriever_error": retriever_error,
-            "errors": [] if ready else ["memory_retriever_not_ready"],
+            "degraded_reason": None if ready else "memory_retriever_not_ready",
+            "errors": [] if ready or allow_unavailable else ["memory_retriever_not_ready"],
         },
     )
 

@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "gateway",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "uvicorn", "agent_gateway:app", "--host", "127.0.0.1", "--port", "8020"],
+      "port": 8020
+    },
+    {
+      "name": "web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "modern_showcase_site"],
+      "port": 5173
+    }
+  ]
+}

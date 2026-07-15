@@ -116,7 +116,13 @@ def test_recent_news_query_without_matches_returns_empty_items():
 
 
 def test_recent_news_refresh_uses_sample_fallback_when_upstream_fails():
-    app = create_app(news_loader=_FailingNewsLoader(), start_background_task=False)
+    # Empty in-memory persistence keeps a developer machine's live Redis
+    # cache from leaking into the scenario.
+    app = create_app(
+        news_loader=_FailingNewsLoader(),
+        persistence=_MemoryPersistence(),
+        start_background_task=False,
+    )
     with TestClient(app) as client:
         resp = client.post("/api/v1/news/refresh")
         assert resp.status_code == 200
@@ -151,6 +157,7 @@ def test_recent_news_refresh_prefers_cached_payload_before_sample_fallback():
 def test_news_readiness_fails_without_payload_when_fallback_disabled():
     app = create_app(
         news_loader=_FailingNewsLoader(),
+        persistence=_MemoryPersistence(),
         config=NewsIngestConfig(allow_sample_fallback=False),
         start_background_task=False,
     )

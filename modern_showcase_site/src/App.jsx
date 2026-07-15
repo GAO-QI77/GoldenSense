@@ -31,6 +31,10 @@ import {
   WalletCards,
 } from 'lucide-react';
 
+import GlobalSearch from './GlobalSearch';
+import QuantPage from './QuantPage';
+import { addSearchEntries } from './searchIndex';
+
 const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
 const DASHBOARD_URL =
   import.meta.env.VITE_AGENT_DASHBOARD_URL || API_URL.replace('/analyze', '/dashboard/current');
@@ -195,6 +199,7 @@ function App() {
         <Routes>
           <Route path="/" element={<DashboardPage />} />
           <Route path="/agent" element={<AgentPage />} />
+          <Route path="/quant" element={<QuantPage />} />
           <Route path="*" element={<DashboardPage />} />
         </Routes>
       </AppShell>
@@ -203,6 +208,25 @@ function App() {
 }
 
 function AppShell({ children }) {
+  useEffect(() => {
+    addSearchEntries('pages', [
+      { id: 'page-dashboard', source: 'pages', title: '研究主页', hint: '三周期预测、指标证据与近端新闻', route: '/', keywords: ['dashboard', '主页', '预测', '指标'] },
+      { id: 'page-agent', source: 'pages', title: '风险画像 Agent', hint: '提交问题与风险画像，获取可追溯分析', route: '/agent', keywords: ['agent', '画像', '分析', '问答'] },
+      { id: 'page-quant', source: 'pages', title: '量化研究面板', hint: 'HMM 状态机、公允价值、情景锥与校准记分卡', route: '/quant', keywords: ['quant', '量化', 'hmm', '校准', '因子'] },
+    ]);
+    addSearchEntries(
+      'prompts',
+      starterPrompts.map((prompt, index) => ({
+        id: `prompt-${index}`,
+        source: 'prompts',
+        title: prompt,
+        hint: '打开风险画像 Agent 使用该问题',
+        route: '/agent',
+        keywords: ['提问', '模板'],
+      })),
+    );
+  }, []);
+
   return (
     <div className="terminal-shell">
       <header className="topbar">
@@ -225,11 +249,18 @@ function AppShell({ children }) {
             <BrainCircuit size={16} />
             风险画像 Agent
           </NavLink>
+          <NavLink to="/quant">
+            <Radar size={16} />
+            量化研究
+          </NavLink>
         </nav>
 
-        <div className="compliance-pill">
-          <ShieldCheck size={15} />
-          研究辅助 · 非下单系统
+        <div className="topbar-right">
+          <GlobalSearch />
+          <div className="compliance-pill">
+            <ShieldCheck size={15} />
+            研究辅助 · 非下单系统
+          </div>
         </div>
       </header>
       {children}
@@ -278,6 +309,22 @@ function DashboardPage() {
   const citations = dashboard?.citations || [];
   const sourceHealth = dashboard?.source_health || [];
   const goldHistory = dashboard?.gold_history;
+
+  useEffect(() => {
+    addSearchEntries(
+      'news',
+      (dashboard?.recent_news || []).map((item, index) => ({
+        id: `news-${index}`,
+        source: 'news',
+        title: item.title || item.summary || '未命名新闻',
+        hint: [item.source, item.published_at || item.published].filter(Boolean).join(' · '),
+        route: '/',
+        hash: 'panel-news',
+        href: item.url || undefined,
+        keywords: ['新闻', 'news'],
+      })),
+    );
+  }, [dashboard]);
 
   const primaryForecast = forecasts[0];
   const dashboardStatus = loading ? 'loading' : error ? 'error' : dataQuality?.status || 'ok';

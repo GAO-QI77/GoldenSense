@@ -42,3 +42,20 @@ def test_memory_service_startup_does_not_block_on_embedding_model():
     assert health.json()["retriever_status"] in {"not_started", "loading", "ready", "unavailable"}
     assert ready.status_code == 503
     assert "memory_retriever_not_ready" in ready.json()["errors"]
+
+
+def test_memory_service_can_mark_unavailable_retriever_as_ready_for_demo(monkeypatch):
+    monkeypatch.setenv("MEMORY_ALLOW_UNAVAILABLE_READY", "1")
+    original = memory_service.retriever
+    memory_service.retriever = None
+    try:
+        with TestClient(memory_service.app) as client:
+            ready = client.get("/health/ready")
+    finally:
+        memory_service.retriever = original
+
+    assert ready.status_code == 200
+    data = ready.json()
+    assert data["status"] == "unavailable"
+    assert data["degraded_reason"] == "memory_retriever_not_ready"
+    assert data["errors"] == []

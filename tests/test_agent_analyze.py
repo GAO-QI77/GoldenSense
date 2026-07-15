@@ -488,6 +488,13 @@ def test_internal_endpoints_reject_public_api_keys():
         )
         assert trigger.status_code == 403
 
+        malformed_trigger = client.post(
+            "/api/v1/agent/trigger",
+            json={},
+            headers=_headers("public"),
+        )
+        assert malformed_trigger.status_code == 403
+
 
 def test_legacy_trigger_respects_manual_vix_override():
     with _make_client(_ScenarioToolbox(direction=1, probability=0.72, news_sentiment=0.3, rag_t1=0.015, rag_t7=0.02)) as client:
@@ -897,3 +904,64 @@ def test_agent_analyze_scenarios(name, toolbox, expected_action, expected_stance
         data = resp.json()
     assert data["summary_card"]["action"] == expected_action
     assert data["summary_card"]["stance"] == expected_stance
+
+
+class _TrendHistoryToolbox(_ScenarioToolbox):
+    """Scenario toolbox that returns a long, clearly-trending gold history so the
+    regime brain has enough data to drive the headline stance."""
+
+    def __init__(self, *, trend: str, **kwargs):
+        super().__init__(**kwargs)
+        self._trend = trend
+
+    async def get_gold_history(self):
+        now = datetime.now(timezone.utc)
+        n = 260
+        if self._trend == "up":
+            prices = [2000.0 + 2.0 * i for i in range(n)]
+        else:
+            prices = [2600.0 - 2.0 * i for i in range(n)]
+        points = [
+            GoldPriceHistoryPoint(date=f"2025-{1 + i % 12:02d}-01", price=p, change_pct=None)
+            for i, p in enumerate(prices)
+        ]
+        return GoldPriceHistoryResponse(
+            asset="XAUUSD", as_of=now, source="test-source", points=points
+        )
+
+
+def test_regime_drives_bullish_stance_on_uptrend_history_despite_bearish_quant():
+    # Quant says bearish, but a long uptrend history + calm vol should make the
+    # backtested regime the source of truth -> 偏多, not 偏空.
+    toolbox = _TrendHistoryToolbox(
+        trend="up", direction=-1, probability=0.6, technical_state="bearish",
+        news_sentiment=0.0, macro_signal=0, rag_t1=0.0, rag_t7=0.0,
+    )
+    with _make_client(toolbox) as client:
+        resp = client.post(
+            "/api/v1/agent/analyze",
+            json={"question": "regime up", "risk_profile": "conservative", "horizon": "24h", "locale": "zh-CN"},
+            headers=_headers(),
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+    assert data["summary_card"]["stance"] == "偏多"
+    assert data["summary_card"]["action"] == "小仓试探"
+    assert any("暴露" in r for r in data["summary_card"]["reasons"])
+
+
+def test_regime_drives_bearish_stance_on_downtrend_history_despite_bullish_quant():
+    toolbox = _TrendHistoryToolbox(
+        trend="down", direction=1, probability=0.6, technical_state="bullish",
+        news_sentiment=0.0, macro_signal=0, rag_t1=0.0, rag_t7=0.0,
+    )
+    with _make_client(toolbox) as client:
+        resp = client.post(
+            "/api/v1/agent/analyze",
+            json={"question": "regime down", "risk_profile": "balanced", "horizon": "24h", "locale": "zh-CN"},
+            headers=_headers(),
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+    assert data["summary_card"]["stance"] == "偏空"
+    assert data["summary_card"]["action"] == "降低暴露"

@@ -4,6 +4,28 @@ GoldenSense 是一个面向中文用户的黄金投资辅助 Agent。它不执�
 
 当前仓库只保留正式 Agent 主链路，不再包含旧的直播平台或历史 demo 分支。
 
+## 产品速览
+
+GoldenSense 当前是一款可演示 MVP，面向需要快速理解黄金市场风险的中文个人研究用户。它把分散的行情、宏观指标、新闻事件、量化预测、历史类比与用户风险画像整理为一条可追溯的研究路径。
+
+| 维度 | 当前设计 |
+| --- | --- |
+| 核心问题 | 黄金研究信号分散、结论难追溯、风险提示与用户情况脱节 |
+| 用户主流程 | 研究主页 → 提交问题与风险画像 → 三周期分析 → 证据卡 / 引用 / 失效条件 → 风险提示 → 反馈 |
+| 产品边界 | 研究辅助，不执行交易，不承诺收益，不提供交易所级实时行情 |
+| 可信机制 | 数据新鲜度检查、显式降级、模型状态标记、多源冲突提示、风险画像门控、内部 Trace |
+| 当前状态 | 已完成可演示 MVP；尚未披露真实用户使用数据 |
+| 下一步验证 | 计划开展 5 - 10 位目标用户访谈与可用性测试，重点验证任务完成率、结果可理解性和风险提示识别率 |
+
+## 演示入口
+
+- GitHub 仓库：<https://github.com/GAO-QI77/GoldenSense>
+- 消费者前台（本地）：`http://localhost:4173`
+- 内部 QA 面板（本地）：`http://localhost:8501`
+- Agent 网关（本地）：`http://localhost:8020`
+
+公开前端体验入口：[https://goldensense-public-site.vercel.app](https://goldensense-public-site.vercel.app)。公网 Agent Gateway 已部署到 Railway：[https://agent-gateway-production-fa79.up.railway.app](https://agent-gateway-production-fa79.up.railway.app)。未配置 DeepSeek key 时，网关会返回保守的规则结果并保留降级标记。
+
 ## 仓库治理
 
 - 许可证：MIT，见 [`LICENSE`](LICENSE)。
@@ -58,6 +80,18 @@ flowchart LR
 | 路径 | 说明 |
 | --- | --- |
 | [`agent_gateway.py`](agent_gateway.py) | 正式 Agent 网关、鉴权、限流、审计与输出编排 |
+| [`data_sources.py`](data_sources.py) | 扩展数据层：FRED 实际利率/盈亏平衡通胀 + 2004 年起长历史行情，带缓存与显式降级 |
+| [`vol_models.py`](vol_models.py) | 短期层：HAR-RV 波动率预测 + P10/P50/P90 经验分位收益带 |
+| [`regime_probabilistic.py`](regime_probabilistic.py) | 三状态 Gaussian HMM（numpy EM），输出 calm/elevated/stress 后验概率 |
+| [`strategy_macro.py`](strategy_macro.py) | 中期层：实际利率/美元/通胀预期/资金流代理四因子组合（先验参数、含成本回测） |
+| [`fair_value.py`](fair_value.py) | 长期层：实际利率+美元误差修正公允价值锚（滚动十年窗口） |
+| [`allocation.py`](allocation.py) | BL-lite 配置区间（观点只倾斜画像先验）+ HMM 蒙特卡洛情景锥 |
+| [`validation.py`](validation.py) | Purged walk-forward（带 embargo）+ PSR / Deflated Sharpe Ratio |
+| [`meta_labeling.py`](meta_labeling.py) | Triple-barrier 元标签 + XGBoost 信号过滤研究框架（当前 AUC≈0.51，如实不部署） |
+| [`analyst_committee.py`](analyst_committee.py) | 确定性四分析师委员会（技术/宏观/资金流/新闻）+ regime 加权融合 + 分歧分数 |
+| [`narrative_critic.py`](narrative_critic.py) | 叙事校验器：LLM 输出中的每个数字必须能在证据包中落地，否则回退规则文案 |
+| [`outcome_tracker.py`](outcome_tracker.py) | 结果回填与校准：命中率 / Brier 分数 / 有界置信度反哺 |
+| [`research_context.py`](research_context.py) | 本地长历史量化上下文（TTL 缓存），供网关与 `/research/current` 使用 |
 | [`inference_service.py`](inference_service.py) | 量化预测服务 |
 | [`market_snapshot_service.py`](market_snapshot_service.py) | 市场快照服务 |
 | [`news_ingest_service.py`](news_ingest_service.py) | 新闻摄取服务 |
@@ -221,15 +255,20 @@ export AGENT_INTERNAL_API_KEYS=dev-internal-key
 | `INFERENCE_ALLOW_SYNTHETIC_FALLBACK` | dev 默认 `1`，非 dev 默认 `0` | 量化预测无法拉取原始输入时是否退回启发式代理 |
 | `MEMORY_START_BACKGROUND_LOAD` | `0` | 是否在后台加载 embedding 模型；不会阻塞服务启动 |
 
-### OpenAI 叙事层
+### LLM 叙事层
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `OPENAI_API_KEY` | 空 | 可选；为空时使用规则回退 |
-| `AGENT_DEFAULT_MODEL` | `gpt-5.4-mini` | 默认叙事模型 |
-| `AGENT_COMPLEX_MODEL` | `gpt-5.4` | 复杂场景叙事模型 |
+| `LLM_PROVIDER` | `deepseek` | `deepseek` 或 `openai`；未配置可用 key 时使用规则回退 |
+| `DEEPSEEK_API_KEY` | 空 | DeepSeek 可选增强 key |
+| `OPENAI_API_KEY` | 空 | OpenAI 可选增强 key；仅在 `LLM_PROVIDER=openai` 时使用 |
+| `LLM_TIMEOUT_SECONDS` | `12.0` | LLM 单次请求超时；失败或非法 JSON 最多重试一次 |
+| `AGENT_DEFAULT_MODEL` | `deepseek-v4-flash` | 默认叙事模型 |
+| `AGENT_COMPLEX_MODEL` | `deepseek-v4-pro` | 证据冲突或高风险场景叙事模型 |
 
 LLM 只负责叙事增强和输出组织，不承担证据检索、风险熔断或事实存储职责。
+
+首发默认使用 `deepseek-v4-flash`；证据冲突或高风险场景才切到 `deepseek-v4-pro`。不要新接入 `deepseek-chat` 或 `deepseek-reasoner`：DeepSeek 官方已标注这两个兼容别名将在 `2026-07-24 15:59 UTC` 弃用。
 
 ## 初始化历史记忆库
 
@@ -247,6 +286,30 @@ python3 memory_ingestion.py \
 - Embedding 模型使用 `sentence-transformers/all-MiniLM-L6-v2`
 
 如果数据库不可用或检索失败，`memory_service.py` 会显式返回 `status=unavailable` 或 `status=degraded`，不会再伪装成“空结果就是没有历史相似事件”。
+
+## 量化研究层（短 / 中 / 长期分层）
+
+策略层按期限分工，每层使用不同的方法论，全部经过含成本回测与走前验证；纪律不变：
+任何新信号必须过 `backtest_engine` 的成本感知门槛才能进入 Agent 输出。
+
+| 期限 | 方法 | 模块 |
+| --- | --- | --- |
+| 短期 (T+1~T+5) | 不预测方向（已被走前验证证伪），改为 HAR-RV 波动率预测 + 经验分位收益带 | `vol_models.py` |
+| 中期 (数周~数月) | 三状态 HMM 概率状态机 + 实际利率/美元/通胀预期/资金流四因子组合，概率加权暴露 | `regime_probabilistic.py`, `strategy_macro.py`, `regime_strategy.evaluate_regime_v2` |
+| 长期 (6 个月+) | 公允价值锚（误差修正）+ BL-lite 配置区间 + regime-switching 蒙特卡洛情景锥 | `fair_value.py`, `allocation.py` |
+
+数据基线：`python3 data_sources.py` 会从 FRED（无需 key）与 yfinance 拉取 2004 年起的扩展数据集
+（含 10Y TIPS 实际利率、盈亏平衡通胀、GLD 成交额代理）写入 `raw_market_data_extended.csv`；
+离线时所有消费方自动回退仓库内置 CSV。22 年样本包含 2008/2011-2015/2022 等多个 regime——
+买入持有在该样本的最大回撤为 -44%，这也是所有策略结论的诚实基准。
+
+Agent 编排新增三道确定性机制（均无 LLM 参与）：
+- **分析师委员会**（`analyst_committee.py`）：四个专业视角输出立场与置信度，按波动状态加权融合；
+  分歧分数超阈值时路由到更强叙事模型并记入 trace。
+- **叙事校验器**（`narrative_critic.py`）：LLM 改写后的每个数字必须能在证据包内落地，
+  否则回退确定性草稿并打 `narrative_critic_reverted` 降级标记。
+- **校准闭环**（`outcome_tracker.py`）：到期分析自动回填实际走势、计算命中率与 Brier 分数，
+  以硬上限反哺委员会置信度，并通过 `/api/v1/agent/calibration` 公开。
 
 ## 模型与回退行为
 
@@ -334,6 +397,27 @@ X-API-Key: <public-or-internal-key>
 ```
 
 返回首页所需的稳定三周期预测、四类指标、近端新闻、数据质量和指标引用。该接口是消费者前台 `/` 的唯一研究首页入口。
+
+### 2.5 量化研究与校准（新增）
+
+```http
+GET /api/v1/agent/research/current
+X-API-Key: <public-or-internal-key>
+```
+
+返回本地长历史数据集（2004 年起）驱动的量化研究上下文：HMM 状态后验（`regime_posterior`）、
+宏观因子面板（`macro_factors`）、公允价值锚（`fair_value`）、HAR-RV 分布带（`vol_bands`）、
+90 日蒙特卡洛情景锥（`scenario_cone`）与按画像的配置区间（`allocation`）。每个区块要么给出数据，
+要么在 `degraded` 中显式标注原因。消费者前台 `/quant` 页面即由该端点驱动。
+
+```http
+GET /api/v1/agent/calibration
+X-API-Key: <public-or-internal-key>
+```
+
+系统的公开记分卡：对已到期的历史分析回填实际金价走势，输出方向判断命中率、Brier 分数、
+分立场/分置信度拆解与最近判定列表。校准结果以硬上限（±20%）反哺委员会置信度，
+`weight_adjustment.basis` 说明依据。
 
 ### 3. 反馈入口
 
@@ -450,8 +534,21 @@ Docker Compose 主链路冒烟保留为本地/手动验证，避免公开 CI 过
 - 仅允许受信来源访问 `traces` 与 `trigger`
 - 在反向代理或 API Gateway 层补充 TLS、IP 约束和速率限制
 - 使用真实 Postgres / Redis，不依赖 dev 内存 trace fallback
-- 将 OpenAI key 视为可选增强，而不是系统可用性的前提
+- 将 LLM key 视为可选增强，而不是系统可用性的前提
 - 部署后检查 `/health/live` 和 `/health/ready`；`ready` 失败时不应接入前端流量
+
+## 公开 Demo 部署
+
+黑客松公开入口采用轻量部署边界：
+
+- Vercel 只部署 [`modern_showcase_site/`](modern_showcase_site/) 静态前台。
+- Railway 使用 [`scripts/public_stack.py`](scripts/public_stack.py) 在一个容器中启动 5 个 Python 服务；只有 Agent Gateway 暴露公网端口。
+- Neon 提供 Postgres / pgvector，Upstash 提供 Redis。
+- `APP_ENV=demo` 显式启用 `yfinance + RSS` 和可观察降级；这是评委体验模式，不是交易级行情 SLA。
+
+Railway、Neon 初始化和 Vercel 环境变量详见 [`DEPLOYMENT_DOC.md`](DEPLOYMENT_DOC.md)。
+
+黑客松首发不购买行情或新闻 API。若公开体验需要更稳定的黄金现货价格，优先评估 Metals.Dev Silver：`$9.99/月`、`10,000 requests/月`，配合 5 分钟缓存使用。
 
 ## 已知限制
 
@@ -479,7 +576,7 @@ Docker Compose 主链路冒烟保留为本地/手动验证，避免公开 CI 过
 - `RECENT_NEWS_URL`、`MARKET_SNAPSHOT_URL`、`MEMORY_URL`、`FORECAST_URL` 是否配置正确
 - 本地是否刻意开启了 fallback 模式
 
-### 没有 `OPENAI_API_KEY` 会不会直接不可用
+### 没有 `DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY` 会不会直接不可用
 
 不会。系统会退回确定性规则生成，接口仍然可用，只是文案表达会更保守。
 

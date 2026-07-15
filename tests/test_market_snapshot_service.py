@@ -32,6 +32,20 @@ class _FailingMarketLoader:
         raise RuntimeError("network_down")
 
 
+class _MemoryPersistence:
+    """Empty in-memory persistence so a developer machine's live Redis
+    cache cannot leak into failure-scenario tests."""
+
+    def __init__(self, payload=None):
+        self.payload = payload
+
+    def save(self, snapshot):
+        self.payload = snapshot
+
+    def load(self):
+        return self.payload
+
+
 class _JumpMarketLoader:
     provider_name = "test_jump"
 
@@ -144,6 +158,7 @@ def test_market_snapshot_refresh_uses_synthetic_fallback_when_upstream_fails():
 def test_market_readiness_fails_without_snapshot_when_fallback_disabled():
     app = create_app(
         market_loader=_FailingMarketLoader(),
+        persistence=_MemoryPersistence(),
         config=MarketSnapshotConfig(allow_synthetic_fallback=False),
         start_background_task=False,
     )

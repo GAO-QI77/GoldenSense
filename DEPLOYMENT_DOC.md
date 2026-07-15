@@ -87,16 +87,88 @@ python3 -m streamlit run frontend/dashboard.py
 export AGENT_GATEWAY_INTERNAL_API_KEY=dev-internal-key
 ```
 
-## 4.1 Vercel 前端 + Docker 后端
+## 4.1 Vercel 前端 + Railway 单容器后端
 
-推荐公开散户助手时只把 `modern_showcase_site/` 部署到 Vercel，并把 Python 服务栈部署到 Docker / 容器平台。
+推荐公开散户助手时只把 `modern_showcase_site/` 部署到 Vercel，并把 Python 服务栈部署到 Railway 单容器。不要从仓库根目录执行 Vercel 发布；根目录包含模型 checkpoint、研究数据和后端源码。
+
+### Railway
+
+仓库根目录包含 [`railway.json`](railway.json)。Railway 会构建 Dockerfile，并运行：
+
+```bash
+python3 scripts/public_stack.py
+```
+
+启动器只公开 `${PORT}` 上的 Agent Gateway。`inference`、`memory`、`market` 和 `news` 服务只监听容器内的 `127.0.0.1`。
+公网镜像使用 [`requirements.public.txt`](requirements.public.txt)，并从 PyTorch 官方 CPU 索引安装 Torch，避免 Railway CPU 容器下载 CUDA 运行时。
+
+Railway Demo 环境变量：
+
+```bash
+APP_ENV=demo
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=your-deepseek-key
+AGENT_DEFAULT_MODEL=deepseek-v4-flash
+AGENT_COMPLEX_MODEL=deepseek-v4-pro
+LLM_TIMEOUT_SECONDS=12.0
+AGENT_PUBLIC_API_KEYS=replace-with-random-public-key
+AGENT_INTERNAL_API_KEYS=replace-with-random-internal-key
+AGENT_ALLOW_ORIGINS=https://your-vercel-domain.vercel.app
+DATABASE_URL=postgresql://... # Neon pooled connection string
+REDIS_URL=rediss://...        # Upstash Redis connection string
+```
+
+可直接从 [`railway.demo.env.example`](railway.demo.env.example) 开始填写。示例文件不包含真实密钥。
+
+`APP_ENV=demo` 会显式使用 `yfinance + RSS`，并保留带标记的 fallback。该模式适合公开黑客松体验，不应描述为交易级行情基础设施。
+
+若需要先发布可体验版本，再补齐第三方服务，可以暂时省略 `DEEPSEEK_API_KEY`、`DATABASE_URL` 和 `REDIS_URL`。启动器会使用规则叙事、内存 trace 和显式降级结果。Neon、Upstash 与 DeepSeek 接入后，无需改代码，只需补充环境变量并重新部署。
+
+### 成本基线
+
+| 服务 | 首发配置 | 费用基线 |
+| --- | --- | --- |
+| Vercel | 静态前端 | 免费层 |
+| Railway | Hobby 单容器 | `$5/月`，包含 `$5` 资源用量 |
+| Neon | Free Postgres / pgvector | `$0`，每项目 `100 CU-hours/月`、`0.5 GB` |
+| Upstash | Free Redis | `$0`，`256 MB`、`500K commands/月` |
+| DeepSeek | 按量计费 | 小额余额，关闭无限自动充值 |
+
+首发继续使用 `yfinance + RSS`。若后续需要更稳定的黄金现货 API，优先评估 Metals.Dev Silver：`$9.99/月`、`10,000 requests/月`，配合 5 分钟缓存。
+
+DeepSeek 默认模型为 `deepseek-v4-flash`，高风险场景为 `deepseek-v4-pro`。不要新接入 `deepseek-chat` 或 `deepseek-reasoner`：官方已标注这两个兼容别名将在 `2026-07-24 15:59 UTC` 弃用。
+
+### Neon / pgvector
+
+创建 Neon 数据库后执行一次历史记忆初始化：
+
+```bash
+python3 memory_ingestion.py \
+  --database-url "$DATABASE_URL"
+```
+
+脚本会在 Neon 支持的情况下自动创建 `vector` 扩展；否则回退到数组存储。
+
+### Vercel
+
+当前公开前端地址：
+
+```text
+https://goldensense-public-site.vercel.app
+```
+
+当前 Railway Demo 后端地址：
+
+```text
+https://agent-gateway-production-fa79.up.railway.app
+```
 
 前端环境变量：
 
 ```bash
-VITE_AGENT_API_URL=https://your-backend.example.com/api/v1/agent/analyze
-VITE_AGENT_DASHBOARD_URL=https://your-backend.example.com/api/v1/agent/dashboard/current
-VITE_AGENT_FEEDBACK_URL=https://your-backend.example.com/api/v1/agent/feedback
+VITE_AGENT_API_URL=https://agent-gateway-production-fa79.up.railway.app/api/v1/agent/analyze
+VITE_AGENT_DASHBOARD_URL=https://agent-gateway-production-fa79.up.railway.app/api/v1/agent/dashboard/current
+VITE_AGENT_FEEDBACK_URL=https://agent-gateway-production-fa79.up.railway.app/api/v1/agent/feedback
 VITE_AGENT_API_KEY=your-public-key
 ```
 
@@ -104,6 +176,8 @@ VITE_AGENT_API_KEY=your-public-key
 
 ```bash
 APP_ENV=production
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=your-deepseek-key
 AGENT_PUBLIC_API_KEYS=your-public-key
 AGENT_INTERNAL_API_KEYS=your-internal-key
 AGENT_ALLOW_ORIGINS=https://your-vercel-domain.vercel.app
@@ -115,11 +189,13 @@ INFERENCE_ALLOW_SYNTHETIC_FALLBACK=0
 AGENT_ALLOW_TRACE_MEMORY_FALLBACK=0
 ```
 
+生产模式应接入经过授权的行情与新闻供应商。它和黑客松 `APP_ENV=demo` 的免费源回退策略是两个不同的运行档位。
+
 发布前检查：
 
 ```bash
-curl https://your-backend.example.com/health/live
-curl https://your-backend.example.com/health/ready
+curl https://agent-gateway-production-fa79.up.railway.app/health/live
+curl https://agent-gateway-production-fa79.up.railway.app/health/ready
 ```
 
 ## 5. Docker Compose

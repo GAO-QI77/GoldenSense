@@ -10,7 +10,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
   && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+COPY requirements.public.txt /app/requirements.public.txt
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.10.0
+RUN pip install --no-cache-dir -r /app/requirements.public.txt
+
+ENV HF_HOME=/app/.cache/huggingface
+RUN python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
 
 COPY . /app
+
+CMD ["python3", "scripts/public_stack.py"]

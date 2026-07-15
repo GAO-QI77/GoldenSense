@@ -82,8 +82,9 @@ services:
       MARKET_SNAPSHOT_URL: http://market_ingest:8014/api/v1/market/snapshot/latest
       MARKET_INDICATORS_URL: http://market_ingest:8014/api/v1/market/indicators/current
       RECENT_NEWS_URL: http://news_ingest:8016/api/v1/news/recent
-      AGENT_DEFAULT_MODEL: gpt-5.4-mini
-      AGENT_COMPLEX_MODEL: gpt-5.4
+      LLM_PROVIDER: deepseek
+      AGENT_DEFAULT_MODEL: deepseek-v4-flash
+      AGENT_COMPLEX_MODEL: deepseek-v4-pro
       AGENT_PUBLIC_API_KEYS: dev-public-key
       AGENT_INTERNAL_API_KEYS: dev-internal-key
       AGENT_ALLOW_ORIGINS: http://localhost:4173,http://127.0.0.1:4173,http://localhost:8501,http://127.0.0.1:8501

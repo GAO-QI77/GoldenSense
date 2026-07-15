@@ -9,6 +9,8 @@ This Vite app is the public retail-facing UI only. Deploy it to Vercel as a stat
 - Output directory: `dist`
 - Node.js: `20`
 
+Do not deploy from the repository root. The repository also contains Python services, model checkpoints, and research data that are not part of the public static frontend.
+
 ## Required Environment Variables
 
 ```bash
@@ -20,13 +22,25 @@ VITE_AGENT_API_KEY=your-public-api-key
 
 The backend must include the Vercel domain in `AGENT_ALLOW_ORIGINS`.
 
+Current public frontend:
+
+```text
+https://goldensense-public-site.vercel.app
+```
+
+Current Railway demo backend:
+
+```text
+https://agent-gateway-production-fa79.up.railway.app
+```
+
 ## Backend Readiness
 
 Before routing user traffic to the frontend, verify the backend:
 
 ```bash
-curl https://your-backend.example.com/health/live
-curl https://your-backend.example.com/health/ready
+curl https://agent-gateway-production-fa79.up.railway.app/health/live
+curl https://agent-gateway-production-fa79.up.railway.app/health/ready
 ```
 
 If `/health/ready` fails, keep the frontend deployed but do not treat the system as production-ready.
