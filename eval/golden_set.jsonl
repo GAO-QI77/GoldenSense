@@ -1,0 +1,5 @@
+{"case_id": "cpi_hot_conservative", "request": {"question": "如果今晚 CPI 高于预期，黄金 24 小时怎么看？", "optional_news_text": "美国 CPI 同比高于预期，美元与收益率同步走高。", "risk_profile": "conservative", "horizon": "24h", "locale": "zh-CN"}}
+{"case_id": "fomc_hawkish_balanced", "request": {"question": "美联储放鹰后黄金中线还能拿吗？", "optional_news_text": "FOMC 释放鹰派信号，点阵图上移，美元走强。", "risk_profile": "balanced", "horizon": "7d", "locale": "zh-CN"}}
+{"case_id": "geopolitics_aggressive", "request": {"question": "地缘冲突升温，黄金 T+30 的机会和风险？", "optional_news_text": "地缘冲突升级，避险资金回流，油价与黄金同步走高。", "risk_profile": "aggressive", "horizon": "30d", "locale": "zh-CN"}}
+{"case_id": "dollar_surge_balanced", "request": {"question": "美元大涨时黄金该怎么办？", "optional_news_text": "美元指数大幅走强，非美货币普遍承压。", "risk_profile": "balanced", "horizon": "24h", "locale": "zh-CN"}}
+{"case_id": "neutral_no_news_conservative", "request": {"question": "现在黄金适合布局吗？", "risk_profile": "conservative", "horizon": "7d", "locale": "zh-CN"}}

@@ -150,6 +150,17 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
+    # Embedded daily data refresh (opt-in via DATA_REFRESH_ENABLED=1). Keeps
+    # the single-container demo's extended dataset from ageing without needing
+    # a separate Railway cron service. Failures degrade to the last good CSV.
+    try:
+        from refresh_data import start_background_refresh
+
+        if start_background_refresh() is not None:
+            print("started embedded data-refresh scheduler", flush=True)
+    except Exception as exc:  # never let refresh wiring block service startup
+        print(f"data-refresh scheduler unavailable: {exc}", file=sys.stderr, flush=True)
+
     for spec in specs:
         print(f"starting {spec.name}: {' '.join(spec.command)}", flush=True)
         processes.append(subprocess.Popen(spec.command, env=spec.env))

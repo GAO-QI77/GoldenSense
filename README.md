@@ -91,7 +91,11 @@ flowchart LR
 | [`analyst_committee.py`](analyst_committee.py) | 确定性四分析师委员会（技术/宏观/资金流/新闻）+ regime 加权融合 + 分歧分数 |
 | [`narrative_critic.py`](narrative_critic.py) | 叙事校验器：LLM 输出中的每个数字必须能在证据包中落地，否则回退规则文案 |
 | [`outcome_tracker.py`](outcome_tracker.py) | 结果回填与校准：命中率 / Brier 分数 / 有界置信度反哺 |
-| [`research_context.py`](research_context.py) | 本地长历史量化上下文（TTL 缓存），供网关与 `/research/current` 使用 |
+| [`research_context.py`](research_context.py) | 本地长历史量化上下文（TTL 缓存 + 数据新鲜度标记），供网关与 `/research/current` 使用 |
+| [`model_governance.py`](model_governance.py) | Champion-challenger 性能治理：命中率跌破阈值自动降级为保守姿态并标记 |
+| [`service_metrics.py`](service_metrics.py) | 进程内运维指标（per-route 时延/错误率/p95 + 降级/降级计数器），暴露于内部 `/metrics` |
+| [`scripts/refresh_data.py`](scripts/refresh_data.py) | 定时数据刷新（cron 入口 + 可内嵌的后台调度线程），失败保留 last-good CSV |
+| [`eval/`](eval/) | 评测护栏：golden-set + 确定性 judge（叙事忠实度/风险提示/失效条件），可进 CI |
 | [`inference_service.py`](inference_service.py) | 量化预测服务 |
 | [`market_snapshot_service.py`](market_snapshot_service.py) | 市场快照服务 |
 | [`news_ingest_service.py`](news_ingest_service.py) | 新闻摄取服务 |
@@ -303,13 +307,26 @@ python3 memory_ingestion.py \
 离线时所有消费方自动回退仓库内置 CSV。22 年样本包含 2008/2011-2015/2022 等多个 regime——
 买入持有在该样本的最大回撤为 -44%，这也是所有策略结论的诚实基准。
 
-Agent 编排新增三道确定性机制（均无 LLM 参与）：
+Agent 编排新增确定性机制（均无 LLM 参与）：
 - **分析师委员会**（`analyst_committee.py`）：四个专业视角输出立场与置信度，按波动状态加权融合；
   分歧分数超阈值时路由到更强叙事模型并记入 trace。
 - **叙事校验器**（`narrative_critic.py`）：LLM 改写后的每个数字必须能在证据包内落地，
   否则回退确定性草稿并打 `narrative_critic_reverted` 降级标记。
 - **校准闭环**（`outcome_tracker.py`）：到期分析自动回填实际走势、计算命中率与 Brier 分数，
   以硬上限反哺委员会置信度，并通过 `/api/v1/agent/calibration` 公开。
+- **性能治理**（`model_governance.py`）：当系统方向判断命中率跌破阈值时，自动降级为保守姿态
+  （下调置信度、打 `model_demoted_by_performance` 标记），规则策略始终是冠军兜底。
+
+### 生产运维
+
+- **定时数据刷新**：`python3 scripts/refresh_data.py` 重建扩展数据集并预热研究上下文；
+  设 `DATA_REFRESH_ENABLED=1` 后单容器 public stack 会内嵌每日刷新线程（`DATA_REFRESH_INTERVAL_SECONDS`）。
+  抓取失败时保留最近可用 CSV，不阻塞部署。
+- **运维指标**：内部端点 `GET /metrics`（需 internal key）返回 per-route 时延/错误率/p95、
+  状态码分布与降级/治理计数器，无外部 APM 依赖。
+- **评测护栏**：`python3 -m eval.run_eval` 用 golden-set + 确定性 judge（忠实度/风险提示/失效条件为硬门）
+  给分析结果打分，任一用例不达标即非零退出；`tests/test_eval_harness.py` 已并入 CI。
+  `--live <BASE_URL>` 可对运行中的网关跑同一套评测。
 
 ## 模型与回退行为
 

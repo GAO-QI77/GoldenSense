@@ -123,27 +123,31 @@ class GaussianHMM:
 
         prev_ll = -np.inf
         n_iter = 0
-        for n_iter in range(1, self.max_iter + 1):
-            log_b = np.column_stack(
-                [_log_gaussian(X, means[k], variances[k]) for k in range(self.n_states)]
-            )
-            gamma, xi_sum, ll = self._forward_backward(log_b, transition, initial)
-
-            weights = gamma.sum(axis=0)  # (K,)
-            means = (gamma.T @ X) / np.maximum(weights[:, None], 1e-10)
-            for k in range(self.n_states):
-                diff2 = (X - means[k]) ** 2
-                variances[k] = np.maximum(
-                    (gamma[:, k][:, None] * diff2).sum(axis=0) / max(weights[k], 1e-10),
-                    1e-8,
+        # Degenerate EM steps (a state's weight collapsing on short/synthetic
+        # data) can transiently over/underflow; the np.maximum guards keep the
+        # result valid, so suppress the benign numpy warnings for clean logs.
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            for n_iter in range(1, self.max_iter + 1):
+                log_b = np.column_stack(
+                    [_log_gaussian(X, means[k], variances[k]) for k in range(self.n_states)]
                 )
-            transition = xi_sum / np.maximum(xi_sum.sum(axis=1, keepdims=True), 1e-10)
-            initial = gamma[0] / max(gamma[0].sum(), 1e-10)
+                gamma, xi_sum, ll = self._forward_backward(log_b, transition, initial)
 
-            if abs(ll - prev_ll) < self.tol * max(abs(prev_ll), 1.0):
+                weights = gamma.sum(axis=0)  # (K,)
+                means = (gamma.T @ X) / np.maximum(weights[:, None], 1e-10)
+                for k in range(self.n_states):
+                    diff2 = (X - means[k]) ** 2
+                    variances[k] = np.maximum(
+                        (gamma[:, k][:, None] * diff2).sum(axis=0) / max(weights[k], 1e-10),
+                        1e-8,
+                    )
+                transition = xi_sum / np.maximum(xi_sum.sum(axis=1, keepdims=True), 1e-10)
+                initial = gamma[0] / max(gamma[0].sum(), 1e-10)
+
+                if abs(ll - prev_ll) < self.tol * max(abs(prev_ll), 1.0):
+                    prev_ll = ll
+                    break
                 prev_ll = ll
-                break
-            prev_ll = ll
 
         # Relabel states by ascending volatility (last feature dimension).
         order = np.argsort(means[:, -1])

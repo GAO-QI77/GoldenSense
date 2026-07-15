@@ -74,9 +74,16 @@ def test_calibration_endpoint_contract(client):
     assert resp.status_code == 200
     payload = resp.json()
     for key in ("total_scored", "directional_calls", "neutral_or_gated",
-                "weight_adjustment", "recent_outcomes"):
+                "weight_adjustment", "recent_outcomes", "governance"):
         assert key in payload
     assert payload["weight_adjustment"]["fused_confidence_multiplier"] >= 0.8
+    gov = payload["governance"]
+    assert gov["mode"] in {"champion", "watch", "demoted", "insufficient_data"}
+    assert isinstance(gov["demoted"], bool)
+    # demoted is only true in the demoted mode (env may or may not have matured
+    # rows in a shared trace DB, so don't assert a specific mode here).
+    assert gov["demoted"] == (gov["mode"] == "demoted")
+    assert 0.8 <= gov["confidence_multiplier"] <= 1.2
 
 
 def test_analyze_response_trace_contains_committee():
@@ -120,3 +127,14 @@ def _assert_committee_in_trace(client):
     assert -1.0 <= committee["fused_stance"] <= 1.0
     assert 0.0 <= committee["disagreement"] <= 1.0
     assert "regime" in bundle
+
+    # Governance overlay must be recorded in the tool trace (champion on a
+    # fresh store -> no demotion flag).
+    tool_trace = trace.json()["tool_trace"]
+    gov_entries = [t for t in tool_trace if t.get("tool") == "model_governance"]
+    assert gov_entries, "model_governance trace entry missing"
+    verdict = gov_entries[0]["verdict"]
+    assert verdict["mode"] in {"champion", "watch", "demoted", "insufficient_data"}
+    # The demotion flag must appear in degradation_flags iff governance demoted.
+    flags = trace.json()["response_payload"]["degradation_flags"]
+    assert ("model_demoted_by_performance" in flags) == verdict["demoted"]

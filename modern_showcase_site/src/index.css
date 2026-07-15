@@ -2573,3 +2573,61 @@ select {
   flex-shrink: 0;
   margin-top: 2px;
 }
+
+/* ------------------------- governance badge ----------------------------- */
+.governance-badge {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 14px;
+  padding: 11px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(236, 211, 154, 0.2);
+  background: rgba(0, 0, 0, 0.2);
+}
+
+.governance-badge .governance-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--gold-soft);
+}
+
+.governance-badge.ok .governance-dot { background: #6fbf9a; }
+.governance-badge.warn .governance-dot { background: #e0b970; }
+.governance-badge.bad .governance-dot { background: #e0917d; }
+.governance-badge.muted .governance-dot { background: rgba(245, 240, 230, 0.4); }
+
+.governance-badge.bad {
+  border-color: rgba(165, 72, 54, 0.5);
+  background: rgba(165, 72, 54, 0.1);
+}
+
+.governance-badge div {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.governance-badge strong {
+  font-size: 0.86rem;
+}
+
+.governance-badge small {
+  color: rgba(245, 240, 230, 0.6);
+  font-size: 0.76rem;
+  line-height: 1.5;
+}
+
+.governance-flag {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(165, 72, 54, 0.55);
+  color: #e0917d;
+  font-size: 0.72rem;
+  white-space: nowrap;
+}

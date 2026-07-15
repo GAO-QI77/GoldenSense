@@ -55,13 +55,34 @@ C) 可搜索、美观、金色科技感的前端产品（modern_showcase_site �
 - .claude/launch.json 新增 gateway/web 启动配置
 
 ### Phase 9: A 档上线阻断修复
-- Status: in_progress
-- Goal: 修三个硬阻断，让改进在生产真实生效且不误导
+- Status: complete（提交步骤因分类器临时不可用，末尾重试）
 - Steps:
-  - [ ] 阻断1: 扩展 CSV 进生产（提交 + data_cache/ 入 gitignore + Docker 构建期可再生）
-  - [ ] 阻断2: research_context 暴露 data_asof/age/stale；/quant 加真实陈旧横幅
-  - [ ] 阻断3: fair_value 增加偏离 z 分与"结构性偏离期"框定，前端改措辞
-  - [ ] 验证: pytest 全绿 + 前端 build + 浏览器实测陈旧横幅与公允价值措辞
+  - [x] 阻断1: data_cache/ 入 gitignore；扩展 CSV 暂存入提交；research_context
+        检测扩展数据缺失时打 extended_dataset 降级标记
+  - [x] 阻断2: research_context 暴露 data_asof/data_age_days/data_stale/is_realtime；
+        QuantPage DataFreshnessBanner（实测"截至 2026-07-14 · 1 天前收盘 · 非实时行情"）
+  - [x] 阻断3: fair_value 增 deviation_z/band_std_pct/regime_break/interpretation；
+        前端按 z 分显示"结构性偏离期"或"正常估值波动"（实测 +60.1% → 1.5σ → 正常带内）
+  - [x] 验证: pytest 170 passed（+4 新测试）；前端 build 通过；浏览器实测横幅+公允价值+无控制台错误
+
+### Phase 10: B 档 — 真实产品上线（自动推进）
+- Status: complete（代码项 B1-B4）
+- 已落地（代码 + 测试）:
+  - [x] B1 定时数据刷新: scripts/refresh_data.py（cron 入口 + 内嵌调度线程，
+        DATA_REFRESH_ENABLED），public_stack 接入；失败保留 last-good CSV。5 tests
+  - [x] B2 模型自动降级: model_governance.py（命中率<45%→demote 保守化，
+        <50%→观察期，有界置信度），gateway TTL 缓存 + summary_card 覆盖 +
+        model_demoted_by_performance 标记 + /calibration 暴露 governance。8+2 tests
+  - [x] B3 端点监控: service_metrics.py（per-route 时延/错误率/p95 + 域计数器）
+        + record_metrics 中间件 + 内部 /metrics 端点。4 tests
+  - [x] B4 LLM 评测护栏: eval/（golden_set.jsonl + judges 确定性 + run_eval CLI +
+        stub toolbox），tests/test_eval_harness.py 进 CI。硬门: 忠实度/风险/失效条件。8 tests
+  - [x] 硬化收尾: HMM/公允价值数值路径 np.errstate 抑制退化告警（日志洁净）
+  - [x] 前端: 校准面板 GovernanceBadge（冠军/观察/降级/样本不足）
+- 结果: pytest 195 passed；前端 build 通过；/quant 治理徽章浏览器实测正常
+- 需你决策（非代码，无法自动完成）:
+  - [ ] B5 数据源 SLA: 是否签付费黄金现货/新闻 API（成本 vs 实时性）
+  - [ ] B6 法务/合规审查: "公允价值/配置区间"措辞的监管边界确认
 
 ## Errors Encountered
 | Error | Attempt | Resolution |

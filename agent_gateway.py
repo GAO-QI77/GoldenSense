@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import time
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
@@ -34,6 +35,11 @@ from service_contracts import (
     RecentNewsResponse,
 )
 from analyst_committee import build_committee
+from model_governance import (
+    GovernanceVerdict,
+    apply_confidence_derate,
+    evaluate_governance,
+)
 from narrative_critic import verify_narrative
 from outcome_tracker import (
     backfill_outcomes,
@@ -42,6 +48,7 @@ from outcome_tracker import (
 )
 from regime_strategy import evaluate_regime, evaluate_regime_v2
 from research_context import shared_context as quant_research_context
+from service_metrics import MetricsRegistry
 
 try:
     from openai import AsyncOpenAI
@@ -1694,6 +1701,57 @@ class AgentAnalysisService:
         self._sentiment_scorer = sentiment_scorer
         self._trace_store = trace_store
         self._cfg = cfg
+        # Champion-challenger governance verdict, TTL-cached so the analyze
+        # path never pays the trace-scan + backfill cost per request.
+        self._governance: Optional[GovernanceVerdict] = None
+        self._governance_at: float = 0.0
+        self._governance_ttl = float(_env("AGENT_GOVERNANCE_TTL_SECONDS", "900"))
+        # Optional metrics registry; set by create_app after construction.
+        self.metrics: Optional[MetricsRegistry] = None
+
+    async def compute_calibration_summary(self, *, limit: int = 500) -> Dict[str, Any]:
+        """Backfill matured analyses and score them. Shared by /calibration
+        and the governance cache so both read one source of truth."""
+        rows = await self._trace_store.load_recent_analyses(limit=limit)
+
+        def _score() -> Dict[str, Any]:
+            from data_sources import load_market_data
+
+            raw, source = load_market_data()
+            outcomes = backfill_outcomes(rows, raw["Gold"])
+            summary = calibration_summary(outcomes)
+            summary["price_data_source"] = source
+            summary["weight_adjustment"] = committee_weight_adjustments(summary)
+            summary["recent_outcomes"] = [
+                {
+                    "analysis_id": o["analysis_id"],
+                    "created_at": o["created_at"].isoformat(),
+                    "horizon": o["horizon"],
+                    "stance": o["stance"],
+                    "confidence_band": o["confidence_band"],
+                    "realized_return": o["realized_return"],
+                    "hit": o.get("hit"),
+                }
+                for o in outcomes[-30:]
+            ]
+            return summary
+
+        return await asyncio.to_thread(_score)
+
+    async def governance_verdict(self) -> GovernanceVerdict:
+        """TTL-cached performance-governance verdict. Fails safe to champion."""
+        now = datetime.now(timezone.utc).timestamp()
+        if self._governance is not None and (now - self._governance_at) < self._governance_ttl:
+            return self._governance
+        try:
+            summary = await self.compute_calibration_summary()
+            verdict = evaluate_governance(summary)
+        except Exception as exc:  # never let governance break analyze
+            LOGGER.warning("governance_eval_failed error=%s", f"{type(exc).__name__}:{exc}")
+            verdict = evaluate_governance({"hit_rate": None, "directional_calls": 0})
+        self._governance = verdict
+        self._governance_at = now
+        return verdict
 
     async def analyze(self, req: AgentAnalyzeRequest) -> AgentAnalyzeResponse:
         return (await self.analyze_internal(req)).response
@@ -1893,6 +1951,37 @@ class AgentAnalysisService:
                     "message": "Agent response must include evidence cards.",
                 },
             )
+
+        # Champion-challenger governance overlay: if the system's realized
+        # hit rate has decayed, demote to a more conservative published stance
+        # (de-rate the confidence band, flag it) without touching the core
+        # regime logic. Fails safe to champion.
+        governance = await self.governance_verdict()
+        if governance.force_conservative:
+            derated = apply_confidence_derate(
+                narrative.summary_card.confidence_band, governance
+            )
+            if derated != narrative.summary_card.confidence_band:
+                narrative = NarrativeOutput(
+                    summary_card=narrative.summary_card.model_copy(
+                        update={"confidence_band": derated}
+                    ),
+                    risk_banner=narrative.risk_banner,
+                    follow_up_questions=narrative.follow_up_questions,
+                )
+            if "model_demoted_by_performance" not in degradation_flags:
+                degradation_flags.append("model_demoted_by_performance")
+        tool_trace = [
+            *tool_trace,
+            {"tool": "model_governance", "status": governance.mode, "verdict": governance.as_dict()},
+        ]
+
+        if self.metrics is not None:
+            self.metrics.incr("analyze_total")
+            for flag in degradation_flags:
+                self.metrics.incr(f"degradation:{flag}")
+            if governance.demoted:
+                self.metrics.incr("governance_demoted")
 
         elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
         analysis_id = str(uuid.uuid4())
@@ -3082,11 +3171,15 @@ def create_app(
             trace_store=app.state.trace_store,
             cfg=cfg,
         )
+        app.state.analysis_service.metrics = app.state.metrics
         yield
         if own_http:
             await http.aclose()
 
     app = FastAPI(title="GoldenSense Agent Gateway", version="2.0.0", lifespan=lifespan)
+    # Metrics registry is created eagerly (not in lifespan) so the recording
+    # middleware always has it, even for requests during startup.
+    app.state.metrics = MetricsRegistry()
     allow_origins = [
         origin.strip()
         for origin in _env(
@@ -3115,6 +3208,31 @@ def create_app(
                     headers=exc.headers,
                 )
         return await call_next(request)
+
+    @app.middleware("http")
+    async def record_metrics(request: Request, call_next: Any) -> Response:
+        started = time.perf_counter()
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            # Group by route template, not raw path, so /traces/{id} does not
+            # explode the cardinality of the metrics registry.
+            route = request.scope.get("route")
+            label = getattr(route, "path", None) or request.url.path
+            app.state.metrics.record_request(
+                label, status_code=status_code, elapsed_ms=elapsed_ms
+            )
+
+    @app.get("/metrics")
+    async def metrics(request: Request) -> JSONResponse:
+        """Read-only in-process ops metrics (per-route latency/error rate,
+        status classes, degradation/governance counters). Internal only."""
+        app.state.authorizer.authorize(request, internal_only=True)
+        return JSONResponse(content=app.state.metrics.snapshot())
 
     @app.get("/health")
     async def health() -> Dict[str, Any]:
@@ -3223,9 +3341,9 @@ def create_app(
         adjustment derived from them."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
         await app.state.rate_limiter.check(auth_ctx["client_id"])
-        store: AgentTraceStore = app.state.trace_store
+        service: AgentAnalysisService = app.state.analysis_service
         try:
-            rows = await store.load_recent_analyses(limit=500)
+            payload = await service.compute_calibration_summary()
         except TraceStoreUnavailableError as exc:
             raise HTTPException(
                 status_code=503,
@@ -3234,31 +3352,6 @@ def create_app(
                     "message": f"Analysis trace store unavailable: {exc}",
                 },
             ) from exc
-
-        def _score() -> Dict[str, Any]:
-            from data_sources import load_market_data
-
-            raw, source = load_market_data()
-            outcomes = backfill_outcomes(rows, raw["Gold"])
-            summary = calibration_summary(outcomes)
-            summary["price_data_source"] = source
-            summary["weight_adjustment"] = committee_weight_adjustments(summary)
-            summary["recent_outcomes"] = [
-                {
-                    "analysis_id": o["analysis_id"],
-                    "created_at": o["created_at"].isoformat(),
-                    "horizon": o["horizon"],
-                    "stance": o["stance"],
-                    "confidence_band": o["confidence_band"],
-                    "realized_return": o["realized_return"],
-                    "hit": o.get("hit"),
-                }
-                for o in outcomes[-30:]
-            ]
-            return summary
-
-        try:
-            payload = await asyncio.to_thread(_score)
         except Exception as exc:
             raise HTTPException(
                 status_code=503,
@@ -3267,6 +3360,8 @@ def create_app(
                     "message": f"{type(exc).__name__}: {exc}",
                 },
             ) from exc
+        # Expose the performance-governance verdict derived from these outcomes.
+        payload["governance"] = evaluate_governance(payload).as_dict()
         return JSONResponse(content=jsonable_encoder(payload))
 
     @app.post("/api/v1/agent/feedback", response_model=AgentFeedbackResponse)

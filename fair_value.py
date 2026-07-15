@@ -135,9 +135,12 @@ def fit_fair_value(
     real = frame["Real_10Y"].values
     log_usd = np.log(frame["USD_Index"].values)
 
-    X = np.column_stack([np.ones(len(frame)), real, log_usd])
-    coef = _ols(X, log_gold)
-    fitted = X @ coef
+    # Guard the linear-algebra path: on pathological synthetic inputs lstsq
+    # can transiently over/underflow; results are validated downstream.
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        X = np.column_stack([np.ones(len(frame)), real, log_usd])
+        coef = _ols(X, log_gold)
+        fitted = X @ coef
     resid = log_gold - fitted
 
     ss_res = float(((log_gold - fitted) ** 2).sum())

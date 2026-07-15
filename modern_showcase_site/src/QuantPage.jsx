@@ -165,6 +165,27 @@ export default function QuantPage() {
   );
 }
 
+const GOVERNANCE_META = {
+  champion: { label: '冠军姿态', tone: 'ok' },
+  watch: { label: '观察期', tone: 'warn' },
+  demoted: { label: '性能降级', tone: 'bad' },
+  insufficient_data: { label: '样本不足', tone: 'muted' },
+};
+
+function GovernanceBadge({ governance }) {
+  const meta = GOVERNANCE_META[governance.mode] || GOVERNANCE_META.insufficient_data;
+  return (
+    <div className={`governance-badge ${meta.tone}`} role="status">
+      <span className="governance-dot" />
+      <div>
+        <strong>模型治理：{meta.label}</strong>
+        <small>{governance.reason}</small>
+      </div>
+      {governance.demoted && <span className="governance-flag">已收敛为保守姿态</span>}
+    </div>
+  );
+}
+
 function DataFreshnessBanner({ research }) {
   const asof = research.data_asof;
   const ageDays = research.data_age_days;
@@ -623,6 +644,7 @@ function CalibrationPanel({ calibration }) {
           尚无足够的已到期历史判断可供评分。每次分析都会入库，24h / 7d / 30d 到期后自动回填实际金价走势并计分。
         </p>
       )}
+      {calibration?.governance && <GovernanceBadge governance={calibration.governance} />}
       {hasData && (
         <>
           <div className="calib-tiles">
