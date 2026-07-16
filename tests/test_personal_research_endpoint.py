@@ -119,3 +119,47 @@ def test_directive_language_reverts_to_draft():
         ).json()
         assert "directive_language_reverted" in payload["degradation_flags"]
         assert "建议买入" not in payload["narrative"]["position_analysis"]
+
+
+class _ExplodingNarrator(_DraftEchoNarrator):
+    """Fails the test if the endpoint calls the LLM in draft mode."""
+
+    async def narrate_personal(self, facts, profile, draft):
+        raise AssertionError("narrate_personal must not be called in draft mode")
+
+
+def test_draft_mode_skips_llm_and_returns_fast():
+    with _client(_ExplodingNarrator()) as client:
+        resp = client.post(
+            "/api/v1/agent/personal-research?mode=draft",
+            headers=PUBLIC_HEADERS,
+            json=VALID_BODY,
+        )
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["mode"] == "draft"
+        assert payload["generated_by"] == "deterministic_draft"
+        assert payload["narrative"]["disclaimer"]
+        assert payload["facts"]["reference_range"]
+
+
+def test_full_mode_is_default_and_unchanged():
+    with _client(_DraftEchoNarrator()) as client:
+        payload = client.post(
+            "/api/v1/agent/personal-research",
+            headers=PUBLIC_HEADERS,
+            json=VALID_BODY,
+        ).json()
+        assert payload["mode"] == "full"
+
+
+def test_advanced_profile_accepted_by_endpoint():
+    body = {**VALID_BODY, "max_drawdown_pct": 1.0, "leverage_attitude": "high"}
+    with _client(_DraftEchoNarrator()) as client:
+        payload = client.post(
+            "/api/v1/agent/personal-research?mode=draft",
+            headers=PUBLIC_HEADERS,
+            json=body,
+        ).json()
+        flags = {f["flag"] for f in payload["facts"]["risk_flags"]}
+        assert "leverage_out_of_scope" in flags

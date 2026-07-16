@@ -3531,7 +3531,9 @@ def create_app(
 
     @app.post("/api/v1/agent/personal-research")
     async def personal_research(
-        profile: PersonalResearchProfile, request: Request
+        profile: PersonalResearchProfile,
+        request: Request,
+        mode: Literal["draft", "full"] = "full",
     ) -> JSONResponse:
         """Personalized research analysis: deterministic rule-engine facts
         (reference range / position gap / risk flags / horizon evidence) plus
@@ -3553,7 +3555,13 @@ def create_app(
 
         facts = build_personal_facts(profile, ctx)
         draft = draft_personal_narrative(facts, profile)
-        narrative = await app.state.narrator.narrate_personal(facts, profile, draft)
+        # Draft mode powers the two-phase frontend UX: all numbers render in
+        # under a second, then a second full-mode call swaps in the polished
+        # narrative. The draft is grounded by construction, so no gates run.
+        if mode == "draft":
+            narrative = draft
+        else:
+            narrative = await app.state.narrator.narrate_personal(facts, profile, draft)
 
         degradation_flags: List[str] = []
         generated_by = "llm"
@@ -3587,12 +3595,13 @@ def create_app(
         return JSONResponse(
             content=jsonable_encoder(
                 {
-                    "profile_echo": profile.model_dump(),
+                    "profile_echo": profile.model_dump(exclude_none=True),
                     "facts": facts,
                     "narrative": narrative.model_dump(),
                     "degradation_flags": degradation_flags,
                     "generated_by": generated_by,
                     "critic_report": critic_report,
+                    "mode": mode,
                 }
             )
         )
