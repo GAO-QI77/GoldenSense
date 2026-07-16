@@ -18,6 +18,12 @@ from typing import Any, Deque, Dict, List, Literal, Optional, Sequence, Tuple, T
 import httpx
 import psycopg
 from fastapi import FastAPI, HTTPException, Request, Response
+
+# Load repo-root .env (DEEPSEEK_API_KEY etc.) before any config is read.
+# Real environment variables always win; missing file is a no-op.
+from env_loader import load_env_file
+
+load_env_file()
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse

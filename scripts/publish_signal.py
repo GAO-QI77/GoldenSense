@@ -21,7 +21,10 @@ from typing import Any, Dict, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from env_loader import load_env_file  # noqa: E402
 from signal_ledger import JsonlLedgerStore, LedgerStore, publish_weekly  # noqa: E402
+
+load_env_file()
 
 LOGGER = logging.getLogger("publish_signal")
 
