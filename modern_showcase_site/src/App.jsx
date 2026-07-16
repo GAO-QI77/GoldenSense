@@ -32,9 +32,12 @@ import {
 } from 'lucide-react';
 
 import AdvisorPage from './AdvisorPage';
+import EventAlertBanner from './EventAlertBanner';
 import GlobalSearch from './GlobalSearch';
 import QuantPage from './QuantPage';
 import SignalsPage from './SignalsPage';
+import { AdvancedProfileFields, CoreProfileFields } from './profileFields';
+import { loadProfile, saveProfile, toLegacyAnalyzeProfile } from './profileStore';
 import { addSearchEntries } from './searchIndex';
 
 const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
@@ -53,12 +56,6 @@ const horizonShortLabels = {
   '24h': 'T+1',
   '7d': 'T+7',
   '30d': 'T+30',
-};
-
-const riskLabels = {
-  conservative: '保守型',
-  balanced: '平衡型',
-  aggressive: '进取型',
 };
 
 const stanceClass = {
@@ -87,62 +84,6 @@ const positionLabels = {
   long: '已有多头',
   short: '已有空头',
   hedged: '已对冲',
-};
-
-const baseCapital = 100000;
-
-const investorDefaults = {
-  risk_capacity: 'medium',
-  trading_horizon: 'short',
-  experience_level: 'intermediate',
-  capital_allocation_pct: 10,
-  max_drawdown_pct: 8,
-  current_position: 'none',
-  liquidity_need: 'medium',
-  leverage_attitude: 'none',
-  investment_goal: 'event_trade',
-};
-
-const selectMeta = {
-  risk_capacity: [
-    ['low', '低'],
-    ['medium', '中'],
-    ['high', '高'],
-  ],
-  trading_horizon: [
-    ['short', '短线'],
-    ['medium', '中线'],
-    ['long', '长线'],
-  ],
-  experience_level: [
-    ['beginner', '新手'],
-    ['intermediate', '有经验'],
-    ['advanced', '成熟交易者'],
-  ],
-  current_position: [
-    ['none', '无持仓'],
-    ['long', '已有多头'],
-    ['short', '已有空头'],
-    ['hedged', '已对冲'],
-  ],
-  liquidity_need: [
-    ['low', '低'],
-    ['medium', '中'],
-    ['high', '高'],
-  ],
-  leverage_attitude: [
-    ['none', '不用杠杆'],
-    ['low', '低杠杆'],
-    ['medium', '中等杠杆'],
-    ['high', '高杠杆'],
-  ],
-  investment_goal: [
-    ['capital_preservation', '本金保护'],
-    ['income', '稳健增值'],
-    ['event_trade', '事件交易'],
-    ['trend_following', '趋势跟随'],
-    ['speculation', '投机博弈'],
-  ],
 };
 
 const starterPrompts = [
@@ -277,6 +218,7 @@ function AppShell({ children }) {
           </div>
         </div>
       </header>
+      <EventAlertBanner />
       {children}
     </div>
   );
@@ -461,14 +403,27 @@ function DashboardPage() {
 
 function AgentPage() {
   const [question, setQuestion] = useState(starterPrompts[0]);
-  const [riskProfile, setRiskProfile] = useState('balanced');
   const [horizon, setHorizon] = useState('24h');
-  const [investorProfile, setInvestorProfile] = useState(investorDefaults);
+  // Unified profile, shared with /advisor via the same localStorage store.
+  const [profile, setProfile] = useState(loadProfile);
   const [analysis, setAnalysis] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [feedbackStatus, setFeedbackStatus] = useState('');
   const resultRef = useRef(null);
+
+  useEffect(() => {
+    saveProfile(profile);
+  }, [profile]);
+
+  // /analyze still speaks the legacy 9-field questionnaire contract; the
+  // unified profile is mapped through an adapter so the backend is untouched.
+  const investorProfile = useMemo(() => toLegacyAnalyzeProfile(profile), [profile]);
+  const riskProfile = profile.risk_tolerance;
+
+  function updateProfile(key, value) {
+    setProfile((current) => ({ ...current, [key]: value }));
+  }
 
   const summary = analysis?.summary_card;
   const riskBanner = analysis?.risk_banner;
@@ -503,13 +458,6 @@ function AgentPage() {
     () => buildExecutionScenarios({ summary, selectedForecast, riskBudget, investorProfile }),
     [summary, selectedForecast, riskBudget, investorProfile],
   );
-
-  function updateInvestorProfile(key, value) {
-    setInvestorProfile((current) => ({
-      ...current,
-      [key]: ['capital_allocation_pct', 'max_drawdown_pct'].includes(key) ? Number(value) : value,
-    }));
-  }
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -601,16 +549,6 @@ function AgentPage() {
 
           <div className="control-pair">
             <SegmentedControl
-              label="风险承受能力"
-              value={riskProfile}
-              options={[
-                ['conservative', riskLabels.conservative],
-                ['balanced', riskLabels.balanced],
-                ['aggressive', riskLabels.aggressive],
-              ]}
-              onChange={setRiskProfile}
-            />
-            <SegmentedControl
               label="分析周期"
               value={horizon}
               options={Object.entries(horizonLabels)}
@@ -618,68 +556,15 @@ function AgentPage() {
             />
           </div>
 
-          <PanelTitle icon={WalletCards} title="完整风险问卷" subtitle="用于限制建议强度，不改变市场预测基线" />
+          <PanelTitle
+            icon={WalletCards}
+            title="投资者画像"
+            subtitle="与「个性化研究」页共享同一份画像 · 用于限制输出强度，不改变市场预测基线"
+          />
 
-          <div className="questionnaire-grid">
-            <SelectField
-              label="风险容量"
-              value={investorProfile.risk_capacity}
-              options={selectMeta.risk_capacity}
-              onChange={(value) => updateInvestorProfile('risk_capacity', value)}
-            />
-            <SelectField
-              label="交易周期"
-              value={investorProfile.trading_horizon}
-              options={selectMeta.trading_horizon}
-              onChange={(value) => updateInvestorProfile('trading_horizon', value)}
-            />
-            <SelectField
-              label="经验水平"
-              value={investorProfile.experience_level}
-              options={selectMeta.experience_level}
-              onChange={(value) => updateInvestorProfile('experience_level', value)}
-            />
-            <SelectField
-              label="已有持仓"
-              value={investorProfile.current_position}
-              options={selectMeta.current_position}
-              onChange={(value) => updateInvestorProfile('current_position', value)}
-            />
-            <NumberField
-              label="资金占比"
-              suffix="%"
-              value={investorProfile.capital_allocation_pct}
-              min="0"
-              max="100"
-              onChange={(value) => updateInvestorProfile('capital_allocation_pct', value)}
-            />
-            <NumberField
-              label="最大回撤"
-              suffix="%"
-              value={investorProfile.max_drawdown_pct}
-              min="0"
-              max="100"
-              onChange={(value) => updateInvestorProfile('max_drawdown_pct', value)}
-            />
-            <SelectField
-              label="流动性需求"
-              value={investorProfile.liquidity_need}
-              options={selectMeta.liquidity_need}
-              onChange={(value) => updateInvestorProfile('liquidity_need', value)}
-            />
-            <SelectField
-              label="杠杆态度"
-              value={investorProfile.leverage_attitude}
-              options={selectMeta.leverage_attitude}
-              onChange={(value) => updateInvestorProfile('leverage_attitude', value)}
-            />
-            <SelectField
-              label="投资目标"
-              value={investorProfile.investment_goal}
-              options={selectMeta.investment_goal}
-              onChange={(value) => updateInvestorProfile('investment_goal', value)}
-            />
-          </div>
+          <CoreProfileFields profile={profile} onChange={updateProfile} />
+          <AdvancedProfileFields profile={profile} onChange={updateProfile} defaultOpen />
+
 
           <RiskBudgetPanel budget={riskBudget} profile={investorProfile} />
           <SuitabilityGatePanel gate={suitabilityGate} />
@@ -1035,11 +920,11 @@ function GoldTrendPanel({ history, loading }) {
 function RiskBudgetPanel({ budget, profile }) {
   return (
     <section className={`risk-budget-panel level-${budget.level}`}>
-      <PanelTitle icon={Calculator} title="风险预算计算器" subtitle="以 10 万资金估算本轮风险容量" />
+      <PanelTitle icon={Calculator} title="风险预算画像" subtitle="全部以组合占比表达，不假设资金规模" />
       <div className="budget-grid">
-        <MetricLine label="计划黄金暴露" value={formatCurrency(budget.plannedExposure)} />
-        <MetricLine label="最大可承受亏损" value={formatCurrency(budget.maxLoss)} />
-        <MetricLine label="建议暴露上限" value={formatCurrency(budget.suggestedExposure)} />
+        <MetricLine label="当前黄金暴露" value={formatPctPlain(budget.plannedExposurePct)} />
+        <MetricLine label="声明回撤承受力" value={formatPctPlain(budget.maxLossPct)} />
+        <MetricLine label="研究参考暴露上限" value={formatPctPlain(budget.suggestedExposurePct)} />
         <MetricLine label="持仓模式" value={positionLabels[profile.current_position]} />
       </div>
       <p>{budget.guidance}</p>
@@ -1427,39 +1312,6 @@ function SegmentedControl({ label, value, options, onChange }) {
   );
 }
 
-function SelectField({ label, value, options, onChange }) {
-  return (
-    <label className="field compact-field">
-      <span>{label}</span>
-      <select value={value} onChange={(event) => onChange(event.target.value)}>
-        {options.map(([optionValue, optionLabel]) => (
-          <option key={optionValue} value={optionValue}>
-            {optionLabel}
-          </option>
-        ))}
-      </select>
-    </label>
-  );
-}
-
-function NumberField({ label, suffix, value, min, max, onChange }) {
-  return (
-    <label className="field compact-field">
-      <span>{label}</span>
-      <div className="number-input">
-        <input
-          type="number"
-          min={min}
-          max={max}
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
-        />
-        <small>{suffix}</small>
-      </div>
-    </label>
-  );
-}
-
 function SummaryList({ title, items }) {
   return (
     <div className="summary-list">
@@ -1565,35 +1417,35 @@ function buildDashboardInsights({ market, forecasts, groups, news, dataQuality, 
 }
 
 function buildRiskBudget(profile, profileScore) {
+  // All figures are % of the user's portfolio: the product never assumes a
+  // capital amount, and never phrases exposure as advice.
   const allocation = Number(profile.capital_allocation_pct || 0);
   const maxDrawdown = Number(profile.max_drawdown_pct || 0);
-  const plannedExposure = baseCapital * allocation / 100;
-  const maxLoss = baseCapital * maxDrawdown / 100;
   const leverageHaircut = { none: 1, low: 0.75, medium: 0.5, high: 0.25 }[profile.leverage_attitude] || 1;
   const scoreHaircut = profileScore >= 5 ? 0.35 : profileScore >= 2 ? 0.65 : 1;
   const liquidityHaircut = profile.liquidity_need === 'high' ? 0.6 : profile.liquidity_need === 'medium' ? 0.85 : 1;
-  const suggestedExposure = plannedExposure * leverageHaircut * scoreHaircut * liquidityHaircut;
+  const suggestedExposurePct = allocation * leverageHaircut * scoreHaircut * liquidityHaircut;
   const level = profileScore >= 5 ? 'high' : profileScore >= 2 ? 'medium' : 'low';
   const positionGuidance = {
-    none: '无持仓时先看触发条件，不用一次性把风险预算打满。',
-    long: '已有多头时先管理现有仓位，新增暴露必须等待确认信号。',
-    short: '已有空头时优先检查偏多失效条件，避免与基线方向硬扛。',
-    hedged: '已对冲时重点观察对冲是否过度，不急于拆腿。',
+    none: '无持仓时先看触发条件，研究口径不覆盖一次性打满风险预算的路径。',
+    long: '已有多头时先关注存量仓位与失效条件，新增暴露的研究前提是确认信号出现。',
+    short: '已有空头时优先检查偏多失效条件，留意与基线方向的冲突。',
+    hedged: '已对冲时重点观察对冲是否过度，研究口径不含急拆对冲腿的情形。',
   }[profile.current_position];
   const rules = [
-    allocation >= 50 ? '禁止重仓追价' : '分批进入',
+    allocation >= 50 ? '重仓追价超出研究口径' : '分批进入',
     maxDrawdown <= 5 ? '回撤触线即停止' : '按失效条件复盘',
-    profile.leverage_attitude === 'high' ? '不建议使用高杠杆' : '不放大杠杆',
+    profile.leverage_attitude === 'high' ? '高杠杆超出研究口径' : '不放大杠杆',
   ];
   const guidance = level === 'high'
-    ? '问卷风险偏高，建议把实际暴露压到计划值的一小部分，优先等待确认。'
+    ? '画像风险偏高：研究参考口径下，实际暴露显著低于计划值、并等待确认信号，是与该画像一致的路径。'
     : level === 'medium'
-      ? '风险预算可以使用，但需要分批和明确失效条件。'
-      : '问卷风险较低，可以把重点放在触发条件和复盘纪律。';
+      ? '风险预算可用的研究前提：分批、且每一步有明确失效条件。'
+      : '画像风险较低：重点可放在触发条件与复盘纪律上。';
   return {
-    plannedExposure,
-    maxLoss,
-    suggestedExposure,
+    plannedExposurePct: allocation,
+    maxLossPct: maxDrawdown,
+    suggestedExposurePct,
     level,
     guidance,
     positionGuidance,
@@ -1622,11 +1474,12 @@ function buildSuitabilityGate(profile, profileScore, riskBudget) {
   const level = forceObservation ? 'high' : profileScore >= 3 ? 'medium' : 'low';
   const decision = forceObservation ? '强制观望' : level === 'medium' ? '降低暴露' : '可继续分析';
   const subtitle = level === 'high' ? '高风险门控' : level === 'medium' ? '中风险限制' : '低风险预检';
+  const exposureText = formatPctPlain(riskBudget.suggestedExposurePct);
   const summary = forceObservation
-    ? `当前问卷组合超过执行边界，Agent 只能输出观察、失效条件和复盘线索，建议暴露上限 ${formatCurrency(riskBudget.suggestedExposure)}。`
+    ? `当前画像组合超过执行边界，Agent 只能输出观察、失效条件和复盘线索，研究参考暴露上限 ${exposureText}（组合占比）。`
     : level === 'medium'
-      ? `当前风险预算需要折扣使用，建议暴露上限 ${formatCurrency(riskBudget.suggestedExposure)}，不得放大仓位。`
-      : `当前画像未触发强门控，但仍需等待证据确认，建议暴露上限 ${formatCurrency(riskBudget.suggestedExposure)}。`;
+      ? `当前风险预算需要折扣使用，研究参考暴露上限 ${exposureText}（组合占比），研究口径不含放大仓位的路径。`
+      : `当前画像未触发强门控，但仍需等待证据确认，研究参考暴露上限 ${exposureText}（组合占比）。`;
 
   return {
     level,
@@ -1676,11 +1529,11 @@ function buildTrendChart(points, keyNodes) {
 
 function buildExecutionScenarios({ summary, selectedForecast, riskBudget, investorProfile }) {
   const action = summary?.action || selectedForecast?.action || '观望';
-  const exposureText = formatCurrency(riskBudget.suggestedExposure);
+  const exposureText = `${formatPctPlain(riskBudget.suggestedExposurePct)}（组合占比）`;
   return [
     {
-      name: '基准执行',
-      action: action === '观望' ? '等待确认' : `${action}，上限 ${exposureText}`,
+      name: '基准观察',
+      action: action === '观望' ? '等待确认' : `${action}，研究参考上限 ${exposureText}`,
       condition: summary?.reasons?.[0] || selectedForecast?.reasons?.[0] || '稳定预测维持当前方向。',
       stop: '若触发任一失效条件，停止新增暴露。',
       tone: 'base',
@@ -1709,13 +1562,9 @@ function toneName(stance) {
   return 'neutral';
 }
 
-function formatCurrency(value) {
+function formatPctPlain(value) {
   if (!Number.isFinite(Number(value))) return 'N/A';
-  return Number(value).toLocaleString('zh-CN', {
-    style: 'currency',
-    currency: 'CNY',
-    maximumFractionDigits: 0,
-  });
+  return `${Number(value).toFixed(1)}%`;
 }
 
 function formatPrice(value) {

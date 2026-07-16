@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   BrainCircuit,
@@ -6,40 +6,22 @@ import {
   FileSearch,
   Loader2,
   ShieldCheck,
+  Sparkles,
   SlidersHorizontal,
   User,
   Wand2,
 } from 'lucide-react';
 
+import {
+  AdvancedProfileFields,
+  CoreProfileFields,
+} from './profileFields';
+import { loadProfile, saveProfile, toPersonalResearchBody } from './profileStore';
+
 const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
 const PERSONAL_URL =
   import.meta.env.VITE_AGENT_PERSONAL_URL || API_URL.replace('/analyze', '/personal-research');
 const API_KEY = import.meta.env.VITE_AGENT_API_KEY || 'dev-public-key';
-
-const STORAGE_KEY = 'gs_advisor_profile_v1';
-
-const defaultProfile = {
-  risk_tolerance: 'balanced',
-  horizon: 'mid',
-  current_gold_pct: 10,
-  experience: 'novice',
-};
-
-const riskOptions = [
-  ['conservative', '保守型'],
-  ['balanced', '稳健型'],
-  ['aggressive', '进取型'],
-];
-const horizonOptions = [
-  ['short', '短期(1-21天)'],
-  ['mid', '中期(1-6月)'],
-  ['long', '长期(6月+)'],
-];
-const experienceOptions = [
-  ['novice', '新手'],
-  ['experienced', '有经验'],
-  ['professional', '专业'],
-];
 
 const gapLabels = {
   within: { text: '处于参考区间内', tone: 'bull' },
@@ -54,31 +36,39 @@ const flagLabels = {
   short_horizon_high_vol: '短期限 × 高波动',
   structural_valuation_deviation: '估值结构性偏离',
   stale_data: '数据超出新鲜度阈值',
+  drawdown_tolerance_mismatch: '回撤承受力可能被击穿',
+  leverage_out_of_scope: '杠杆超出研究口径',
+  liquidity_horizon_mismatch: '流动性与期限矛盾',
 };
 
-function loadStoredProfile() {
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return defaultProfile;
-    const parsed = JSON.parse(raw);
-    return { ...defaultProfile, ...parsed };
-  } catch {
-    return defaultProfile;
+async function postPersonal(body, mode, signal) {
+  const response = await fetch(`${PERSONAL_URL}?mode=${mode}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
+    body: JSON.stringify(body),
+    signal,
+  });
+  const text = await response.text();
+  const json = text ? JSON.parse(text) : null;
+  if (!response.ok) {
+    const detail = json?.detail;
+    throw new Error(
+      (typeof detail === 'string' ? detail : detail?.message) ||
+        `个性化研究生成失败：HTTP ${response.status}`,
+    );
   }
+  return json;
 }
 
 export default function AdvisorPage() {
-  const [profile, setProfile] = useState(loadStoredProfile);
+  const [profile, setProfile] = useState(loadProfile);
   const [result, setResult] = useState(null);
-  const [loading, setLoading] = useState(false);
+  const [phase, setPhase] = useState('idle'); // idle | draft-loading | polishing | done | draft-only
   const [error, setError] = useState('');
+  const generationRef = useRef(0);
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(profile));
-    } catch {
-      /* localStorage unavailable: profile stays session-only */
-    }
+    saveProfile(profile);
   }, [profile]);
 
   function update(key, value) {
@@ -87,31 +77,34 @@ export default function AdvisorPage() {
 
   async function handleSubmit(event) {
     event.preventDefault();
-    setLoading(true);
+    const generation = ++generationRef.current;
+    const body = toPersonalResearchBody(profile);
     setError('');
+    setPhase('draft-loading');
+
+    // Phase 1: deterministic draft — every number, in about a second.
     try {
-      const response = await fetch(PERSONAL_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
-        body: JSON.stringify({
-          ...profile,
-          current_gold_pct: Number(profile.current_gold_pct),
-        }),
-      });
-      const text = await response.text();
-      const json = text ? JSON.parse(text) : null;
-      if (!response.ok) {
-        const detail = json?.detail;
-        throw new Error(
-          (typeof detail === 'string' ? detail : detail?.message) ||
-            `个性化研究生成失败：HTTP ${response.status}`,
-        );
-      }
-      setResult(json);
-    } catch (submitError) {
-      setError(submitError.message || '个性化研究生成失败');
-    } finally {
-      setLoading(false);
+      const draft = await postPersonal(body, 'draft');
+      if (generationRef.current !== generation) return;
+      setResult(draft);
+      setPhase('polishing');
+    } catch (draftError) {
+      if (generationRef.current !== generation) return;
+      setError(draftError.message || '个性化研究生成失败');
+      setPhase('idle');
+      return;
+    }
+
+    // Phase 2: LLM polish — swap the narrative in place when it lands.
+    try {
+      const full = await postPersonal(body, 'full');
+      if (generationRef.current !== generation) return;
+      setResult(full);
+      setPhase('done');
+    } catch {
+      if (generationRef.current !== generation) return;
+      // Draft stays on screen; numbers are identical by construction.
+      setPhase('draft-only');
     }
   }
 
@@ -121,12 +114,23 @@ export default function AdvisorPage() {
   const range = facts?.reference_range;
   const gapMeta = gapLabels[gap?.status] || gapLabels.unknown;
   const horizonSection = facts?.horizon_evidence?.section;
-  const generatedByLabel = useMemo(() => {
-    if (!result) return '';
-    return result.generated_by === 'llm'
-      ? 'DeepSeek 叙事 · 已通过数字校验与去指令化双重把关'
-      : '确定性草稿（LLM 未启用或被把关回退，数字口径不变）';
-  }, [result]);
+  const polishing = phase === 'polishing';
+  const loading = phase === 'draft-loading';
+
+  const narrativeStatus = useMemo(() => {
+    if (polishing) return { label: 'DeepSeek 正在润色语言…（数字已定稿，不会改变）', tone: 'pending' };
+    if (phase === 'draft-only')
+      return { label: '本次使用确定性草稿（语言润色暂不可用，数字口径完全一致）', tone: 'muted' };
+    if (!result) return { label: '', tone: 'muted' };
+    if (result.generated_by === 'llm')
+      return { label: 'DeepSeek 叙事 · 已通过数字校验与去指令化双重把关', tone: 'ok' };
+    return {
+      label: result.degradation_flags?.length
+        ? `已回退确定性草稿（${result.degradation_flags.join(' · ')}）`
+        : '确定性草稿',
+      tone: 'muted',
+    };
+  }, [phase, polishing, result]);
 
   return (
     <main className="page-surface advisor-page">
@@ -135,8 +139,8 @@ export default function AdvisorPage() {
           <p className="eyebrow">Personalized Research</p>
           <h1>个性化研究分析</h1>
           <p>
-            画像只在本机浏览器保存并随请求发送，服务端不存储。输出恒为「参考区间 / 差距 /
-            风险提示」研究框架——不是操作指令。
+            画像只在本机浏览器保存并随请求发送，服务端不存储；与「风险画像 Agent」页共用同一份画像。
+            输出恒为「参考区间 / 差距 / 风险提示」研究框架——不是操作指令。
           </p>
         </div>
         <div className="compliance-pill">
@@ -151,43 +155,12 @@ export default function AdvisorPage() {
             <SlidersHorizontal size={16} />
             <div>
               <h2>投资者画像</h2>
-              <span>四个字段，保存在 localStorage</span>
+              <span>核心 4 项必填 · 进阶可选 · 全站共享</span>
             </div>
           </div>
 
-          <SegmentedRow
-            label="风险承受能力"
-            value={profile.risk_tolerance}
-            options={riskOptions}
-            onChange={(v) => update('risk_tolerance', v)}
-          />
-          <SegmentedRow
-            label="投资期限"
-            value={profile.horizon}
-            options={horizonOptions}
-            onChange={(v) => update('horizon', v)}
-          />
-          <SegmentedRow
-            label="投资经验"
-            value={profile.experience}
-            options={experienceOptions}
-            onChange={(v) => update('experience', v)}
-          />
-
-          <label className="field compact-field">
-            <span>当前黄金仓位（占组合 %）</span>
-            <div className="number-input">
-              <input
-                type="number"
-                min="0"
-                max="100"
-                step="0.5"
-                value={profile.current_gold_pct}
-                onChange={(event) => update('current_gold_pct', event.target.value)}
-              />
-              <small>%</small>
-            </div>
-          </label>
+          <CoreProfileFields profile={profile} onChange={update} />
+          <AdvancedProfileFields profile={profile} onChange={update} />
 
           {error ? (
             <div className="error-panel">
@@ -199,9 +172,9 @@ export default function AdvisorPage() {
             </div>
           ) : null}
 
-          <button className="primary-action" type="submit" disabled={loading}>
+          <button className="primary-action" type="submit" disabled={loading || polishing}>
             {loading ? <Loader2 size={17} className="spinning" /> : <Wand2 size={17} />}
-            {loading ? '生成研究分析中' : '生成个性化研究分析'}
+            {loading ? '计算数字中（约 1 秒）' : polishing ? '数字已出 · 语言润色中' : '生成个性化研究分析'}
           </button>
         </form>
 
@@ -214,9 +187,10 @@ export default function AdvisorPage() {
             </div>
           </div>
           <ul className="boundary-list">
-            <li>全部数字由确定性规则引擎产出：参考区间来自已验证的配置模型，差距与风险旗标为可审计规则。</li>
-            <li>DeepSeek 只重写语言；每个数字经叙事校验器逐一核对，未着地则整体回退确定性草稿。</li>
+            <li>提交后约 1 秒先看到全部数字（规则引擎确定性产出），DeepSeek 随后仅替换语言表述。</li>
+            <li>每个数字经叙事校验器逐一核对，未着地则整体回退确定性草稿。</li>
             <li>出现任何指令式措辞（「建议买入」等）同样触发回退——本页永不输出买卖指令。</li>
+            <li>进阶画像可选：填写回撤承受力/流动性/杠杆态度后，解锁对应的错配检查规则。</li>
             <li>画像仅保存在你的浏览器，请求处理完即弃。</li>
           </ul>
         </aside>
@@ -228,7 +202,11 @@ export default function AdvisorPage() {
             <div>
               <span>Personalized Briefing</span>
               <h2>你的研究参考</h2>
-              <p>{generatedByLabel}</p>
+              <p className={`narrative-status ${narrativeStatus.tone}`}>
+                {polishing ? <Loader2 size={13} className="spinning" /> : null}
+                {narrativeStatus.tone === 'ok' ? <Sparkles size={13} /> : null}
+                {narrativeStatus.label}
+              </p>
             </div>
           </div>
 
@@ -276,12 +254,18 @@ export default function AdvisorPage() {
               </div>
             </section>
 
-            <section className="panel-block">
+            <section className={`panel-block ${polishing ? 'narrative-polishing' : ''}`}>
               <div className="panel-title">
                 <BrainCircuit size={16} />
                 <div>
                   <h2>定制叙事</h2>
-                  <span>{result.degradation_flags?.length ? result.degradation_flags.join(' · ') : '双重把关通过'}</span>
+                  <span>
+                    {polishing
+                      ? '润色中 · 以下为确定性草稿'
+                      : result.degradation_flags?.length
+                        ? result.degradation_flags.join(' · ')
+                        : '双重把关通过'}
+                  </span>
                 </div>
               </div>
               <div className="advisor-narrative">
@@ -312,28 +296,8 @@ export default function AdvisorPage() {
 
       <footer className="terminal-footer">
         <span>GoldenSense Personalized Research</span>
-        <span>数字来自规则引擎 · 语言经双重把关 · 画像不落库</span>
+        <span>数字先行 · 语言后补 · 双重把关 · 画像不落库</span>
       </footer>
     </main>
-  );
-}
-
-function SegmentedRow({ label, value, options, onChange }) {
-  return (
-    <div className="segmented-block">
-      <span>{label}</span>
-      <div className="segmented-control">
-        {options.map(([optionValue, optionLabel]) => (
-          <button
-            key={optionValue}
-            type="button"
-            className={value === optionValue ? 'active' : ''}
-            onClick={() => onChange(optionValue)}
-          >
-            {optionLabel}
-          </button>
-        ))}
-      </div>
-    </div>
   );
 }

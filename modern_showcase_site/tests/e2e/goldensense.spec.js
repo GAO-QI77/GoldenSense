@@ -268,16 +268,17 @@ test('dashboard exposes source audit details for each indicator', async ({ page 
 test('agent submits full investor profile and renders risk briefing', async ({ page }) => {
   await page.goto('/agent');
 
-  await page.getByLabel('资金占比').fill('75');
-  await page.getByLabel('最大回撤').fill('3');
+  // Unified profile: core fields + advanced layer (open by default on /agent).
+  await page.getByLabel('当前黄金仓位').fill('75');
+  await page.getByLabel('最大回撤承受力').fill('3');
   await page.getByLabel('杠杆态度').selectOption('high');
-  await page.getByLabel('经验水平').selectOption('beginner');
-  await page.getByLabel('已有持仓').selectOption('long');
+  await page.getByRole('button', { name: '新手', exact: true }).click();
   await expect(page.getByRole('heading', { name: '适当性门控预检' })).toBeVisible();
   await expect(page.getByText('强制观望')).toBeVisible();
   await expect(page.getByText('禁止加杠杆')).toBeVisible();
-  await expect(page.getByRole('heading', { name: '风险预算计算器' })).toBeVisible();
-  await expect(page.getByText('最大可承受亏损')).toBeVisible();
+  await expect(page.getByRole('heading', { name: '风险预算画像' })).toBeVisible();
+  await expect(page.getByText('声明回撤承受力')).toBeVisible();
+  // A 75% gold position maps to a long position in the legacy contract.
   await expect(page.locator('.position-mode-panel').getByText('已有多头', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: '生成风险适配 briefing' }).click();
 
