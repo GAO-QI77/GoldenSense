@@ -41,7 +41,13 @@ from model_governance import (
     apply_confidence_derate,
     evaluate_governance,
 )
+from market_view import build_market_view
 from narrative_critic import verify_narrative
+from signal_ledger import (
+    JsonlLedgerStore,
+    publish_weekly,
+    score_track_record,
+)
 from outcome_tracker import (
     backfill_outcomes,
     calibration_summary,
@@ -3104,6 +3110,7 @@ def create_app(
     sentiment_scorer: Optional[BaseSentimentScorer] = None,
     trace_store: Optional[AgentTraceStore] = None,
     http_client: Optional[httpx.AsyncClient] = None,
+    signal_ledger_store: Optional[Any] = None,
 ) -> FastAPI:
     tool_timeout_seconds = float(_env("AGENT_TOOL_TIMEOUT_SECONDS", "35.0"))
     tool_connect_timeout_seconds = float(_env("AGENT_TOOL_CONNECT_TIMEOUT_SECONDS", "1.5"))
@@ -3156,6 +3163,9 @@ def create_app(
         app.state.rate_limiter = SlidingWindowRateLimiter(
             limit=analyze_rate_limit_per_minute,
             window_seconds=analyze_rate_limit_window_seconds,
+        )
+        app.state.signal_ledger_store = signal_ledger_store or JsonlLedgerStore(
+            _env("SIGNAL_LEDGER_PATH", "data_cache/signal_ledger.jsonl")
         )
         app.state.trace_store = trace_store or AgentTraceStore(
             database_url,
@@ -3345,6 +3355,123 @@ def create_app(
                 },
             ) from exc
         return JSONResponse(content=jsonable_encoder(ctx))
+
+    @app.get("/api/v1/agent/market-view")
+    async def market_view_endpoint(request: Request) -> JSONResponse:
+        """Unified three-horizon view book (short: distribution+risk, mid:
+        regime+factors, long: valuation+scenarios), assembled from the cached
+        research context. Every section carries evidence and invalidation
+        conditions; sections degrade independently."""
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        try:
+            ctx = await asyncio.to_thread(quant_research_context.get_context)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_code": "research_context_unavailable",
+                    "message": f"{type(exc).__name__}: {exc}",
+                },
+            ) from exc
+        return JSONResponse(content=jsonable_encoder(build_market_view(ctx)))
+
+    def _ledger_records() -> list:
+        return app.state.signal_ledger_store.load_all()
+
+    @app.get("/api/v1/signals/current")
+    async def signals_current(request: Request) -> JSONResponse:
+        """Latest immutable weekly signal publication."""
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        records = await asyncio.to_thread(_ledger_records)
+        if not records:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error_code": "no_publication",
+                    "message": "信号台账为空：追踪记录自首次发布起前向累积，不回填。",
+                },
+            )
+        latest = max(records, key=lambda r: r.get("published_at") or "")
+        return JSONResponse(content=jsonable_encoder(latest))
+
+    @app.get("/api/v1/signals/history")
+    async def signals_history(request: Request, limit: int = 52) -> JSONResponse:
+        """Full publication history, oldest first (append-only audit trail)."""
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        records = await asyncio.to_thread(_ledger_records)
+        records.sort(key=lambda r: r.get("published_at") or "")
+        return JSONResponse(
+            content=jsonable_encoder({"publications": records[-max(1, limit):]})
+        )
+
+    @app.get("/api/v1/signals/track-record")
+    async def signals_track_record(request: Request) -> JSONResponse:
+        """Forward shadow-portfolio scorecard over matured publications only.
+        Starts empty by design: no backfilled history, backtests live under
+        /research and are labeled as backtests."""
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+
+        def _score() -> Dict[str, Any]:
+            from data_sources import load_market_data
+
+            records = _ledger_records()
+            raw, _source = load_market_data()
+            return score_track_record(records, raw["Gold"])
+
+        try:
+            payload = await asyncio.to_thread(_score)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_code": "track_record_unavailable",
+                    "message": f"{type(exc).__name__}: {exc}",
+                },
+            ) from exc
+        return JSONResponse(content=jsonable_encoder(payload))
+
+    @app.post("/api/v1/signals/publish")
+    async def signals_publish(request: Request) -> JSONResponse:
+        """Freeze this ISO week's publication (idempotent). Internal only:
+        publication is an operational act, not a public mutation."""
+        app.state.authorizer.authorize(request, internal_only=True)
+        try:
+            ctx = await asyncio.to_thread(quant_research_context.get_context)
+            record, created = await asyncio.to_thread(
+                publish_weekly, app.state.signal_ledger_store, ctx
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_code": "publish_failed",
+                    "message": f"{type(exc).__name__}: {exc}",
+                },
+            ) from exc
+        return JSONResponse(
+            content=jsonable_encoder({"record": record, "created": created})
+        )
+
+    @app.get("/api/v1/signals/{publication_id}")
+    async def signals_by_id(publication_id: str, request: Request) -> JSONResponse:
+        """Permalink to one immutable publication (audit trail)."""
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        records = await asyncio.to_thread(_ledger_records)
+        for record in records:
+            if record.get("publication_id") == publication_id:
+                return JSONResponse(content=jsonable_encoder(record))
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error_code": "publication_not_found",
+                "message": f"Publication not found: {publication_id}",
+            },
+        )
 
     @app.get("/api/v1/agent/calibration")
     async def calibration(request: Request) -> JSONResponse:
