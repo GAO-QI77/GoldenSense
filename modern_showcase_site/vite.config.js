@@ -14,6 +14,10 @@ export default defineConfig(({ mode }) => {
           target: proxyTarget,
           changeOrigin: true,
         },
+        '/api/v1/signals': {
+          target: proxyTarget,
+          changeOrigin: true,
+        },
       },
     },
   };

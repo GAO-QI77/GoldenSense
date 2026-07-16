@@ -31,8 +31,10 @@ import {
   WalletCards,
 } from 'lucide-react';
 
+import AdvisorPage from './AdvisorPage';
 import GlobalSearch from './GlobalSearch';
 import QuantPage from './QuantPage';
+import SignalsPage from './SignalsPage';
 import { addSearchEntries } from './searchIndex';
 
 const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
@@ -200,6 +202,8 @@ function App() {
           <Route path="/" element={<DashboardPage />} />
           <Route path="/agent" element={<AgentPage />} />
           <Route path="/quant" element={<QuantPage />} />
+          <Route path="/advisor" element={<AdvisorPage />} />
+          <Route path="/signals" element={<SignalsPage />} />
           <Route path="*" element={<DashboardPage />} />
         </Routes>
       </AppShell>
@@ -213,6 +217,8 @@ function AppShell({ children }) {
       { id: 'page-dashboard', source: 'pages', title: '研究主页', hint: '三周期预测、指标证据与近端新闻', route: '/', keywords: ['dashboard', '主页', '预测', '指标'] },
       { id: 'page-agent', source: 'pages', title: '风险画像 Agent', hint: '提交问题与风险画像，获取可追溯分析', route: '/agent', keywords: ['agent', '画像', '分析', '问答'] },
       { id: 'page-quant', source: 'pages', title: '量化研究面板', hint: 'HMM 状态机、公允价值、情景锥与校准记分卡', route: '/quant', keywords: ['quant', '量化', 'hmm', '校准', '因子'] },
+      { id: 'page-signals', source: 'pages', title: '观点书与信号台账', hint: '短中长三尺度观点、每周不可变发布与前向记分卡', route: '/signals', keywords: ['signals', '观点书', '台账', '信号', 'ledger'] },
+      { id: 'page-advisor', source: 'pages', title: '个性化研究分析', hint: '按画像生成参考区间/差距/风险提示与定制叙事', route: '/advisor', keywords: ['advisor', '个性化', '画像', '参考区间'] },
     ]);
     addSearchEntries(
       'prompts',
@@ -252,6 +258,14 @@ function AppShell({ children }) {
           <NavLink to="/quant">
             <Radar size={16} />
             量化研究
+          </NavLink>
+          <NavLink to="/signals">
+            <BookOpenCheck size={16} />
+            观点书与台账
+          </NavLink>
+          <NavLink to="/advisor">
+            <WalletCards size={16} />
+            个性化研究
           </NavLink>
         </nav>
 
@@ -416,10 +430,18 @@ function DashboardPage() {
         </div>
 
         <aside className="side-rail">
+          <MarketViewSummaryPanel />
           <QualityPanel quality={dataQuality} flags={degradationFlags} />
           <SourceHealthPanel sources={sourceHealth} loading={loading} />
           <NewsPanel news={news} loading={loading} />
           <CitationPanel citations={citations} />
+          <Link className="agent-entry" to="/advisor">
+            <span>
+              <strong>生成个性化研究分析</strong>
+              <small>按你的画像输出参考区间、差距与风险提示</small>
+            </span>
+            <ArrowRight size={17} />
+          </Link>
           <Link className="agent-entry" to="/agent">
             <span>
               <strong>进入风险画像 Agent</strong>
@@ -803,6 +825,60 @@ function AgentPage() {
         right="问卷、门控、证据与引用统一在 Agent 页收口"
       />
     </main>
+  );
+}
+
+const MARKET_VIEW_URL =
+  import.meta.env.VITE_AGENT_MARKET_VIEW_URL || API_URL.replace('/analyze', '/market-view');
+
+const marketViewMeta = {
+  short_term: '短期 1-21天',
+  mid_term: '中期 1-6月',
+  long_term: '长期 6月+',
+};
+
+function MarketViewSummaryPanel() {
+  const [book, setBook] = useState(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch(MARKET_VIEW_URL, { headers: apiHeaders(), signal: controller.signal })
+      .then((response) => (response.ok ? response.json() : Promise.reject()))
+      .then(setBook)
+      .catch(() => {
+        if (!controller.signal.aborted) setFailed(true);
+      });
+    return () => controller.abort();
+  }, []);
+
+  return (
+    <section className="panel-block market-view-summary">
+      <PanelTitle
+        icon={BookOpenCheck}
+        title="大盘观点书"
+        subtitle={book?.meta?.data_asof ? `数据截至 ${book.meta.data_asof} · 非实时` : '读取中'}
+      />
+      {book ? (
+        <div className="compact-list">
+          {Object.entries(marketViewMeta).map(([key, label]) => {
+            const section = book[key];
+            return (
+              <article key={key}>
+                <span>{label}{section?.available ? ` · 置信度${section.confidence}` : ''}</span>
+                <p>{section?.available ? section.core_view : `数据降级：${section?.degraded_reason || '不可用'}`}</p>
+              </article>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="muted-copy">{failed ? '观点书暂不可用。' : '正在读取三尺度观点。'}</p>
+      )}
+      <Link className="audit-source-link" to="/signals">
+        查看完整观点书与信号台账
+        <ArrowRight size={13} />
+      </Link>
+    </section>
   );
 }
 

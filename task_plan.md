@@ -97,9 +97,41 @@ C) 可搜索、美观、金色科技感的前端产品（modern_showcase_site �
   research_context.flagship, 网关启动预热线程, QuantPage FlagshipHero(回撤/净值切换+动效)
 - 测试: 204 passed（+9）；前端 build 通过；浏览器实测回撤/净值双视图+动效+无控制台错误
 
+### Phase 13: 双 Agent 投研系统（分支 codex/dual-agent-system，2026-07-16）
+- 设计: docs/superpowers/specs/2026-07-16-dual-agent-research-system-design.md（已获批准）
+- P1 观点书+信号台账: complete — market_view.py（三尺度+失效条件）、signal_ledger.py
+  （不可变 JSONL/幂等/sha256/影子组合成熟周计分）、5+1 网关端点、publish CLI+自动发布开关
+- P2 个性化 Agent: complete — investor_profile.py、personal_research.py（规则引擎+去指令化
+  检查）、narrate_personal（DeepSeek）、personal-research 端点（critic+去指令化双硬门，
+  画像不落库）、评测 4 硬门 judge+3 golden 用例。注意: 网关已有同名 InvestorProfile
+  （analyze 问卷），导入用 PersonalResearchProfile 别名
+- P3 RAG: complete — knowledge/events_catalog.jsonl（52 真实事件）、event_study.py
+  （前向收益零手写，mp 类 30 天均值 +3.61% n=19）、event_classifier.py、news_archive.py
+  （相关性过滤/去重/180 天 TTL/衰减检索/CJK 二元切分）、knowledge/search 端点
+- P4 新闻反应: complete — news_analyst 类比先验（±0.3 硬上限，n<5 不启用，不碰 stance
+  门控）、research_context.invalidate（15min 防抖）、高严重度事件触发
+- P5 前端: in-progress — AdvisorPage/SignalsPage 已建、App 路由/导航/搜索/首页观点书
+  面板已接、vite 代理补 /api/v1/signals、CSS 已加；待: npm build + 浏览器实测
+  （Bash 分类器临时不可用，恢复后执行）
+- 测试: 288 passed / 0 failed；评测门 8/8
+- DeepSeek: 代码已接好（LLM_PROVIDER=deepseek 默认），本机 env 尚无 DEEPSEEK_API_KEY，
+  填入 .env 即生效，无 key 走确定性草稿
+
+### Phase 12: 推送、PR、CI、部署
+- Status: blocked-on-user（仅剩合并一步）
+- 已完成:
+  - [x] push codex/goldensense-public-demo → origin（新远端分支，未动 main）
+  - [x] 开 PR #2 → main（github.com/GAO-QI77/GoldenSense/pull/2）
+  - [x] CI clean env 全绿: Python tests pass 5m54s, Web build+e2e pass 1m1s
+  - [x] 评测门 5/5 passed
+- 待用户:
+  - [ ] 合并 PR #2（自我审批被安全策略挡下——需人来点合并，这是正确红线，不绕过）
+  - [ ] 合并后确认 Vercel/Railway 部署；生产切换设 APP_ENV=production + 真 Postgres + 法务确认
+
 ## Errors Encountered
 | Error | Attempt | Resolution |
 |-------|---------|------------|
+| gh pr merge 被 classifier 拒绝 | 1 | 正当红线(自我审批/双人审查)，不绕过，交用户合并 |
 
 ## Decisions Made
 | Decision | Reason |
