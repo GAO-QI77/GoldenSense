@@ -3194,6 +3194,30 @@ def create_app(
 
         if _env("AGENT_WARM_QUANT_CONTEXT", "1") == "1":
             threading.Thread(target=_warm_quant_context, name="quant-warmup", daemon=True).start()
+
+        # Optional startup autopublish: freeze this ISO week's signal if it is
+        # missing. Publishing is idempotent, so this is safe to run on every
+        # boot; failures are logged and never block startup.
+        def _autopublish_signal() -> None:
+            try:
+                from signal_ledger import publish_weekly as _publish
+
+                ctx = quant_research_context.get_context()
+                record, created = _publish(app.state.signal_ledger_store, ctx)
+                LOGGER.info(
+                    "signal_autopublish %s publication_id=%s",
+                    "created" if created else "already_exists",
+                    record["publication_id"],
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                LOGGER.warning(
+                    "signal_autopublish_failed error=%s:%s", type(exc).__name__, exc
+                )
+
+        if _env("SIGNAL_AUTOPUBLISH_ENABLED", "0") == "1":
+            threading.Thread(
+                target=_autopublish_signal, name="signal-autopublish", daemon=True
+            ).start()
         yield
         if own_http:
             await http.aclose()
