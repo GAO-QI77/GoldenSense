@@ -152,6 +152,42 @@ def build_personal_facts(profile: InvestorProfile, ctx: Dict[str, Any]) -> Dict[
             "evidence_ref": "data_asof/data_age_days",
         })
 
+    # ---- Advanced-layer rules (only when the optional fields are given) ----
+    if profile.max_drawdown_pct is not None and h21:
+        # Worst-decile 21-day move applied to the current position: if that
+        # single bad month alone can breach the stated tolerance, say so.
+        p10 = float(h21.get("p10", 0.0))
+        potential_hit_pct = abs(min(p10, 0.0)) * float(profile.current_gold_pct)
+        if potential_hit_pct > float(profile.max_drawdown_pct):
+            risk_flags.append({
+                "flag": "drawdown_tolerance_mismatch",
+                "detail": (
+                    f"未来 21 天最差十分位金价变动（{p10:+.1%}）作用于当前仓位 "
+                    f"{profile.current_gold_pct:.0f}%，对组合的潜在冲击约 "
+                    f"{potential_hit_pct:.1f}%，已超过您声明的最大回撤承受力 "
+                    f"{profile.max_drawdown_pct:.0f}%。"
+                ),
+                "evidence_ref": "vol_bands.h21.p10 x profile.current_gold_pct",
+            })
+    if profile.leverage_attitude in ("medium", "high"):
+        risk_flags.append({
+            "flag": "leverage_out_of_scope",
+            "detail": (
+                "本研究口径的参考区间均以无杠杆现货敞口计算；"
+                "使用杠杆会成倍放大区间外风险，且不在本系统的评估范围内。"
+            ),
+            "evidence_ref": "profile.leverage_attitude",
+        })
+    if profile.liquidity_need == "high" and profile.horizon == "long":
+        risk_flags.append({
+            "flag": "liquidity_horizon_mismatch",
+            "detail": (
+                "您声明的流动性需求为高，但期限画像为长期——"
+                "长期视角的估值锚回归可能需要数月甚至更久，两者存在结构性矛盾。"
+            ),
+            "evidence_ref": "profile.liquidity_need vs profile.horizon",
+        })
+
     # Horizon-matched evidence: the view-book section for this profile.
     section_key = _HORIZON_TO_SECTION[profile.horizon]
     horizon_evidence = {

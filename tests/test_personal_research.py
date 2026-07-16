@@ -213,3 +213,76 @@ def test_compliant_language_passes():
     ])
     assert ok is True
     assert violations == []
+
+
+# --------------------------------------------------------------------------- #
+# Advanced (optional) profile fields and their rules
+# --------------------------------------------------------------------------- #
+def test_advanced_fields_optional_and_backward_compatible():
+    # The original 4-field payload must remain fully valid.
+    p = InvestorProfile(
+        risk_tolerance="balanced", horizon="mid",
+        current_gold_pct=10.0, experience="novice",
+    )
+    assert p.max_drawdown_pct is None
+    assert p.liquidity_need is None
+    assert p.leverage_attitude is None
+    assert p.investment_goal is None
+    # And facts computation is unchanged when advanced fields are absent.
+    facts = build_personal_facts(p, _ctx())
+    flags = {f["flag"] for f in facts["risk_flags"]}
+    assert not flags & {"drawdown_tolerance_mismatch", "leverage_out_of_scope",
+                        "liquidity_horizon_mismatch"}
+
+
+def test_advanced_field_validation():
+    import pytest as _pytest
+    with _pytest.raises(ValidationError):
+        InvestorProfile(
+            risk_tolerance="balanced", horizon="mid", current_gold_pct=10.0,
+            experience="novice", max_drawdown_pct=150.0,
+        )
+    with _pytest.raises(ValidationError):
+        InvestorProfile(
+            risk_tolerance="balanced", horizon="mid", current_gold_pct=10.0,
+            experience="novice", leverage_attitude="turbo",
+        )
+
+
+def test_drawdown_tolerance_mismatch_rule():
+    # Position 20% x 21d band p10 -6% = potential -1.2% portfolio hit;
+    # stated tolerance 1% -> mismatch flag fires.
+    p = _profile(current_gold_pct=20.0, max_drawdown_pct=1.0)
+    facts = build_personal_facts(p, _ctx(band_width=0.12))
+    assert "drawdown_tolerance_mismatch" in {f["flag"] for f in facts["risk_flags"]}
+
+    # Generous tolerance -> no flag.
+    p2 = _profile(current_gold_pct=20.0, max_drawdown_pct=30.0)
+    facts2 = build_personal_facts(p2, _ctx(band_width=0.12))
+    assert "drawdown_tolerance_mismatch" not in {f["flag"] for f in facts2["risk_flags"]}
+
+
+def test_leverage_out_of_scope_rule():
+    p = _profile(leverage_attitude="high")
+    facts = build_personal_facts(p, _ctx())
+    assert "leverage_out_of_scope" in {f["flag"] for f in facts["risk_flags"]}
+    p2 = _profile(leverage_attitude="none")
+    facts2 = build_personal_facts(p2, _ctx())
+    assert "leverage_out_of_scope" not in {f["flag"] for f in facts2["risk_flags"]}
+
+
+def test_liquidity_horizon_mismatch_rule():
+    p = _profile(horizon="long", liquidity_need="high")
+    facts = build_personal_facts(p, _ctx())
+    assert "liquidity_horizon_mismatch" in {f["flag"] for f in facts["risk_flags"]}
+    p2 = _profile(horizon="short", liquidity_need="high")
+    facts2 = build_personal_facts(p2, _ctx())
+    assert "liquidity_horizon_mismatch" not in {f["flag"] for f in facts2["risk_flags"]}
+
+
+def test_advanced_flags_surface_in_draft_narrative():
+    p = _profile(leverage_attitude="high", liquidity_need="high", horizon="long")
+    facts = build_personal_facts(p, _ctx())
+    draft = draft_personal_narrative(facts, p)
+    joined = " ".join(draft.risk_notes)
+    assert "杠杆" in joined
