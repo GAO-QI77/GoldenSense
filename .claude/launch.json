@@ -12,6 +12,24 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev", "--prefix", "modern_showcase_site"],
       "port": 5173
+    },
+    {
+      "name": "inference",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "uvicorn", "inference_service:app", "--host", "127.0.0.1", "--port", "8010"],
+      "port": 8010
+    },
+    {
+      "name": "snapshot",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "uvicorn", "market_snapshot_service:app", "--host", "127.0.0.1", "--port", "8014"],
+      "port": 8014
+    },
+    {
+      "name": "news",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "uvicorn", "news_ingest_service:app", "--host", "127.0.0.1", "--port", "8016"],
+      "port": 8016
     }
   ]
 }
