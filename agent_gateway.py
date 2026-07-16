@@ -41,8 +41,18 @@ from model_governance import (
     apply_confidence_derate,
     evaluate_governance,
 )
+# Aliased: the gateway already defines its own (richer, analyze-scoped)
+# InvestorProfile questionnaire; the personal-research endpoint uses the
+# allocation-profile-aligned model from investor_profile.py.
+from investor_profile import InvestorProfile as PersonalResearchProfile
+from investor_profile import PersonalNarrative
 from market_view import build_market_view
 from narrative_critic import verify_narrative
+from personal_research import (
+    build_personal_facts,
+    check_no_directive_language,
+    draft_personal_narrative,
+)
 from signal_ledger import (
     JsonlLedgerStore,
     publish_weekly,
@@ -1560,6 +1570,81 @@ class OpenAINarrator:
         if self._provider == "openai":
             return await self._narrate_openai(bundle, draft, model)
         LOGGER.warning("agent_narrator_degraded provider=%s model=%s reason=unsupported_provider", self._provider, model)
+        return draft
+
+    async def narrate_personal(
+        self,
+        facts: Dict[str, Any],
+        profile: PersonalResearchProfile,
+        draft: PersonalNarrative,
+    ) -> PersonalNarrative:
+        """Polish the deterministic personalized draft. Language only: the
+        critic re-grounds every number afterwards, and directive phrasing is
+        rejected downstream, so degrading to ``draft`` is always safe."""
+        model = (
+            self._cfg.complex_model if facts.get("risk_flags") else self._cfg.default_model
+        )
+        if self._client is None:
+            LOGGER.warning(
+                "personal_narrator_degraded provider=%s model=%s reason=no_client_configured",
+                self._provider,
+                model,
+            )
+            return draft
+        if self._provider not in {"deepseek", "openai"}:
+            LOGGER.warning(
+                "personal_narrator_degraded provider=%s reason=unsupported_provider",
+                self._provider,
+            )
+            return draft
+
+        schema = PersonalNarrative.model_json_schema()
+        system_prompt = (
+            "你是 GoldenSense 的中文个性化研究助手。根据给定的结构化事实，"
+            "为该投资者画像重写一份更流畅的研究参考叙事。硬性规则："
+            "1) 只能使用事实中已有的数字，禁止编造或外推任何数值；"
+            "2) 禁止任何操作指令式措辞（如'建议买入/卖出、应该加仓、满仓、清仓、抄底'），"
+            "只能使用'参考区间/差距/风险提示'框架；"
+            "3) 依据 experience 调整解释深度：novice 需解释术语，professional 直接给结论；"
+            "4) 保留免责声明原文。"
+            "严格输出符合以下 JSON Schema 的 json 对象，不要输出 markdown："
+            f"{json.dumps(schema, ensure_ascii=False)}"
+        )
+        payload = {
+            "profile": profile.model_dump(),
+            "facts": facts,
+            "draft": draft.model_dump(),
+        }
+
+        for attempt in range(1, 3):
+            try:
+                async def _request() -> str:
+                    response = await self._client.chat.completions.create(
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                        ],
+                        response_format={"type": "json_object"},
+                    )
+                    choices = getattr(response, "choices", [])
+                    if not choices:
+                        return ""
+                    return str(getattr(getattr(choices[0], "message", None), "content", "") or "")
+
+                output_text = await asyncio.wait_for(_request(), timeout=self._timeout_seconds)
+                if not output_text:
+                    raise ValueError("empty_output")
+                return PersonalNarrative(**json.loads(output_text))
+            except Exception as exc:
+                LOGGER.warning(
+                    "personal_narrator_degraded provider=%s model=%s attempt=%s reason=%s:%s",
+                    self._provider,
+                    model,
+                    attempt,
+                    type(exc).__name__,
+                    exc,
+                )
         return draft
 
     def _build_client(self) -> Any:
@@ -3399,6 +3484,74 @@ def create_app(
                 },
             ) from exc
         return JSONResponse(content=jsonable_encoder(build_market_view(ctx)))
+
+    @app.post("/api/v1/agent/personal-research")
+    async def personal_research(
+        profile: PersonalResearchProfile, request: Request
+    ) -> JSONResponse:
+        """Personalized research analysis: deterministic rule-engine facts
+        (reference range / position gap / risk flags / horizon evidence) plus
+        an LLM-polished narrative, double-gated by the numeric critic and the
+        directive-language check. The profile is request-scoped only -- it is
+        never persisted server-side."""
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        try:
+            ctx = await asyncio.to_thread(quant_research_context.get_context)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_code": "research_context_unavailable",
+                    "message": f"{type(exc).__name__}: {exc}",
+                },
+            ) from exc
+
+        facts = build_personal_facts(profile, ctx)
+        draft = draft_personal_narrative(facts, profile)
+        narrative = await app.state.narrator.narrate_personal(facts, profile, draft)
+
+        degradation_flags: List[str] = []
+        generated_by = "llm"
+        critic_report: Optional[Dict[str, Any]] = None
+        # Identity check: the narrator returns the draft object itself when it
+        # degraded, in which case the gates are unnecessary by construction.
+        if narrative is draft:
+            generated_by = "deterministic_draft"
+        else:
+            texts = [
+                narrative.overview,
+                narrative.position_analysis,
+                narrative.horizon_note,
+                *narrative.risk_notes,
+            ]
+            critic_passed, critic_report = verify_narrative(texts, [facts])
+            if not critic_passed:
+                degradation_flags.append("narrative_critic_reverted")
+                narrative = draft
+                generated_by = "deterministic_draft"
+            else:
+                language_ok, violations = check_no_directive_language(texts)
+                if not language_ok:
+                    LOGGER.warning(
+                        "personal_directive_language_reverted violations=%s", violations
+                    )
+                    degradation_flags.append("directive_language_reverted")
+                    narrative = draft
+                    generated_by = "deterministic_draft"
+
+        return JSONResponse(
+            content=jsonable_encoder(
+                {
+                    "profile_echo": profile.model_dump(),
+                    "facts": facts,
+                    "narrative": narrative.model_dump(),
+                    "degradation_flags": degradation_flags,
+                    "generated_by": generated_by,
+                    "critic_report": critic_report,
+                }
+            )
+        )
 
     def _ledger_records() -> list:
         return app.state.signal_ledger_store.load_all()
