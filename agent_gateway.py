@@ -3606,6 +3606,49 @@ def create_app(
             )
         )
 
+    @app.get("/api/v1/agent/event-alert")
+    async def event_alert(request: Request) -> JSONResponse:
+        """High-severity market-event feed for the frontend banner: recent
+        news classified onto the event taxonomy; only severity=high activates.
+        Process-cached for 5 minutes so homepage traffic never hammers the
+        news service. Failures degrade to inactive, never to an error page."""
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+
+        now = time.time()
+        cached = getattr(app.state, "event_alert_cache", None)
+        if cached and (now - cached["at"]) < 300:
+            return JSONResponse(content=cached["payload"])
+
+        from event_classifier import classify_news
+
+        payload: Dict[str, Any] = {
+            "active": False,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            news = await app.state.toolbox.search_recent_news(
+                "黄金 宏观 政策 地缘 风险", limit=6
+            )
+            for item in news.items:
+                classification = classify_news(f"{item.title} {item.summary or ''}")
+                if classification and classification["severity"] == "high":
+                    payload.update({
+                        "active": True,
+                        "severity": "high",
+                        "category": classification["category"],
+                        "title": item.title,
+                        "published_at": item.published_at,
+                        "source": item.source,
+                    })
+                    break
+        except Exception as exc:
+            payload["degraded"] = f"{type(exc).__name__}: {exc}"
+
+        encoded = jsonable_encoder(payload)
+        app.state.event_alert_cache = {"at": now, "payload": encoded}
+        return JSONResponse(content=encoded)
+
     @app.get("/api/v1/agent/knowledge/search")
     async def knowledge_search(q: str, request: Request) -> JSONResponse:
         """Unified knowledge retrieval: event-study analogs (real computed
