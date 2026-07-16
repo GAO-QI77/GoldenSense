@@ -42,6 +42,9 @@ class _DraftNarrator:
     async def narrate(self, bundle, draft):
         return draft
 
+    async def narrate_personal(self, facts, profile, draft):
+        return draft
+
 
 class _ScenarioToolbox:
     def __init__(

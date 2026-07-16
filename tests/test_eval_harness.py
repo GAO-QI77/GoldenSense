@@ -91,3 +91,60 @@ def test_golden_set_passes_in_process():
     reports = run_in_process(cases)
     failed = [r.case_id for r in reports if not r.passed]
     assert not failed, f"golden cases failed: {failed}"
+
+
+# --------------------------- personal channel ------------------------------ #
+from eval.judges import (  # noqa: E402
+    judge_no_directive_language,
+    judge_personal_disclaimer,
+    judge_personal_faithfulness,
+    judge_risk_flags_surfaced,
+    score_personal_case,
+)
+
+
+def _personal_response():
+    return {
+        "facts": {
+            "reference_range": {"available": True, "range_pct": [5.0, 12.0], "midpoint": 8.5},
+            "position_gap": {"status": "above", "gap_pct": 3.0, "current_gold_pct": 15.0},
+            "risk_flags": [{"flag": "position_far_above_range", "detail": "超出 3.0 个百分点"}],
+        },
+        "narrative": {
+            "overview": "基于您的稳健画像整理，仅为研究参考。",
+            "position_analysis": "参考区间为 5.0%–12.0%，您的仓位 15% 高于上沿约 3.0 个百分点。",
+            "risk_notes": ["高于区间时历史回撤波动更大，供您参考。"],
+            "horizon_note": "中期主导状态为平静。",
+            "disclaimer": "本内容为教育型研究参考，不构成投资建议。",
+        },
+    }
+
+
+def test_personal_judges_pass_on_compliant_response():
+    report = score_personal_case("ok", _personal_response(), {})
+    assert report.passed is True
+
+
+def test_directive_language_judge_blocks():
+    resp = _personal_response()
+    resp["narrative"]["position_analysis"] = "建议买入黄金到 12%。"
+    assert judge_no_directive_language(resp, {}).passed is False
+    assert score_personal_case("bad", resp, {}).passed is False
+
+
+def test_personal_faithfulness_blocks_ungrounded_numbers():
+    resp = _personal_response()
+    resp["narrative"]["overview"] = "金价目标 99999 美元。"
+    assert judge_personal_faithfulness(resp, {}).passed is False
+
+
+def test_risk_flags_must_surface_in_notes():
+    resp = _personal_response()
+    resp["narrative"]["risk_notes"] = []
+    assert judge_risk_flags_surfaced(resp, {}).passed is False
+
+
+def test_personal_disclaimer_required():
+    resp = _personal_response()
+    resp["narrative"]["disclaimer"] = ""
+    assert judge_personal_disclaimer(resp, {}).passed is False

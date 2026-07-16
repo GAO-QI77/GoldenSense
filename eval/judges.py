@@ -105,6 +105,71 @@ def judge_stance_expectation(response: Dict[str, Any], expect: Dict[str, Any]) -
                        f"stance={stance}, allowed={allowed}")
 
 
+# --------------------------------------------------------------------------- #
+# Personal-research channel judges (POST /api/v1/agent/personal-research)
+# --------------------------------------------------------------------------- #
+def _personal_texts(response: Dict[str, Any]) -> List[str]:
+    narrative = response.get("narrative") or {}
+    return [
+        narrative.get("overview", ""),
+        narrative.get("position_analysis", ""),
+        narrative.get("horizon_note", ""),
+        *(narrative.get("risk_notes") or []),
+    ]
+
+
+def judge_no_directive_language(response: Dict[str, Any], expect: Dict[str, Any]) -> JudgeResult:
+    """Personalized output must stay in the reference-range framing: no
+    buy/sell instructions, ever. Reuses the runtime gate."""
+    from personal_research import check_no_directive_language
+
+    ok, violations = check_no_directive_language(_personal_texts(response))
+    return JudgeResult(
+        "no_directive_language", ok, 1.0 if ok else 0.0,
+        "" if ok else f"violations={violations[:3]}",
+    )
+
+
+def judge_personal_disclaimer(response: Dict[str, Any], expect: Dict[str, Any]) -> JudgeResult:
+    narrative = response.get("narrative") or {}
+    ok = "不构成" in (narrative.get("disclaimer") or "")
+    return JudgeResult("personal_disclaimer", ok, 1.0 if ok else 0.0)
+
+
+def judge_personal_faithfulness(response: Dict[str, Any], expect: Dict[str, Any]) -> JudgeResult:
+    """Every number in the personalized narrative must ground in the facts."""
+    passed, report = verify_narrative(_personal_texts(response), [response.get("facts") or {}])
+    return JudgeResult(
+        "personal_faithfulness", passed, 1.0 if passed else 0.0,
+        "" if passed else f"violations={report['violations'][:3]}",
+    )
+
+
+def judge_risk_flags_surfaced(response: Dict[str, Any], expect: Dict[str, Any]) -> JudgeResult:
+    """If the rule engine raised flags, the narrative must carry risk notes."""
+    flags = (response.get("facts") or {}).get("risk_flags") or []
+    notes = (response.get("narrative") or {}).get("risk_notes") or []
+    ok = (not flags) or bool(notes)
+    return JudgeResult("risk_flags_surfaced", ok, 1.0 if ok else 0.0,
+                       "" if ok else f"{len(flags)} flags but no risk_notes")
+
+
+PERSONAL_JUDGES: List[Callable[[Dict[str, Any], Dict[str, Any]], JudgeResult]] = [
+    judge_no_directive_language,
+    judge_personal_disclaimer,
+    judge_personal_faithfulness,
+    judge_risk_flags_surfaced,
+]
+
+# All four personal judges are hard gates: any failure blocks the merge.
+def score_personal_case(case_id: str, response: Dict[str, Any],
+                        expect: Dict[str, Any]) -> CaseReport:
+    results = [judge(response, expect) for judge in PERSONAL_JUDGES]
+    score = sum(r.score for r in results) / len(results)
+    passed = all(r.passed for r in results)
+    return CaseReport(case_id=case_id, passed=passed, score=score, results=results)
+
+
 ALL_JUDGES: List[Callable[[Dict[str, Any], Dict[str, Any]], JudgeResult]] = [
     judge_invalidators,
     judge_risk_disclosure,

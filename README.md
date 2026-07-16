@@ -479,6 +479,33 @@ POST /api/v1/signals/publish            # 冻结本 ISO 周发布（仅 internal
 所有输出附研究参考免责声明。运维：`python3 scripts/publish_signal.py`（cron 安全）或
 `SIGNAL_AUTOPUBLISH_ENABLED=1`（网关启动时补发本周缺失发布）。
 
+### 2.7 个性化研究分析（新增）
+
+```http
+POST /api/v1/agent/personal-research
+Content-Type: application/json
+X-API-Key: <public-or-internal-key>
+```
+
+```json
+{
+  "risk_tolerance": "balanced",
+  "horizon": "mid",
+  "current_gold_pct": 15.0,
+  "experience": "novice"
+}
+```
+
+第二支柱 Agent：投资者画像 → **确定性规则引擎**产出全部数字（对应画像的研究参考区间、
+当前仓位与区间的差距、结构化风险旗标、期限匹配的观点书证据，均带 `evidence_ref` 溯源）→
+DeepSeek 仅重写语言（按 `experience` 调整解释深度）。双重硬门：叙事校验器逐数校验
+（未着地 → `narrative_critic_reverted` 回退确定性草稿）+ 去指令化检查
+（出现"建议买入/满仓/抄底"类措辞 → `directive_language_reverted` 回退）。
+输出永远是"参考区间/差距/风险提示"框架，附免责声明；**画像随请求携带，服务端不持久化**。
+无 LLM key 时走确定性草稿（`generated_by=deterministic_draft`），功能完整。
+评测护栏：golden set 含 3 条个性化用例，4 个 judge（去指令化/免责/数字着地/风险旗标呈现）
+全部为硬门，进 CI。
+
 ### 3. 反馈入口
 
 ```http

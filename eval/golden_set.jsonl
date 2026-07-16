@@ -3,3 +3,6 @@
 {"case_id": "geopolitics_aggressive", "request": {"question": "地缘冲突升温，黄金 T+30 的机会和风险？", "optional_news_text": "地缘冲突升级，避险资金回流，油价与黄金同步走高。", "risk_profile": "aggressive", "horizon": "30d", "locale": "zh-CN"}}
 {"case_id": "dollar_surge_balanced", "request": {"question": "美元大涨时黄金该怎么办？", "optional_news_text": "美元指数大幅走强，非美货币普遍承压。", "risk_profile": "balanced", "horizon": "24h", "locale": "zh-CN"}}
 {"case_id": "neutral_no_news_conservative", "request": {"question": "现在黄金适合布局吗？", "risk_profile": "conservative", "horizon": "7d", "locale": "zh-CN"}}
+{"case_id": "personal_novice_above_range", "channel": "personal", "request": {"risk_tolerance": "balanced", "horizon": "mid", "current_gold_pct": 20.0, "experience": "novice"}, "expect": {}}
+{"case_id": "personal_short_horizon_aggressive", "channel": "personal", "request": {"risk_tolerance": "aggressive", "horizon": "short", "current_gold_pct": 10.0, "experience": "experienced"}, "expect": {}}
+{"case_id": "personal_professional_within_range", "channel": "personal", "request": {"risk_tolerance": "conservative", "horizon": "long", "current_gold_pct": 5.0, "experience": "professional"}, "expect": {}}
