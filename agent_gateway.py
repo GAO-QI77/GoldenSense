@@ -1933,6 +1933,43 @@ class AgentAnalysisService:
             memory_lookup=memory_lookup,
         )
 
+        # Event-driven news reaction: classify the news text onto the event
+        # taxonomy, fetch historical-analog statistics (real computed forward
+        # returns), and let them tilt -- bounded -- the news analyst below.
+        # High-severity events also invalidate the research-context cache so
+        # the next /quant read recomputes on fresh state (anti-thrash guard:
+        # a cache younger than 15 minutes is kept).
+        analog_prior: Optional[Dict[str, Any]] = None
+        news_classification: Optional[Dict[str, Any]] = None
+        try:
+            from event_classifier import classify_news
+            from event_study import shared_event_library
+
+            class_text = req.optional_news_text or " ".join(
+                f"{item.title} {getattr(item, 'summary', '') or ''}"
+                for item in news.items[:3]
+            )
+            news_classification = classify_news(class_text)
+            if news_classification:
+                analog_prior = shared_event_library.analogs_for(
+                    news_classification["category"]
+                )
+                cache_invalidated = False
+                if news_classification["severity"] == "high":
+                    cache_invalidated = quant_research_context.invalidate(
+                        min_age_seconds=900
+                    )
+                tool_trace.append({
+                    "tool": "knowledge_analogs",
+                    "classification": news_classification,
+                    "analog_prior": analog_prior,
+                    "cache_invalidated": cache_invalidated,
+                })
+        except Exception as exc:  # pragma: no cover - defensive
+            LOGGER.warning(
+                "knowledge_analogs_failed error=%s:%s", type(exc).__name__, exc
+            )
+
         # Deterministic analyst committee: four specialist views fused with
         # regime-conditional weights; disagreement feeds the conflict router.
         # Committee disagreement routes narration to the stronger model and is
@@ -1945,6 +1982,7 @@ class AgentAnalysisService:
             news_sentiment=news_sentiment,
             vix_value=selected_outlook["vix_value"],
             vix_threshold=self._cfg.vix_circuit_breaker_threshold,
+            analog_prior=analog_prior,
         )
 
         bundle = AnalysisBundle(

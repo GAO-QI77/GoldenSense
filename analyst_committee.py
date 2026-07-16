@@ -100,17 +100,52 @@ def flow_analyst(macro_factors: Optional[Dict[str, Any]]) -> AnalystView:
     return AnalystView("flow", stance, 0.4, evidence)
 
 
+# Historical-analog prior: bounded contribution to the news stance, derived
+# from the event-study library (real computed forward returns, never vibes).
+ANALOG_PRIOR_CAP = 0.3
+ANALOG_MIN_SAMPLES = 5
+
+
+def _analog_component(analog_prior: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not analog_prior:
+        return None
+    mean_30d = analog_prior.get("mean_30d")
+    pos_share = analog_prior.get("positive_share_30d")
+    n = analog_prior.get("n_30d") or 0
+    if mean_30d is None or pos_share is None or n < ANALOG_MIN_SAMPLES:
+        return None
+    # Direction/size from the mean (±5% saturates), conviction from how far
+    # the win-rate is from a coin flip. Hard-capped so history can only tilt.
+    magnitude = float(np.clip(float(mean_30d) / 0.05, -1.0, 1.0))
+    conviction = abs(float(pos_share) - 0.5) * 2.0
+    return float(np.clip(magnitude * conviction, -1.0, 1.0) * ANALOG_PRIOR_CAP)
+
+
 def news_analyst(
     news_sentiment: Optional[float],
     vix_value: Optional[float],
     vix_threshold: float = 30.0,
+    *,
+    analog_prior: Optional[Dict[str, Any]] = None,
 ) -> AnalystView:
-    """Reads scored news sentiment plus the VIX risk backdrop."""
+    """Reads scored news sentiment, the VIX backdrop, and -- when the news is
+    classifiable -- a bounded historical-analog prior from the event study."""
     if news_sentiment is None:
         return AnalystView("news", 0.0, 0.1, ["新闻情绪数据不可用。"])
     stance = float(np.clip(news_sentiment, -1.0, 1.0))
     confidence = 0.5
     evidence = [f"近端新闻情绪得分 {news_sentiment:+.2f}。"]
+
+    component = _analog_component(analog_prior)
+    if component is not None:
+        stance = float(np.clip(stance * 0.7 + component, -1.0, 1.0))
+        confidence = min(0.6, confidence + 0.1)
+        evidence.append(
+            f"历史类比：{analog_prior['n_30d']} 次{analog_prior.get('category', '')}类事件后 "
+            f"30 天平均 {float(analog_prior['mean_30d']):+.1%}"
+            f"（正收益占比 {float(analog_prior['positive_share_30d']):.0%}），"
+            f"先验贡献 {component:+.2f}（上限 ±{ANALOG_PRIOR_CAP:.1f}）。"
+        )
     if vix_value is not None:
         if vix_value >= vix_threshold:
             stance = min(stance, 0.0)
@@ -130,13 +165,15 @@ def build_committee(
     news_sentiment: Optional[float] = None,
     vix_value: Optional[float] = None,
     vix_threshold: float = 30.0,
+    analog_prior: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Assemble views, fuse them with regime weights, score disagreement."""
     views = [
         technical_analyst(regime),
         macro_analyst(macro_factors, fair_value),
         flow_analyst(macro_factors),
-        news_analyst(news_sentiment, vix_value, vix_threshold),
+        news_analyst(news_sentiment, vix_value, vix_threshold,
+                     analog_prior=analog_prior),
     ]
 
     vol_state = (regime or {}).get("vol_state", "elevated")

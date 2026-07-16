@@ -44,6 +44,19 @@ class LocalQuantContext:
             self._computed_at = time.time()
             return self._cache
 
+    def invalidate(self, *, min_age_seconds: float = 0.0) -> bool:
+        """Drop the cache so the next request recomputes (event-driven
+        refresh, e.g. after high-severity news). ``min_age_seconds`` is an
+        anti-thrash guard: a cache younger than this is kept."""
+        with self._lock:
+            if self._cache is None:
+                return False
+            if (time.time() - self._computed_at) < min_age_seconds:
+                return False
+            self._cache = None
+            self._computed_at = 0.0
+            return True
+
     def latest_posterior(self) -> Optional[Dict[str, float]]:
         ctx = self.get_context()
         regime = ctx.get("regime_posterior")
