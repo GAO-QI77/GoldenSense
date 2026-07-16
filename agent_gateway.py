@@ -3553,6 +3553,27 @@ def create_app(
             )
         )
 
+    @app.get("/api/v1/agent/knowledge/search")
+    async def knowledge_search(q: str, request: Request) -> JSONResponse:
+        """Unified knowledge retrieval: event-study analogs (real computed
+        forward returns with event citations) + archived decision-relevant
+        news, both sides degrading explicitly."""
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        from knowledge_retriever import search_knowledge
+
+        try:
+            payload = await asyncio.to_thread(search_knowledge, q)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_code": "knowledge_unavailable",
+                    "message": f"{type(exc).__name__}: {exc}",
+                },
+            ) from exc
+        return JSONResponse(content=jsonable_encoder(payload))
+
     def _ledger_records() -> list:
         return app.state.signal_ledger_store.load_all()
 

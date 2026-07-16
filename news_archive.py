@@ -28,6 +28,27 @@ DECISION_THRESHOLD = 0.5
 DECAY_HALF_LIFE_DAYS = 30.0
 
 _WS_RE = re.compile(r"\s+")
+_CJK_RUN_RE = re.compile(r"[一-鿿]+")
+
+
+def _query_terms(query: str) -> List[str]:
+    """Whitespace tokens for latin text; overlapping bigrams for CJK runs
+    (Chinese queries carry no whitespace, so substring matching needs
+    segmentation)."""
+    terms: List[str] = []
+    for token in _WS_RE.split((query or "").strip().lower()):
+        if not token:
+            continue
+        cjk_runs = _CJK_RUN_RE.findall(token)
+        latin = _CJK_RUN_RE.sub(" ", token).strip()
+        if latin:
+            terms.extend(t for t in latin.split() if t)
+        for run in cjk_runs:
+            if len(run) == 1:
+                terms.append(run)
+            else:
+                terms.extend(run[i:i + 2] for i in range(len(run) - 1))
+    return terms
 
 
 def _normalize_title(title: str) -> str:
@@ -145,7 +166,7 @@ class NewsArchive:
     ) -> List[Dict[str, Any]]:
         """Keyword hits x exponential time decay; expired items excluded."""
         now = now or datetime.now(timezone.utc)
-        terms = [t for t in _WS_RE.split((query or "").strip().lower()) if t]
+        terms = _query_terms(query)
         if not terms:
             return []
         results: List[Dict[str, Any]] = []
@@ -153,7 +174,8 @@ class NewsArchive:
             if self._is_expired(record, now):
                 continue
             text = f"{record.get('title', '')} {record.get('summary', '')}".lower()
-            match_strength = sum(1.0 for t in terms if t in text)
+            # Normalized by term count so long queries don't inflate scores.
+            match_strength = sum(1.0 for t in terms if t in text) / len(terms)
             if match_strength == 0:
                 continue
             ts = _parse_ts(record.get("published_at")) or now
