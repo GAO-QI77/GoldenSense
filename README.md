@@ -452,6 +452,33 @@ X-API-Key: <public-or-internal-key>
 分立场/分置信度拆解与最近判定列表。校准结果以硬上限（±20%）反哺委员会置信度，
 `weight_adjustment.basis` 说明依据。
 
+### 2.6 大盘观点书与每周信号台账（新增）
+
+```http
+GET /api/v1/agent/market-view
+X-API-Key: <public-or-internal-key>
+```
+
+统一的三时间尺度「观点书」：短期（1-21 天，仅分布与风险口径——方向预测已被走前验证证伪，
+如实不提供）、中期（HMM 主导状态 + 宏观因子顺逆风）、长期（公允价值偏离 + 情景锥 + 旗舰策略语境）。
+每节含 `core_view / confidence / evidence / invalidation`（失效条件是一等公民），分节独立降级。
+
+```http
+GET  /api/v1/signals/current            # 最新一期发布
+GET  /api/v1/signals/history?limit=52   # 发布历史（append-only 审计链）
+GET  /api/v1/signals/track-record       # 影子组合前向记分卡
+GET  /api/v1/signals/{publication_id}   # 单期永久链接（如 2026-W29）
+POST /api/v1/signals/publish            # 冻结本 ISO 周发布（仅 internal key，幂等）
+```
+
+**每周信号台账**是系统的问责层：每周冻结一条不可变记录（三档参考区间 + 观点书摘要 +
+证据快照 + `sha256` 防篡改哈希），append-only、同周幂等、历史永不重写。追踪记录
+自首次发布起**前向累积**——无任何回填历史；影子组合按各档中点持金（余为现金），
+发布日调仓、含换手成本（默认 5bps）、仅对已成熟周计分，对照恒定权重与买入持有双基准。
+回测归回测（`/research/current` 的 `flagship`），前向归前向（本台账），两者永不混算。
+所有输出附研究参考免责声明。运维：`python3 scripts/publish_signal.py`（cron 安全）或
+`SIGNAL_AUTOPUBLISH_ENABLED=1`（网关启动时补发本周缺失发布）。
+
 ### 3. 反馈入口
 
 ```http
