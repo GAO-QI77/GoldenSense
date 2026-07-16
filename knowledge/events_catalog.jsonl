@@ -1,0 +1,55 @@
+{"event_id": "mp_2004_hike_cycle", "date": "2004-06-30", "category": "monetary_policy", "title": "美联储启动 2004 加息周期", "summary": "联邦基金利率自 1% 首次上调 25bp，开启连续 17 次加息的紧缩周期。"}
+{"event_id": "mp_2007_first_cut", "date": "2007-09-18", "category": "monetary_policy", "title": "美联储降息 50bp 应对次贷压力", "summary": "次贷危机发酵，美联储超预期降息 50bp，宽松周期开启。"}
+{"event_id": "mp_2008_qe1", "date": "2008-11-25", "category": "monetary_policy", "title": "QE1 宣布", "summary": "美联储宣布购买 6000 亿美元机构债与 MBS，量化宽松时代开启。"}
+{"event_id": "mp_2010_qe2", "date": "2010-11-03", "category": "monetary_policy", "title": "QE2 宣布", "summary": "美联储宣布再购 6000 亿美元长期国债，实际利率预期下行。"}
+{"event_id": "mp_2012_qe3", "date": "2012-09-13", "category": "monetary_policy", "title": "QE3 开放式购债宣布", "summary": "美联储宣布每月 400 亿美元 MBS 开放式购买，直至就业改善。"}
+{"event_id": "mp_2013_taper_tantrum", "date": "2013-06-19", "category": "monetary_policy", "title": "伯南克缩减恐慌", "summary": "伯南克给出 QE 退出时间表，实际利率飙升，缩减恐慌爆发。"}
+{"event_id": "mp_2015_liftoff", "date": "2015-12-16", "category": "monetary_policy", "title": "2015 首次加息", "summary": "美联储 2006 年以来首次加息，零利率时代结束。"}
+{"event_id": "mp_2018_dec_hike", "date": "2018-12-19", "category": "monetary_policy", "title": "2018 年 12 月鹰派加息", "summary": "美联储顶住市场抛售压力继续加息并维持缩表'自动驾驶'，风险资产重挫。"}
+{"event_id": "mp_2019_powell_pivot", "date": "2019-01-04", "category": "monetary_policy", "title": "鲍威尔转鸽", "summary": "鲍威尔表态对加息'保持耐心'、缩表灵活，2018 紧缩预期逆转。"}
+{"event_id": "mp_2019_first_cut", "date": "2019-07-31", "category": "monetary_policy", "title": "2008 年以来首次降息", "summary": "美联储降息 25bp，'周期中调整'开启预防式宽松。"}
+{"event_id": "mp_2020_emergency_cut", "date": "2020-03-03", "category": "monetary_policy", "title": "疫情紧急降息 50bp", "summary": "美联储盘中紧急降息 50bp 应对疫情冲击，2008 以来首次非会议降息。"}
+{"event_id": "mp_2020_zero_qe", "date": "2020-03-16", "category": "monetary_policy", "title": "降至零利率并重启 QE", "summary": "美联储周日紧急降息至 0-0.25% 并宣布 7000 亿美元 QE，市场反应剧烈。"}
+{"event_id": "mp_2020_unlimited_qe", "date": "2020-03-23", "category": "monetary_policy", "title": "无限量 QE", "summary": "美联储宣布不设上限购债并推出信用工具，美元流动性危机缓解，实际利率崩落。"}
+{"event_id": "mp_2021_taper", "date": "2021-11-03", "category": "monetary_policy", "title": "2021 缩减购债宣布", "summary": "美联储宣布每月缩减 150 亿美元购债，宽松退坡正式开始。"}
+{"event_id": "mp_2022_liftoff", "date": "2022-03-16", "category": "monetary_policy", "title": "2022 加息周期启动", "summary": "美联储加息 25bp 应对四十年最高通胀，点阵图指向连续紧缩。"}
+{"event_id": "mp_2022_75bp", "date": "2022-06-15", "category": "monetary_policy", "title": "1994 年以来首次 75bp 加息", "summary": "美联储超常规加息 75bp，实际利率快速走高。"}
+{"event_id": "mp_2023_last_hike", "date": "2023-07-26", "category": "monetary_policy", "title": "本轮周期最后一次加息", "summary": "美联储加息至 5.25-5.50% 后进入长期按兵不动，紧缩顶部确认。"}
+{"event_id": "mp_2024_first_cut", "date": "2024-09-18", "category": "monetary_policy", "title": "2024 降息周期开启(50bp)", "summary": "美联储以 50bp 开启宽松周期，实际利率预期下行。"}
+{"event_id": "mp_2025_resume_cuts", "date": "2025-09-17", "category": "monetary_policy", "title": "2025 重启降息", "summary": "美联储在就业走弱背景下恢复降息，宽松预期强化。"}
+{"event_id": "inf_2021_apr_cpi", "date": "2021-05-12", "category": "inflation", "title": "2021 年 4 月 CPI 大超预期", "summary": "美国 CPI 同比 4.2% 远超预期，疫后通胀叙事确立。"}
+{"event_id": "inf_2021_oct_cpi", "date": "2021-11-10", "category": "inflation", "title": "CPI 破 6% 创三十年新高", "summary": "美国 10 月 CPI 同比 6.2%，'暂时性通胀'叙事崩塌，金价单日大涨。"}
+{"event_id": "inf_2022_may_cpi", "date": "2022-06-10", "category": "inflation", "title": "CPI 8.6% 再创新高", "summary": "美国 5 月 CPI 同比 8.6% 打破见顶预期，紧缩预期急剧升温。"}
+{"event_id": "inf_2022_peak_cpi", "date": "2022-07-13", "category": "inflation", "title": "CPI 9.1% 周期顶", "summary": "美国 6 月 CPI 同比 9.1% 触及本轮峰值，市场定价更陡峭加息路径。"}
+{"event_id": "inf_2022_cool_surprise", "date": "2022-11-10", "category": "inflation", "title": "CPI 低于预期的转折", "summary": "美国 10 月 CPI 7.7% 低于预期，通胀见顶交易启动，美元与实际利率回落。"}
+{"event_id": "inf_2023_cooling", "date": "2023-06-13", "category": "inflation", "title": "CPI 回落至 4%", "summary": "美国 5 月 CPI 同比降至 4.0%，去通胀路径确认，紧缩预期见顶。"}
+{"event_id": "inf_2008_oil_peak", "date": "2008-07-16", "category": "inflation", "title": "2008 油价通胀峰值", "summary": "油价冲上历史高位后 CPI 同比 5.6% 触顶，随后需求崩塌逆转为通缩恐慌。"}
+{"event_id": "geo_2014_crimea", "date": "2014-03-03", "category": "geopolitics", "title": "俄罗斯出兵克里米亚", "summary": "俄乌冲突升级，避险需求推升黄金。"}
+{"event_id": "geo_2016_brexit", "date": "2016-06-24", "category": "geopolitics", "title": "英国脱欧公投结果", "summary": "脱欧意外通过，英镑暴跌，黄金单日大涨创多年最大涨幅之一。"}
+{"event_id": "geo_2016_us_election", "date": "2016-11-09", "category": "geopolitics", "title": "2016 美国大选意外结果", "summary": "特朗普当选引发政策不确定性，黄金冲高后随再通胀交易回落。"}
+{"event_id": "geo_2017_nk_tension", "date": "2017-08-09", "category": "geopolitics", "title": "朝鲜半岛'火与怒'紧张", "summary": "美朝言辞升级引发地缘避险，黄金走强。"}
+{"event_id": "geo_2018_trade_war", "date": "2018-03-22", "category": "geopolitics", "title": "对华关税宣布(贸易战开启)", "summary": "美国宣布对华 500 亿美元关税计划，全球贸易摩擦时代开启。"}
+{"event_id": "geo_2019_tariff_escalation", "date": "2019-08-01", "category": "geopolitics", "title": "2019 关税升级", "summary": "美方宣布对剩余 3000 亿美元中国商品加征关税，避险与降息预期同步升温。"}
+{"event_id": "geo_2019_aramco", "date": "2019-09-16", "category": "geopolitics", "title": "沙特阿美设施遇袭", "summary": "无人机袭击致沙特原油供应减半，中东风险溢价飙升。"}
+{"event_id": "geo_2020_soleimani", "date": "2020-01-03", "category": "geopolitics", "title": "美军击杀苏莱曼尼", "summary": "美伊冲突骤然升级，黄金跳涨至七年高位。"}
+{"event_id": "geo_2022_ukraine", "date": "2022-02-24", "category": "geopolitics", "title": "俄罗斯全面入侵乌克兰", "summary": "欧洲爆发大规模战争，黄金避险冲高，随后被激进加息压制。"}
+{"event_id": "geo_2023_hamas", "date": "2023-10-09", "category": "geopolitics", "title": "哈马斯袭击以色列(市场反应日)", "summary": "中东冲突骤起，黄金自超卖区连续反弹。"}
+{"event_id": "geo_2024_iran_strike", "date": "2024-04-15", "category": "geopolitics", "title": "伊朗直接打击以色列(市场反应日)", "summary": "中东局势历史性升级，金价在央行购金背景下续创新高。"}
+{"event_id": "geo_2025_tariff_shock", "date": "2025-04-02", "category": "geopolitics", "title": "2025 全面对等关税宣布", "summary": "美国宣布大范围对等关税，全球贸易与滞胀担忧共振，黄金避险买盘涌入。"}
+{"event_id": "geo_2025_israel_iran", "date": "2025-06-13", "category": "geopolitics", "title": "以伊直接冲突爆发", "summary": "以色列空袭伊朗核设施引发直接战争，油价金价同步跳涨。"}
+{"event_id": "usd_2011_sp_downgrade", "date": "2011-08-08", "category": "usd", "title": "标普下调美国主权评级(市场反应日)", "summary": "美国历史上首次失去 AAA 评级，美元信用担忧推动黄金冲向历史高位。"}
+{"event_id": "usd_2015_dxy_100", "date": "2015-03-13", "category": "usd", "title": "美元指数十二年来首破 100", "summary": "欧央行 QE 与美联储加息预期分化推动美元大周期走强，压制金价。"}
+{"event_id": "usd_2017_dxy_peak", "date": "2017-01-03", "category": "usd", "title": "美元指数十四年高点", "summary": "再通胀交易推动 DXY 触及 103 上方周期顶，随后全年回落。"}
+{"event_id": "usd_2020_liquidity_crunch", "date": "2020-03-19", "category": "usd", "title": "美元流动性危机峰值", "summary": "全球疯抢美元致 DXY 冲上 102，黄金被无差别抛售，流动性溢价极端化。"}
+{"event_id": "usd_2022_dxy_114", "date": "2022-09-26", "category": "usd", "title": "美元指数 20 年高点(英国迷你预算冲击)", "summary": "英国减税预算引发英镑危机，DXY 触及 114，金价承压至周期低点。"}
+{"event_id": "flow_2008_lehman", "date": "2008-09-15", "category": "flows", "title": "雷曼兄弟破产", "summary": "系统性金融危机爆发，先流动性抛售后避险买盘，黄金剧烈波动。"}
+{"event_id": "flow_2009_china_reserves", "date": "2009-04-24", "category": "flows", "title": "中国披露黄金储备大增", "summary": "中国宣布黄金储备增至 1054 吨，央行购金叙事进入市场。"}
+{"event_id": "flow_2011_chf_peg", "date": "2011-09-06", "category": "flows", "title": "瑞士央行设定瑞郎上限", "summary": "避险货币瑞郎被钉住欧元，避险资金转向黄金，金价触及 1920 历史高位后回落。"}
+{"event_id": "flow_2013_gold_crash", "date": "2013-04-15", "category": "flows", "title": "黄金单日暴跌 9%", "summary": "塞浦路斯抛售传闻叠加 ETF 巨量流出，黄金遭遇三十年最大单日跌幅。"}
+{"event_id": "flow_2015_china_update", "date": "2015-07-20", "category": "flows", "title": "中国储备更新不及预期与闪崩", "summary": "中国六年来首次更新黄金储备数据低于预期，亚洲盘黄金闪崩至五年低点。"}
+{"event_id": "flow_2020_covid_liquidation", "date": "2020-03-12", "category": "flows", "title": "疫情恐慌无差别抛售", "summary": "全球市场熔断连环触发，黄金随风险资产同步被抛售换取美元流动性。"}
+{"event_id": "flow_2020_ath", "date": "2020-08-06", "category": "flows", "title": "黄金首破 2070 历史新高", "summary": "实际利率深度为负叠加 ETF 创纪录流入，金价刷新历史高位。"}
+{"event_id": "flow_2022_cb_record", "date": "2022-11-01", "category": "flows", "title": "央行购金创纪录(WGC 三季报)", "summary": "世界黄金协会披露 Q3 央行购金近 400 吨创纪录，去美元化配置叙事确立。"}
+{"event_id": "flow_2023_svb", "date": "2023-03-10", "category": "flows", "title": "硅谷银行倒闭", "summary": "美国区域银行危机爆发，降息预期骤升，避险资金涌入黄金。"}
+{"event_id": "flow_2024_breakout", "date": "2024-03-04", "category": "flows", "title": "黄金突破两千一百创新高", "summary": "央行持续购金与降息预期共振，金价突破长期盘整区开启主升。"}
+{"event_id": "flow_2025_3000", "date": "2025-03-14", "category": "flows", "title": "黄金首破 3000 美元", "summary": "关税避险、央行购金与 ETF 回流共振，金价历史性突破 3000 关口。"}
