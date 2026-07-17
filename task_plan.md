@@ -124,6 +124,21 @@ C) 可搜索、美观、金色科技感的前端产品（modern_showcase_site �
 - 重要修复: env_loader 引入后 .env 的 INFERENCE_MODEL_CHECKPOINTS_DIR_T1 覆盖测试
   显式参数导致套件死锁——已修优先级(显式>env)+ conftest 剥离 .env 影响
   (LLM key/预热线程/checkpoint 目录),测试套件与开发者 .env 完全隔离
+- P7 严重层(2026-07-17): complete —
+  S1 订阅周报: subscriptions.py(JSONL+退订令牌+SMTP/log_only 诚实降级)、
+    POST /api/v1/subscriptions + 免鉴权退订链接、发布时自动 fan-out(--no-digest 可关)、
+    SignalsPage 订阅卡
+  S4 跨资产: cross_asset.py(63d 滚动相关+1y 对照)入 research_context,SignalsPage 面板
+    (实测: 白银 0.82/美元 -0.57/美债 -0.33,符合直觉)
+  S5 健康检查: scripts/health_check.py(网关/新鲜度/5xx/周发布,cron 出口码+webhook),
+    实盘全绿;注意 /metrics 需 internal key
+  S3 RAG: 事件目录 127 条(5 类全覆盖);refresh_once 接新闻自动归档(语料自动累积);
+    README 运维手册(cron 三件套+SMTP/webhook/pgvector docker 指引)
+  S2 渐进披露: viewMode(默认简明,localStorage),首页折叠指标审计/来源健康/引用,
+    signals 折叠证据链/哈希/历史表(失效条件与免责永不隐藏);顶栏 search-trigger
+    纵向换行遮挡 bug 根治(white-space:nowrap+topbar-right wrap);事件横幅改标题级
+    严重度判定(summary 关键词密集导致普通行情误报全站横幅)
+- 测试: 328 passed / 0 failed;评测门 8/8;e2e 10/10(含简明模式新用例);build 通过
 
 ### Phase 12: 推送、PR、CI、部署
 - Status: blocked-on-user（仅剩合并一步）
