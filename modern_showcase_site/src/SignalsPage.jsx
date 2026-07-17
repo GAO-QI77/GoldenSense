@@ -32,6 +32,9 @@ const horizonMeta = {
 
 const confidenceTone = { 高: 'bull', 中: 'neutral', 低: 'risk' };
 
+// eslint-disable-next-line import/order
+import { useViewMode } from './viewMode';
+
 function headers() {
   return { 'X-API-Key': API_KEY };
 }
@@ -51,6 +54,8 @@ async function fetchJson(url, { allow404 = false } = {}) {
 }
 
 export default function SignalsPage() {
+  const { mode } = useViewMode();
+  const isPro = mode === 'pro';
   const [book, setBook] = useState(null);
   const [current, setCurrent] = useState(null);
   const [history, setHistory] = useState([]);
@@ -153,11 +158,13 @@ export default function SignalsPage() {
                 {section?.available ? (
                   <>
                     <p className="view-book-core">{section.core_view}</p>
-                    <div className="view-book-evidence">
-                      {(section.evidence || []).slice(0, 3).map((line) => (
-                        <span key={line}>{line}</span>
-                      ))}
-                    </div>
+                    {isPro ? (
+                      <div className="view-book-evidence">
+                        {(section.evidence || []).slice(0, 3).map((line) => (
+                          <span key={line}>{line}</span>
+                        ))}
+                      </div>
+                    ) : null}
                     <div className="view-book-invalidation">
                       <strong>失效条件</strong>
                       <ul>
@@ -198,11 +205,13 @@ export default function SignalsPage() {
                   </div>
                 ))}
               </div>
-              <div className="ledger-hash">
-                <Fingerprint size={13} />
-                <code>{current.content_hash?.slice(0, 26)}…</code>
-                <span>发布于 {new Date(current.published_at).toLocaleString('zh-CN', { hour12: false })}</span>
-              </div>
+              {isPro ? (
+                <div className="ledger-hash">
+                  <Fingerprint size={13} />
+                  <code>{current.content_hash?.slice(0, 26)}…</code>
+                  <span>发布于 {new Date(current.published_at).toLocaleString('zh-CN', { hour12: false })}</span>
+                </div>
+              ) : null}
               <p className="disclaimer">{current.disclaimer}</p>
             </>
           ) : (
@@ -254,6 +263,13 @@ export default function SignalsPage() {
         </section>
       </section>
 
+      {!isPro ? (
+        <p className="muted-copy simple-mode-hint">
+          简明模式已折叠证据链、防篡改哈希与发布历史审计表——右上角切换「专业」查看完整审计链。
+        </p>
+      ) : null}
+
+      {isPro ? (
       <section className="panel-block ledger-history">
         <div className="panel-title">
           <ScrollText size={16} />
@@ -287,6 +303,7 @@ export default function SignalsPage() {
           <p className="muted-copy">尚无发布记录。</p>
         )}
       </section>
+      ) : null}
 
       <CrossAssetPanel />
 

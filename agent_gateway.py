@@ -3676,7 +3676,10 @@ def create_app(
                 "黄金 宏观 政策 地缘 风险", limit=6
             )
             for item in news.items:
-                classification = classify_news(f"{item.title} {item.summary or ''}")
+                # Severity is judged on the headline alone: summaries of
+                # routine market wraps are keyword-dense and would cry wolf
+                # on a site-wide banner.
+                classification = classify_news(item.title or "")
                 if classification and classification["severity"] == "high":
                     payload.update({
                         "active": True,

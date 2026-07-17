@@ -1749,6 +1749,10 @@ select {
   align-items: center;
   justify-content: flex-end;
   gap: 12px;
+  /* Overflowing content must wrap to a second row, never spill left over
+     the nav (flex-end overflow extends leftward and covers neighbours). */
+  flex-wrap: wrap;
+  min-width: 0;
 }
 
 .search-trigger {
@@ -1761,6 +1765,10 @@ select {
   background: rgba(236, 211, 154, 0.06);
   color: rgba(245, 240, 230, 0.82);
   font-size: 0.85rem;
+  /* Never wrap vertically: a squeezed topbar once made this button 132px
+     tall and it silently covered its neighbours (unclickable toggle). */
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .search-trigger:hover {
@@ -3151,6 +3159,41 @@ select {
 .narrative-status.pending { color: var(--gold-bright, #e8c979); }
 .narrative-status.ok { color: #9aae8f; }
 .narrative-status.muted { color: var(--text-dim, #97917f); }
+
+/* view mode toggle */
+.view-mode-toggle {
+  display: inline-flex;
+  border: 1px solid rgba(201, 154, 56, 0.3);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.view-mode-toggle button {
+  background: none;
+  border: none;
+  color: var(--text-dim, #97917f);
+  font-size: 0.76rem;
+  padding: 6px 13px;
+  cursor: pointer;
+  letter-spacing: 0.04em;
+}
+.view-mode-toggle button.active {
+  background: linear-gradient(120deg, rgba(201, 154, 56, 0.85), rgba(232, 201, 121, 0.8));
+  color: #17140d;
+  font-weight: 600;
+}
+.simple-mode-hint { margin-top: 10px; font-size: 0.76rem; }
+
+.view-mode-toggle { flex-shrink: 0; }
+.view-mode-toggle button { white-space: nowrap; }
+
+@media (max-width: 900px) {
+  /* Compact topbar: icon-only search, tighter toggle, allow wrapping. */
+  .topbar-right { flex-wrap: wrap; }
+  .search-trigger span,
+  .search-trigger kbd { display: none; }
+  .view-mode-toggle button { padding: 5px 10px; font-size: 0.7rem; }
+  .compliance-pill { display: none; }
+}
 
 /* cross-asset panel */
 .cross-asset-grid { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }

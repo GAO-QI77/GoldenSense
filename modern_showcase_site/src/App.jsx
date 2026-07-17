@@ -39,6 +39,7 @@ import SignalsPage from './SignalsPage';
 import { AdvancedProfileFields, CoreProfileFields } from './profileFields';
 import { loadProfile, saveProfile, toLegacyAnalyzeProfile } from './profileStore';
 import { addSearchEntries } from './searchIndex';
+import { ViewModeContext, loadViewMode, saveViewMode, useViewMode } from './viewMode';
 
 const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
 const DASHBOARD_URL =
@@ -153,6 +154,13 @@ function App() {
 }
 
 function AppShell({ children }) {
+  const [mode, setModeState] = useState(loadViewMode);
+
+  function setMode(next) {
+    setModeState(next);
+    saveViewMode(next);
+  }
+
   useEffect(() => {
     addSearchEntries('pages', [
       { id: 'page-dashboard', source: 'pages', title: '研究主页', hint: '三周期预测、指标证据与近端新闻', route: '/', keywords: ['dashboard', '主页', '预测', '指标'] },
@@ -211,6 +219,22 @@ function AppShell({ children }) {
         </nav>
 
         <div className="topbar-right">
+          <div className="view-mode-toggle" role="group" aria-label="视图模式">
+            <button
+              type="button"
+              className={mode === 'simple' ? 'active' : ''}
+              onClick={() => setMode('simple')}
+            >
+              简明
+            </button>
+            <button
+              type="button"
+              className={mode === 'pro' ? 'active' : ''}
+              onClick={() => setMode('pro')}
+            >
+              专业
+            </button>
+          </div>
           <GlobalSearch />
           <div className="compliance-pill">
             <ShieldCheck size={15} />
@@ -219,12 +243,16 @@ function AppShell({ children }) {
         </div>
       </header>
       <EventAlertBanner />
-      {children}
+      <ViewModeContext.Provider value={{ mode, setMode }}>
+        {children}
+      </ViewModeContext.Provider>
     </div>
   );
 }
 
 function DashboardPage() {
+  const { mode } = useViewMode();
+  const isPro = mode === 'pro';
   const [dashboard, setDashboard] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -364,19 +392,26 @@ function DashboardPage() {
           />
           <div className="indicator-grid">
             {groups.length ? (
-              groups.map((group) => <IndicatorGroupCard key={group.id} group={group} />)
+              groups.map((group) => (
+                <IndicatorGroupCard key={group.id} group={group} showDetails={isPro} />
+              ))
             ) : (
               <PlaceholderPanel icon={Gauge} text={loading ? '正在读取指标柱。' : '暂无指标数据。'} />
             )}
           </div>
+          {!isPro ? (
+            <p className="muted-copy simple-mode-hint">
+              简明模式已折叠逐项指标审计与来源健康监控——右上角切换「专业」查看全部方法论细节。
+            </p>
+          ) : null}
         </div>
 
         <aside className="side-rail">
           <MarketViewSummaryPanel />
           <QualityPanel quality={dataQuality} flags={degradationFlags} />
-          <SourceHealthPanel sources={sourceHealth} loading={loading} />
+          {isPro ? <SourceHealthPanel sources={sourceHealth} loading={loading} /> : null}
           <NewsPanel news={news} loading={loading} />
-          <CitationPanel citations={citations} />
+          {isPro ? <CitationPanel citations={citations} /> : null}
           <Link className="agent-entry" to="/advisor">
             <span>
               <strong>生成个性化研究分析</strong>
@@ -1004,9 +1039,27 @@ function ForecastCard({ forecast }) {
   );
 }
 
-function IndicatorGroupCard({ group }) {
+function IndicatorGroupCard({ group, showDetails = true }) {
   const Icon = groupIcons[group.id] || Gauge;
   const [openIndicatorId, setOpenIndicatorId] = useState(null);
+  if (!showDetails) {
+    return (
+      <article className={`indicator-card status-${group.status}`}>
+        <div className="indicator-card-head">
+          <span>
+            <Icon size={16} />
+            {group.title}
+          </span>
+          <QualityDot status={group.status} />
+        </div>
+        <p>{group.summary}</p>
+        <div className="score-line">
+          <span>score {group.score.toFixed(2)}</span>
+          <span>{group.freshness_seconds}s</span>
+        </div>
+      </article>
+    );
+  }
   return (
     <article className={`indicator-card status-${group.status}`}>
       <div className="indicator-card-head">

@@ -229,7 +229,13 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
+async function usePro(page) {
+  // These assertions cover methodology internals that simple mode folds away.
+  await page.addInitScript(() => window.localStorage.setItem('gs_view_mode', 'pro'));
+}
+
 test('dashboard presents forecasts and four indicator pillars', async ({ page }) => {
+  await usePro(page);
   await page.goto('/');
 
   await expect(page.getByRole('heading', { name: '黄金价格预测与指标总览' })).toBeVisible();
@@ -253,6 +259,7 @@ test('dashboard presents forecasts and four indicator pillars', async ({ page })
 });
 
 test('dashboard exposes source audit details for each indicator', async ({ page }) => {
+  await usePro(page);
   await page.goto('/');
 
   await page.getByRole('button', { name: '审计 基本面A' }).click();
@@ -289,6 +296,21 @@ test('agent submits full investor profile and renders risk briefing', async ({ p
   await expect(page.getByText('量化引擎当前不可用')).toHaveCount(0);
   await expect(page.getByRole('heading', { name: '用户风险画像' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '三情景执行框架' })).toBeVisible();
+});
+
+test('simple mode hides methodology internals until toggled', async ({ page }) => {
+  await page.goto('/');
+
+  // Default is simple: audits and source health are folded away...
+  await expect(page.getByRole('heading', { name: '今日核心结论' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '数据源健康监控' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '审计 基本面A' })).toHaveCount(0);
+  await expect(page.getByText('简明模式已折叠逐项指标审计')).toBeVisible();
+
+  // ...and the topbar toggle reveals them without a reload.
+  await page.getByRole('button', { name: '专业', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '数据源健康监控' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '审计 基本面A' })).toBeVisible();
 });
 
 test('mobile dashboard does not create horizontal overflow', async ({ page }) => {
