@@ -49,10 +49,10 @@ def test_cli_main_returns_zero(tmp_path, monkeypatch):
     monkeypatch.setenv("SIGNAL_LEDGER_PATH", str(ledger_path))
     # Avoid the heavy research-context compute in the unit test.
     monkeypatch.setattr("scripts.publish_signal._load_ctx", _ctx)
-    assert cli_main() == 0
+    assert cli_main(["--no-digest"]) == 0
     lines = ledger_path.read_text().strip().splitlines()
     assert len(lines) == 1
     assert json.loads(lines[0])["content_hash"].startswith("sha256:")
     # Second run: idempotent, still exit 0, still one line.
-    assert cli_main() == 0
+    assert cli_main(["--no-digest"]) == 0
     assert len(ledger_path.read_text().strip().splitlines()) == 1

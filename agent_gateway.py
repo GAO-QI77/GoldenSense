@@ -64,6 +64,7 @@ from signal_ledger import (
     publish_weekly,
     score_track_record,
 )
+from subscriptions import SubscriptionStore, mask_email, send_digest
 from outcome_tracker import (
     backfill_outcomes,
     calibration_summary,
@@ -85,6 +86,12 @@ class RiskResult(TypedDict):
     current_vix: Optional[float]
     vix_threshold: float
     notes: str
+
+
+class SubscriptionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=5, max_length=254)
 
 
 class AgentTriggerRequest(BaseModel):
@@ -3240,6 +3247,7 @@ def create_app(
     trace_store: Optional[AgentTraceStore] = None,
     http_client: Optional[httpx.AsyncClient] = None,
     signal_ledger_store: Optional[Any] = None,
+    subscription_store: Optional[Any] = None,
 ) -> FastAPI:
     tool_timeout_seconds = float(_env("AGENT_TOOL_TIMEOUT_SECONDS", "35.0"))
     tool_connect_timeout_seconds = float(_env("AGENT_TOOL_CONNECT_TIMEOUT_SECONDS", "1.5"))
@@ -3295,6 +3303,9 @@ def create_app(
         )
         app.state.signal_ledger_store = signal_ledger_store or JsonlLedgerStore(
             _env("SIGNAL_LEDGER_PATH", "data_cache/signal_ledger.jsonl")
+        )
+        app.state.subscription_store = subscription_store or SubscriptionStore(
+            _env("SUBSCRIPTIONS_PATH", "data_cache/subscriptions.jsonl")
         )
         app.state.trace_store = trace_store or AgentTraceStore(
             database_url,
@@ -3605,6 +3616,40 @@ def create_app(
                 }
             )
         )
+
+    @app.post("/api/v1/subscriptions")
+    async def subscribe(req: SubscriptionRequest, request: Request) -> JSONResponse:
+        """Subscribe to the weekly signal digest. Emails live only in the
+        local gitignored store, keyed with an unsubscribe token; the token is
+        never returned via the API (it travels inside the digest mail)."""
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        try:
+            result = await asyncio.to_thread(
+                app.state.subscription_store.subscribe, req.email
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "invalid_email", "message": str(exc)},
+            ) from exc
+        return JSONResponse(content={
+            "email_masked": mask_email(result["email"]),
+            "created": result["created"],
+        })
+
+    @app.get("/api/v1/subscriptions/unsubscribe")
+    async def unsubscribe(token: str, request: Request) -> JSONResponse:
+        """One-click unsubscribe from the digest mail. No API key: the link
+        must work from any mail client; the token itself is the credential."""
+        removed = await asyncio.to_thread(
+            app.state.subscription_store.unsubscribe, token
+        )
+        return JSONResponse(content={
+            "unsubscribed": removed,
+            "message": "已退订，本邮箱不会再收到每周信号。" if removed
+            else "退订链接无效或已退订。",
+        })
 
     @app.get("/api/v1/agent/event-alert")
     async def event_alert(request: Request) -> JSONResponse:
