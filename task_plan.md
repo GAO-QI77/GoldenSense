@@ -110,12 +110,20 @@ C) 可搜索、美观、金色科技感的前端产品（modern_showcase_site �
   （相关性过滤/去重/180 天 TTL/衰减检索/CJK 二元切分）、knowledge/search 端点
 - P4 新闻反应: complete — news_analyst 类比先验（±0.3 硬上限，n<5 不启用，不碰 stance
   门控）、research_context.invalidate（15min 防抖）、高严重度事件触发
-- P5 前端: in-progress — AdvisorPage/SignalsPage 已建、App 路由/导航/搜索/首页观点书
-  面板已接、vite 代理补 /api/v1/signals、CSS 已加；待: npm build + 浏览器实测
-  （Bash 分类器临时不可用，恢复后执行）
-- 测试: 288 passed / 0 failed；评测门 8/8
-- DeepSeek: 代码已接好（LLM_PROVIDER=deepseek 默认），本机 env 尚无 DEEPSEEK_API_KEY，
-  填入 .env 即生效，无 key 走确定性草稿
+- P5 前端: complete — AdvisorPage/SignalsPage、首页观点书面板、vite 代理、浏览器实测通过
+- P6 致命层: complete —
+  ①统一画像体系: 画像进阶层(4 可选字段+3 错配规则)、前端共享 profileStore(v2+v1迁移)、
+    AgentPage 弃 9 字段问卷改共享画像+toLegacyAnalyzeProfile 适配器(/analyze 契约零改动)、
+    风险预算全%化去建议化；两页画像实测互通
+  ②两段式生成: mode=draft 端点(实测 19ms 出全部数字)→ 前端草稿秒渲染+「润色中」状态
+    → DeepSeek 完成后原位替换(浏览器实测完整闭环)
+  ③事件横幅: /event-alert 端点(5min 进程缓存,降级不报错)+ EventAlertBanner 全站挂载
+- 测试: 305 passed / 0 failed(64s)；评测门 8/8；e2e 8/8；npm build 通过
+- DeepSeek: .env key 已配置并实测接通(generated_by=llm,critic 4 数字全着地)；
+  LLM_TIMEOUT_SECONDS 上调 45s(12s 会超时)
+- 重要修复: env_loader 引入后 .env 的 INFERENCE_MODEL_CHECKPOINTS_DIR_T1 覆盖测试
+  显式参数导致套件死锁——已修优先级(显式>env)+ conftest 剥离 .env 影响
+  (LLM key/预热线程/checkpoint 目录),测试套件与开发者 .env 完全隔离
 
 ### Phase 12: 推送、PR、CI、部署
 - Status: blocked-on-user（仅剩合并一步）
