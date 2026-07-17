@@ -58,8 +58,47 @@ def refresh_once(*, cache_dir: Optional[str] = None) -> dict:
     except Exception as exc:
         summary["context_error"] = f"{type(exc).__name__}: {exc}"
 
+    # Decision-relevant news accrues into the archive on every refresh, so
+    # the RAG corpus builds itself over time. Never blocks the main flow.
+    summary["news_archive"] = archive_recent_news()
+
     summary["elapsed_ms"] = int((time.time() - started) * 1000)
     return summary
+
+
+def archive_recent_news(*, fetch_items=None, archive=None) -> dict:
+    """Fetch recent RSS items and ingest them into the news archive.
+
+    ``fetch_items``/``archive`` are injectable for tests. Failures degrade to
+    a summary dict -- the dataset refresh must never fail because a feed is
+    down.
+    """
+    try:
+        if archive is None:
+            from news_archive import NewsArchive
+
+            archive = NewsArchive(
+                os.environ.get("NEWS_ARCHIVE_PATH", "data_cache/news_archive.jsonl")
+            )
+        if fetch_items is None:
+            from data_loader import NewsDataLoader
+
+            fetch_items = NewsDataLoader().fetch_news
+        items = fetch_items() or []
+        normalized = [
+            {
+                "title": item.get("title"),
+                "summary": item.get("summary"),
+                "source": item.get("source"),
+                "published_at": item.get("published_at") or item.get("published"),
+            }
+            for item in items
+        ]
+        report = archive.ingest(normalized)
+        report["fetched"] = len(normalized)
+        return report
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 def _log(summary: dict) -> None:

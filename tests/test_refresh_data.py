@@ -57,3 +57,37 @@ def test_main_returns_zero_when_local_csv_available():
     # the research context assemble, so cron should exit 0 (usable dataset).
     rc = refresh_data.main()
     assert rc in (0, 1)  # 0 when local CSV present; 1 only if context empty
+
+
+# --------------------------- news auto-archival ---------------------------- #
+def test_archive_recent_news_ingests_relevant_items(tmp_path):
+    from news_archive import NewsArchive
+    from scripts.refresh_data import archive_recent_news
+
+    archive = NewsArchive(tmp_path / "archive.jsonl")
+
+    def fake_fetch():
+        return [
+            {"title": "美联储宣布加息 75 个基点", "summary": "通胀创四十年新高",
+             "published": "2026-07-16", "source": "feed"},
+            {"title": "本地球队夺冠", "summary": "体育新闻", "published": "2026-07-16",
+             "source": "feed"},
+        ]
+
+    report = archive_recent_news(fetch_items=fake_fetch, archive=archive)
+    assert report["fetched"] == 2
+    assert report["kept"] == 1
+    assert report["dropped"] == 1
+
+
+def test_archive_recent_news_degrades_on_feed_failure(tmp_path):
+    from news_archive import NewsArchive
+    from scripts.refresh_data import archive_recent_news
+
+    def broken_fetch():
+        raise RuntimeError("feed down")
+
+    report = archive_recent_news(
+        fetch_items=broken_fetch, archive=NewsArchive(tmp_path / "a.jsonl")
+    )
+    assert "RuntimeError" in report["error"]

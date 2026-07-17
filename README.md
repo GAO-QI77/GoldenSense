@@ -657,6 +657,27 @@ Railway、Neon 初始化和 Vercel 环境变量详见 [`DEPLOYMENT_DOC.md`](DEPL
 
 黑客松首发不购买行情或新闻 API。若公开体验需要更稳定的黄金现货价格，优先评估 Metals.Dev Silver：`$9.99/月`、`10,000 requests/月`，配合 5 分钟缓存使用。
 
+## 运维手册（工业运行标准）
+
+```bash
+# 每 30 分钟健康检查（网关可达/数据新鲜度/5xx 率/本周发布是否存在；失败退出码 1）
+*/30 * * * * cd /path/to/repo && python3 scripts/health_check.py
+# 每周一发布信号 + 订阅者周报（幂等，重复执行安全）
+0 9 * * 1 cd /path/to/repo && python3 scripts/publish_signal.py
+# 每日数据刷新 + 新闻自动归档（RAG 语料自动累积，feed 失败不影响主流程）
+0 7 * * * cd /path/to/repo && python3 scripts/refresh_data.py
+```
+
+- 告警：设 `ALERT_WEBHOOK_URL`（Slack 兼容）后健康检查失败自动推送；不设则以退出码供 cron 邮件/CI 捕获。
+- 周报投递：设 `SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASSWORD/SMTP_FROM` 启用真实邮件；
+  未配置时降级为 `log_only` 并在报告中如实标注（绝不假装已送达）。订阅邮箱只存本地
+  `data_cache/subscriptions.jsonl`（gitignored），退订链接免鉴权、按事件幂等。
+- 记忆服务（pgvector 历史事件检索）一键启用：
+  `docker compose up -d postgres && python3 memory_ingestion.py && docker compose up -d memory`；
+  未启用时 /analyze 的历史类比检索走显式降级路径，不影响其余功能。
+- 事件研究库 `knowledge/events_catalog.jsonl`（127 条人工精选，统计由价格数据实时计算、
+  零手写）；新闻精选档案随每日刷新自动累积（决策相关性过滤 + 180 天 TTL）。
+
 ## 已知限制
 
 - 本项目是教育型辅助系统，不构成投资建议。
