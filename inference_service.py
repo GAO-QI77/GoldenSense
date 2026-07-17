@@ -353,13 +353,22 @@ def create_app(
     market_loader: Optional[MarketDataProvider] = None,
     news_loader: Optional[NewsDataProvider] = None,
     feature_engineer: Optional[FeatureEngineer] = None,
-    model_checkpoints_dir_t1: str = "model_checkpoints",
-    model_checkpoints_dir_t7: str = "model_checkpoints",
+    model_checkpoints_dir_t1: Optional[str] = None,
+    model_checkpoints_dir_t7: Optional[str] = None,
 ) -> FastAPI:
     app = FastAPI()
     app_env = os.environ.get("APP_ENV", "development").lower()
-    model_checkpoints_dir_t1 = os.environ.get("INFERENCE_MODEL_CHECKPOINTS_DIR_T1", model_checkpoints_dir_t1)
-    model_checkpoints_dir_t7 = os.environ.get("INFERENCE_MODEL_CHECKPOINTS_DIR_T7", model_checkpoints_dir_t7)
+    # Precedence: explicit argument > environment > default. An explicitly
+    # injected directory (tests, embedding callers) must never be silently
+    # overridden by a developer's .env.
+    if model_checkpoints_dir_t1 is None:
+        model_checkpoints_dir_t1 = os.environ.get(
+            "INFERENCE_MODEL_CHECKPOINTS_DIR_T1", "model_checkpoints"
+        )
+    if model_checkpoints_dir_t7 is None:
+        model_checkpoints_dir_t7 = os.environ.get(
+            "INFERENCE_MODEL_CHECKPOINTS_DIR_T7", "model_checkpoints"
+        )
 
     svc_models: Dict[str, DynamicEnsemble] = {
         "T+1": model_t1 or DynamicEnsemble(tabular_input_dim=15, seq_input_dim=4),
