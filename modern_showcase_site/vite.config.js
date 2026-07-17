@@ -18,6 +18,10 @@ export default defineConfig(({ mode }) => {
           target: proxyTarget,
           changeOrigin: true,
         },
+        '/api/v1/subscriptions': {
+          target: proxyTarget,
+          changeOrigin: true,
+        },
       },
     },
   };

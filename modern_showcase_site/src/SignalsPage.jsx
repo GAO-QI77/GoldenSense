@@ -3,9 +3,11 @@ import {
   AlertTriangle,
   BookOpenCheck,
   CalendarClock,
+  CheckCircle2,
   FileClock,
   Fingerprint,
   Loader2,
+  Mail,
   Radar,
   ScrollText,
   ShieldCheck,
@@ -16,6 +18,10 @@ const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
 const MARKET_VIEW_URL =
   import.meta.env.VITE_AGENT_MARKET_VIEW_URL || API_URL.replace('/analyze', '/market-view');
 const SIGNALS_BASE = import.meta.env.VITE_SIGNALS_BASE_URL || '/api/v1/signals';
+const SUBSCRIBE_URL =
+  import.meta.env.VITE_SUBSCRIBE_URL || '/api/v1/subscriptions';
+const RESEARCH_URL =
+  import.meta.env.VITE_AGENT_RESEARCH_URL || API_URL.replace('/analyze', '/research/current');
 const API_KEY = import.meta.env.VITE_AGENT_API_KEY || 'dev-public-key';
 
 const horizonMeta = {
@@ -282,10 +288,142 @@ export default function SignalsPage() {
         )}
       </section>
 
+      <CrossAssetPanel />
+
+      <DigestSubscribeCard />
+
       <footer className="terminal-footer">
         <span>GoldenSense Signal Ledger</span>
         <span>不可变发布 · 成熟周计分 · 双基准对照 · 非投资建议</span>
       </footer>
     </main>
+  );
+}
+
+function CrossAssetPanel() {
+  const [cross, setCross] = useState(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch(RESEARCH_URL, { headers: headers(), signal: controller.signal })
+      .then((response) => (response.ok ? response.json() : Promise.reject()))
+      .then((payload) => setCross(payload.cross_asset || null))
+      .catch(() => {
+        if (!controller.signal.aborted) setFailed(true);
+      });
+    return () => controller.abort();
+  }, []);
+
+  return (
+    <section className="panel-block cross-asset-panel">
+      <div className="panel-title">
+        <Radar size={16} />
+        <div>
+          <h2>跨资产背景</h2>
+          <span>
+            {cross
+              ? `${cross.corr_window_days} 日滚动相关 · 近一年表现对照（历史统计，非配置信号）`
+              : failed
+                ? '跨资产数据暂不可用'
+                : '读取中'}
+          </span>
+        </div>
+      </div>
+      {cross ? (
+        <>
+          <div className="cross-asset-grid">
+            <div className="cross-asset-row cross-asset-head">
+              <span>资产</span>
+              <span>与黄金相关性</span>
+              <span>近一年表现</span>
+            </div>
+            <div className="cross-asset-row">
+              <span>黄金（基准）</span>
+              <span>—</span>
+              <strong>{(cross.gold_perf_1y * 100).toFixed(1)}%</strong>
+            </div>
+            {Object.entries(cross.peers).map(([key, peer]) => (
+              <div key={key} className="cross-asset-row">
+                <span>{peer.label}</span>
+                <span className="corr-cell">
+                  <i
+                    className={peer.corr_63d >= 0 ? 'corr-pos' : 'corr-neg'}
+                    style={{ width: `${Math.min(100, Math.abs(peer.corr_63d || 0) * 100)}%` }}
+                  />
+                  <small>{peer.corr_63d != null ? peer.corr_63d.toFixed(2) : 'N/A'}</small>
+                </span>
+                <strong>{(peer.perf_1y * 100).toFixed(1)}%</strong>
+              </div>
+            ))}
+          </div>
+          <p className="muted-copy">{cross.note}</p>
+        </>
+      ) : null}
+    </section>
+  );
+}
+
+function DigestSubscribeCard() {
+  const [email, setEmail] = useState('');
+  const [state, setState] = useState('idle'); // idle | sending | done | error
+  const [message, setMessage] = useState('');
+
+  async function submit(event) {
+    event.preventDefault();
+    setState('sending');
+    setMessage('');
+    try {
+      const response = await fetch(SUBSCRIBE_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
+        body: JSON.stringify({ email: email.trim() }),
+      });
+      const json = await response.json();
+      if (!response.ok) {
+        throw new Error(json?.detail?.message || `订阅失败：HTTP ${response.status}`);
+      }
+      setState('done');
+      setMessage(
+        json.created
+          ? `已订阅（${json.email_masked}）：每周发布日自动送达，邮件内含一键退订链接。`
+          : `该邮箱已在订阅列表中（${json.email_masked}）。`,
+      );
+    } catch (submitError) {
+      setState('error');
+      setMessage(submitError.message || '订阅失败');
+    }
+  }
+
+  return (
+    <section className="panel-block digest-subscribe">
+      <div className="panel-title">
+        <Mail size={16} />
+        <div>
+          <h2>订阅每周信号</h2>
+          <span>发布日自动送达 · 邮箱仅存本地 · 一键退订</span>
+        </div>
+      </div>
+      {state === 'done' ? (
+        <p className="subscribe-ok">
+          <CheckCircle2 size={14} /> {message}
+        </p>
+      ) : (
+        <form className="subscribe-row" onSubmit={submit}>
+          <input
+            type="email"
+            required
+            placeholder="you@example.com"
+            value={email}
+            onChange={(event) => setEmail(event.target.value)}
+            aria-label="订阅邮箱"
+          />
+          <button type="submit" disabled={state === 'sending'}>
+            {state === 'sending' ? <Loader2 size={14} className="spinning" /> : '订阅'}
+          </button>
+        </form>
+      )}
+      {state === 'error' ? <p className="subscribe-err">{message}</p> : null}
+    </section>
   );
 }

@@ -3152,6 +3152,61 @@ select {
 .narrative-status.ok { color: #9aae8f; }
 .narrative-status.muted { color: var(--text-dim, #97917f); }
 
+/* cross-asset panel */
+.cross-asset-grid { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.cross-asset-row {
+  display: grid;
+  grid-template-columns: 140px 1fr 90px;
+  gap: 12px;
+  align-items: center;
+  padding: 7px 10px;
+  border: 1px solid rgba(201, 154, 56, 0.14);
+  border-radius: 8px;
+  font-size: 0.8rem;
+  color: var(--text-main, #cfc8b4);
+}
+.cross-asset-row.cross-asset-head {
+  border: none;
+  color: var(--text-dim, #97917f);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  padding-bottom: 0;
+}
+.corr-cell { display: flex; align-items: center; gap: 8px; }
+.corr-cell i { display: block; height: 6px; border-radius: 3px; min-width: 3px; }
+.corr-cell i.corr-pos { background: linear-gradient(90deg, rgba(127,185,138,0.5), #7fb98a); }
+.corr-cell i.corr-neg { background: linear-gradient(90deg, rgba(224,122,95,0.5), #e07a5f); }
+.corr-cell small { color: var(--text-dim, #97917f); }
+
+/* digest subscription */
+.digest-subscribe { margin-top: 4px; }
+.subscribe-row { display: flex; gap: 10px; margin-top: 10px; }
+.subscribe-row input {
+  flex: 1;
+  min-width: 0;
+  background: rgba(14, 13, 10, 0.9);
+  border: 1px solid rgba(201, 154, 56, 0.3);
+  border-radius: 8px;
+  color: var(--text-main, #ddd6c4);
+  padding: 9px 12px;
+  font-size: 0.85rem;
+}
+.subscribe-row button {
+  background: linear-gradient(120deg, rgba(201, 154, 56, 0.9), rgba(232, 201, 121, 0.85));
+  border: none;
+  border-radius: 8px;
+  color: #17140d;
+  font-weight: 600;
+  padding: 9px 18px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.subscribe-row button:disabled { opacity: 0.6; cursor: wait; }
+.subscribe-ok { display: flex; align-items: center; gap: 7px; color: #7fb98a; font-size: 0.84rem; margin-top: 10px; }
+.subscribe-err { color: #e07a5f; font-size: 0.8rem; margin-top: 8px; }
+
 .narrative-polishing .advisor-narrative {
   position: relative;
   overflow: hidden;

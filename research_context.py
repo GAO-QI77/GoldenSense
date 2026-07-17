@@ -205,6 +205,18 @@ class LocalQuantContext:
         except Exception as exc:
             context["degraded"]["flagship"] = f"{type(exc).__name__}: {exc}"
 
+        # --- Cross-asset context --------------------------------------------
+        try:
+            from cross_asset import build_cross_asset_context
+
+            cross = build_cross_asset_context(raw)
+            if cross is not None:
+                context["cross_asset"] = cross
+            else:
+                context["degraded"]["cross_asset"] = "insufficient_history"
+        except Exception as exc:
+            context["degraded"]["cross_asset"] = f"{type(exc).__name__}: {exc}"
+
         # --- Allocation advice per profile ---------------------------------
         try:
             from allocation import allocation_range
