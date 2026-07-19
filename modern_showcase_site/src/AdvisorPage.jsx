@@ -1,22 +1,15 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   BrainCircuit,
   CheckCircle2,
   FileSearch,
   Loader2,
-  ShieldCheck,
   Sparkles,
-  SlidersHorizontal,
-  User,
   Wand2,
 } from 'lucide-react';
 
-import {
-  AdvancedProfileFields,
-  CoreProfileFields,
-} from './profileFields';
-import { loadProfile, saveProfile, toPersonalResearchBody } from './profileStore';
+import { toPersonalResearchBody } from './profileStore';
 
 const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
 const PERSONAL_URL =
@@ -33,12 +26,18 @@ const gapLabels = {
 const flagLabels = {
   position_above_range_in_stress: '压力状态下仓位超区间',
   position_far_above_range: '仓位显著高于区间',
-  short_horizon_high_vol: '短期限 × 高波动',
+  short_horizon_high_vol: '短期 × 高波动',
   structural_valuation_deviation: '估值结构性偏离',
   stale_data: '数据超出新鲜度阈值',
   drawdown_tolerance_mismatch: '回撤承受力可能被击穿',
   leverage_out_of_scope: '杠杆超出研究口径',
   liquidity_horizon_mismatch: '流动性与期限矛盾',
+};
+
+const horizonSectionLabels = {
+  short_term: '短期观点',
+  mid_term: '中期观点',
+  long_term: '长期观点',
 };
 
 async function postPersonal(body, mode, signal) {
@@ -60,23 +59,17 @@ async function postPersonal(body, mode, signal) {
   return json;
 }
 
-export default function AdvisorPage() {
-  const [profile, setProfile] = useState(loadProfile);
+// Capability A of the unified workbench: profile -> reference allocation
+// range / position gap / risk flags / two-phase DeepSeek narrative. The
+// profile is owned by the parent workbench and passed in; this component only
+// renders the "generate" action and its output.
+export default function AllocationResearchPanel({ profile }) {
   const [result, setResult] = useState(null);
   const [phase, setPhase] = useState('idle'); // idle | draft-loading | polishing | done | draft-only
   const [error, setError] = useState('');
   const generationRef = useRef(0);
 
-  useEffect(() => {
-    saveProfile(profile);
-  }, [profile]);
-
-  function update(key, value) {
-    setProfile((current) => ({ ...current, [key]: value }));
-  }
-
-  async function handleSubmit(event) {
-    event.preventDefault();
+  async function handleSubmit() {
     const generation = ++generationRef.current;
     const body = toPersonalResearchBody(profile);
     setError('');
@@ -103,7 +96,6 @@ export default function AdvisorPage() {
       setPhase('done');
     } catch {
       if (generationRef.current !== generation) return;
-      // Draft stays on screen; numbers are identical by construction.
       setPhase('draft-only');
     }
   }
@@ -133,71 +125,35 @@ export default function AdvisorPage() {
   }, [phase, polishing, result]);
 
   return (
-    <main className="page-surface advisor-page">
-      <section className="terminal-header">
-        <div>
-          <p className="eyebrow">Personalized Research</p>
-          <h1>个性化研究分析</h1>
-          <p>
-            画像只在本机浏览器保存并随请求发送，服务端不存储；与「风险画像 Agent」页共用同一份画像。
-            输出恒为「参考区间 / 差距 / 风险提示」研究框架——不是操作指令。
-          </p>
-        </div>
-        <div className="compliance-pill">
-          <ShieldCheck size={15} />
-          画像不落库 · 非投顾
-        </div>
-      </section>
-
-      <section className="advisor-layout">
-        <form className="agent-form" onSubmit={handleSubmit}>
-          <div className="panel-title">
-            <SlidersHorizontal size={16} />
+    <div className="capability-panel">
+      <div className="capability-intro">
+        <p>
+          按你的画像给出<strong>研究口径的参考配置区间</strong>：当前仓位与区间的差距、结构化风险提示，
+          以及一段个性化叙事。数字由规则引擎确定性产出、约 1 秒即出；DeepSeek 随后仅润色语言，
+          经数字校验与去指令化双重把关。<strong>永不输出买卖指令。</strong>
+        </p>
+        <button
+          className="primary-action"
+          type="button"
+          onClick={handleSubmit}
+          disabled={loading || polishing}
+        >
+          {loading ? <Loader2 size={17} className="spinning" /> : <Wand2 size={17} />}
+          {loading ? '计算数字中（约 1 秒）' : polishing ? '数字已出 · 语言润色中' : '生成个性化配置研究'}
+        </button>
+        {error ? (
+          <div className="error-panel">
+            <AlertTriangle size={18} />
             <div>
-              <h2>投资者画像</h2>
-              <span>核心 4 项必填 · 进阶可选 · 全站共享</span>
+              <strong>生成失败</strong>
+              <p>{error}</p>
             </div>
           </div>
-
-          <CoreProfileFields profile={profile} onChange={update} />
-          <AdvancedProfileFields profile={profile} onChange={update} />
-
-          {error ? (
-            <div className="error-panel">
-              <AlertTriangle size={18} />
-              <div>
-                <strong>生成失败</strong>
-                <p>{error}</p>
-              </div>
-            </div>
-          ) : null}
-
-          <button className="primary-action" type="submit" disabled={loading || polishing}>
-            {loading ? <Loader2 size={17} className="spinning" /> : <Wand2 size={17} />}
-            {loading ? '计算数字中（约 1 秒）' : polishing ? '数字已出 · 语言润色中' : '生成个性化研究分析'}
-          </button>
-        </form>
-
-        <aside className="agent-context">
-          <div className="panel-title">
-            <User size={16} />
-            <div>
-              <h2>这一页如何工作</h2>
-              <span>数字与语言严格分离</span>
-            </div>
-          </div>
-          <ul className="boundary-list">
-            <li>提交后约 1 秒先看到全部数字（规则引擎确定性产出），DeepSeek 随后仅替换语言表述。</li>
-            <li>每个数字经叙事校验器逐一核对，未着地则整体回退确定性草稿。</li>
-            <li>出现任何指令式措辞（「建议买入」等）同样触发回退——本页永不输出买卖指令。</li>
-            <li>进阶画像可选：填写回撤承受力/流动性/杠杆态度后，解锁对应的错配检查规则。</li>
-            <li>画像仅保存在你的浏览器，请求处理完即弃。</li>
-          </ul>
-        </aside>
-      </section>
+        ) : null}
+      </div>
 
       {result ? (
-        <section className="analysis-output">
+        <div className="analysis-output">
           <div className="section-head">
             <div>
               <span>Personalized Briefing</span>
@@ -216,7 +172,7 @@ export default function AdvisorPage() {
                 <FileSearch size={16} />
                 <div>
                   <h2>参考区间与仓位差距</h2>
-                  <span>{range?.available ? range.evidence_ref : '配置区间降级'}</span>
+                  <span>研究口径 · 组合占比</span>
                 </div>
               </div>
               {range?.available ? (
@@ -280,7 +236,9 @@ export default function AdvisorPage() {
               </div>
               {horizonSection?.available ? (
                 <div className="advisor-horizon-evidence">
-                  <strong>期限匹配证据（{facts.horizon_evidence.horizon}）</strong>
+                  <strong>
+                    {horizonSectionLabels[facts.horizon_evidence.horizon] || '期限匹配证据'}
+                  </strong>
                   <ul>
                     {(horizonSection.evidence || []).slice(0, 3).map((line) => (
                       <li key={line}>{line}</li>
@@ -291,13 +249,15 @@ export default function AdvisorPage() {
               <p className="disclaimer">{narrative?.disclaimer}</p>
             </section>
           </div>
-        </section>
-      ) : null}
-
-      <footer className="terminal-footer">
-        <span>GoldenSense Personalized Research</span>
-        <span>数字先行 · 语言后补 · 双重把关 · 画像不落库</span>
-      </footer>
-    </main>
+        </div>
+      ) : (
+        phase === 'idle' ? (
+          <div className="capability-empty">
+            <FileSearch size={22} />
+            <p>填好上方画像后点击「生成个性化配置研究」，这里会展示参考区间、仓位差距与定制叙事。</p>
+          </div>
+        ) : null
+      )}
+    </div>
   );
 }

@@ -31,7 +31,7 @@ import {
   WalletCards,
 } from 'lucide-react';
 
-import AdvisorPage from './AdvisorPage';
+import AllocationResearchPanel from './AdvisorPage';
 import EventAlertBanner from './EventAlertBanner';
 import GlobalSearch from './GlobalSearch';
 import QuantPage from './QuantPage';
@@ -47,17 +47,21 @@ const DASHBOARD_URL =
 const FEEDBACK_URL = import.meta.env.VITE_AGENT_FEEDBACK_URL || API_URL.replace('/analyze', '/feedback');
 const API_KEY = import.meta.env.VITE_AGENT_API_KEY || 'dev-public-key';
 
+// User-facing horizon labels. Internal API keys stay 24h/7d/30d; only the
+// copy is de-jargonised to 短/中/长期 (no T+N).
 const horizonLabels = {
-  '24h': '短线 T+1',
-  '7d': '中线 T+7',
-  '30d': '长线 T+30',
+  '24h': '短期',
+  '7d': '中期',
+  '30d': '长期',
 };
 
-const horizonShortLabels = {
-  '24h': 'T+1',
-  '7d': 'T+7',
-  '30d': 'T+30',
+const horizonSubLabels = {
+  '24h': '未来数日',
+  '7d': '未来一周',
+  '30d': '未来一月',
 };
+
+const horizonShortLabels = horizonLabels;
 
 const stanceClass = {
   偏多: 'tone-bull',
@@ -88,8 +92,8 @@ const positionLabels = {
 };
 
 const starterPrompts = [
-  '如果今晚 CPI 高于预期，黄金短线应该如何控制风险？',
-  '美元指数继续走强时，黄金 T+7 的失效条件是什么？',
+  '如果今晚 CPI 高于预期，黄金短期应该如何控制风险？',
+  '美元指数继续走强时，黄金中期观点的失效条件是什么？',
   '我已经有黄金多头，接下来一周该关注哪些指标？',
   '地缘冲突升温但 ETF 没有流入，黄金是不是只适合观望？',
 ];
@@ -142,9 +146,10 @@ function App() {
       <AppShell>
         <Routes>
           <Route path="/" element={<DashboardPage />} />
-          <Route path="/agent" element={<AgentPage />} />
           <Route path="/quant" element={<QuantPage />} />
-          <Route path="/advisor" element={<AdvisorPage />} />
+          <Route path="/advisor" element={<AdvisorWorkbench />} />
+          {/* /agent kept as an alias so old links & the unified workbench coincide */}
+          <Route path="/agent" element={<AdvisorWorkbench />} />
           <Route path="/signals" element={<SignalsPage />} />
           <Route path="*" element={<DashboardPage />} />
         </Routes>
@@ -163,11 +168,10 @@ function AppShell({ children }) {
 
   useEffect(() => {
     addSearchEntries('pages', [
-      { id: 'page-dashboard', source: 'pages', title: '研究主页', hint: '三周期预测、指标证据与近端新闻', route: '/', keywords: ['dashboard', '主页', '预测', '指标'] },
-      { id: 'page-agent', source: 'pages', title: '风险画像 Agent', hint: '提交问题与风险画像，获取可追溯分析', route: '/agent', keywords: ['agent', '画像', '分析', '问答'] },
+      { id: 'page-dashboard', source: 'pages', title: '研究主页', hint: '短中长期预测、指标证据与近端新闻', route: '/', keywords: ['dashboard', '主页', '预测', '指标'] },
       { id: 'page-quant', source: 'pages', title: '量化研究面板', hint: 'HMM 状态机、公允价值、情景锥与校准记分卡', route: '/quant', keywords: ['quant', '量化', 'hmm', '校准', '因子'] },
       { id: 'page-signals', source: 'pages', title: '观点书与信号台账', hint: '短中长三尺度观点、每周不可变发布与前向记分卡', route: '/signals', keywords: ['signals', '观点书', '台账', '信号', 'ledger'] },
-      { id: 'page-advisor', source: 'pages', title: '个性化研究分析', hint: '按画像生成参考区间/差距/风险提示与定制叙事', route: '/advisor', keywords: ['advisor', '个性化', '画像', '参考区间'] },
+      { id: 'page-advisor', source: 'pages', title: '个性化投研', hint: '一份画像两种能力：配置研究 + 提问分析', route: '/advisor', keywords: ['advisor', 'agent', '个性化', '画像', '参考区间', '问答', '分析'] },
     ]);
     addSearchEntries(
       'prompts',
@@ -175,8 +179,8 @@ function AppShell({ children }) {
         id: `prompt-${index}`,
         source: 'prompts',
         title: prompt,
-        hint: '打开风险画像 Agent 使用该问题',
-        route: '/agent',
+        hint: '在个性化投研的提问分析中使用该问题',
+        route: '/advisor',
         keywords: ['提问', '模板'],
       })),
     );
@@ -200,10 +204,6 @@ function AppShell({ children }) {
             <LineChart size={16} />
             研究主页
           </NavLink>
-          <NavLink to="/agent">
-            <BrainCircuit size={16} />
-            风险画像 Agent
-          </NavLink>
           <NavLink to="/quant">
             <Radar size={16} />
             量化研究
@@ -214,7 +214,7 @@ function AppShell({ children }) {
           </NavLink>
           <NavLink to="/advisor">
             <WalletCards size={16} />
-            个性化研究
+            个性化投研
           </NavLink>
         </nav>
 
@@ -343,7 +343,7 @@ function DashboardPage() {
         <MetricTile
           label="主预测"
           value={primaryForecast ? primaryForecast.stance : loading ? '读取中' : 'N/A'}
-          detail={primaryForecast ? `${primaryForecast.action} · ${primaryForecast.confidence_band}置信度` : 'T+1 baseline'}
+          detail={primaryForecast ? `${primaryForecast.action} · ${primaryForecast.confidence_band}置信度` : '短期基线'}
           tone={primaryForecast ? toneName(primaryForecast.stance) : 'neutral'}
           icon={Radar}
         />
@@ -372,7 +372,7 @@ function DashboardPage() {
         {forecasts.length ? (
           forecasts.map((forecast) => <ForecastCard key={forecast.horizon} forecast={forecast} />)
         ) : (
-          <PlaceholderPanel icon={Clock3} text={loading ? '正在读取 T+1 / T+7 / T+30 预测基线。' : '暂无预测基线。'} />
+          <PlaceholderPanel icon={Clock3} text={loading ? '正在读取短期 / 中期 / 长期预测基线。' : '暂无预测基线。'} />
         )}
       </section>
 
@@ -436,38 +436,16 @@ function DashboardPage() {
   );
 }
 
-function AgentPage() {
-  const [question, setQuestion] = useState(starterPrompts[0]);
-  const [horizon, setHorizon] = useState('24h');
-  // Unified profile, shared with /advisor via the same localStorage store.
+function AdvisorWorkbench() {
+  // One shared profile powers both capabilities; the workbench owns it.
   const [profile, setProfile] = useState(loadProfile);
-  const [analysis, setAnalysis] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [feedbackStatus, setFeedbackStatus] = useState('');
-  const resultRef = useRef(null);
+  const [tab, setTab] = useState('allocation'); // 'allocation' | 'qa'
 
   useEffect(() => {
     saveProfile(profile);
   }, [profile]);
 
-  // /analyze still speaks the legacy 9-field questionnaire contract; the
-  // unified profile is mapped through an adapter so the backend is untouched.
   const investorProfile = useMemo(() => toLegacyAnalyzeProfile(profile), [profile]);
-  const riskProfile = profile.risk_tolerance;
-
-  function updateProfile(key, value) {
-    setProfile((current) => ({ ...current, [key]: value }));
-  }
-
-  const summary = analysis?.summary_card;
-  const riskBanner = analysis?.risk_banner;
-  const forecasts = analysis?.horizon_forecasts || [];
-  const evidenceCards = analysis?.evidence_cards || [];
-  const citations = analysis?.citations || [];
-  const recentNews = analysis?.recent_news || [];
-  const selectedForecast = forecasts.find((item) => item.horizon === horizon) || forecasts[0];
-
   const profileScore = useMemo(() => {
     let score = 0;
     if (Number(investorProfile.capital_allocation_pct) >= 50) score += 3;
@@ -482,8 +460,103 @@ function AgentPage() {
     if (investorProfile.investment_goal === 'speculation') score += 1;
     return score;
   }, [investorProfile]);
-
   const profileLevel = profileScore >= 5 ? '高' : profileScore >= 2 ? '中' : '低';
+
+  function updateProfile(key, value) {
+    setProfile((current) => ({ ...current, [key]: value }));
+  }
+
+  return (
+    <main className="page-surface advisor-page">
+      <section className="terminal-header">
+        <div>
+          <p className="eyebrow">Personalized Research & Q&A</p>
+          <h1>个性化投研</h1>
+          <p>
+            一份画像，两种能力：给出研究口径的<strong>参考配置区间</strong>，或就任意问题生成
+            <strong>可追溯的风险适配分析</strong>。画像只存本机浏览器、随请求发送，服务端不存储；输出永不构成买卖指令。
+          </p>
+        </div>
+        <div className={`profile-score level-${profileLevel === '高' ? 'high' : profileLevel === '中' ? 'medium' : 'low'}`}>
+          <span>画像风险</span>
+          <strong>{profileLevel}</strong>
+          <small>score {profileScore}</small>
+        </div>
+      </section>
+
+      <section className="profile-card">
+        <PanelTitle
+          icon={SlidersHorizontal}
+          title="投资者画像"
+          subtitle="核心 4 项 · 进阶可选 · 两种能力共用；仅用于限制输出强度，不改变市场基线"
+        />
+        <div className="profile-fields">
+          <CoreProfileFields profile={profile} onChange={updateProfile} />
+          <AdvancedProfileFields profile={profile} onChange={updateProfile} defaultOpen />
+        </div>
+      </section>
+
+      <div className="capability-tabs" role="tablist" aria-label="能力切换">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === 'allocation'}
+          className={tab === 'allocation' ? 'active' : ''}
+          onClick={() => setTab('allocation')}
+        >
+          <WalletCards size={16} />
+          <span>配置研究</span>
+          <small>参考区间 · 仓位差距 · 风险提示</small>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === 'qa'}
+          className={tab === 'qa' ? 'active' : ''}
+          onClick={() => setTab('qa')}
+        >
+          <BrainCircuit size={16} />
+          <span>提问分析</span>
+          <small>自由提问 · 证据卡 · 失效条件</small>
+        </button>
+      </div>
+
+      {tab === 'allocation' ? (
+        <AllocationResearchPanel profile={profile} />
+      ) : (
+        <QaAnalysisPanel
+          profile={profile}
+          investorProfile={investorProfile}
+          profileScore={profileScore}
+        />
+      )}
+
+      <TerminalFooter
+        left="GoldenSense 个性化投研"
+        right="画像不落库 · 数字来自规则引擎 · 语言经双重把关 · 非投资建议"
+      />
+    </main>
+  );
+}
+
+function QaAnalysisPanel({ profile, investorProfile, profileScore }) {
+  const [question, setQuestion] = useState(starterPrompts[0]);
+  const [horizon, setHorizon] = useState('24h');
+  const [analysis, setAnalysis] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [feedbackStatus, setFeedbackStatus] = useState('');
+  const resultRef = useRef(null);
+
+  const riskProfile = profile.risk_tolerance;
+  const summary = analysis?.summary_card;
+  const riskBanner = analysis?.risk_banner;
+  const forecasts = analysis?.horizon_forecasts || [];
+  const evidenceCards = analysis?.evidence_cards || [];
+  const citations = analysis?.citations || [];
+  const recentNews = analysis?.recent_news || [];
+  const selectedForecast = forecasts.find((item) => item.horizon === horizon) || forecasts[0];
+
   const riskBudget = useMemo(() => buildRiskBudget(investorProfile, profileScore), [investorProfile, profileScore]);
   const suitabilityGate = useMemo(
     () => buildSuitabilityGate(investorProfile, profileScore, riskBudget),
@@ -501,11 +574,9 @@ function AgentPage() {
       setError('请输入具体问题后再开始分析。');
       return;
     }
-
     setLoading(true);
     setError('');
     setFeedbackStatus('');
-
     try {
       const response = await fetch(API_URL, {
         method: 'POST',
@@ -518,11 +589,11 @@ function AgentPage() {
           investor_profile: investorProfile,
         }),
       });
-      const json = await readApiJson(response, 'Agent 分析失败');
+      const json = await readApiJson(response, '分析失败');
       setAnalysis(json);
       window.setTimeout(() => resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
     } catch (submitError) {
-      setError(submitError.message || 'Agent 分析失败');
+      setError(submitError.message || '分析失败');
     } finally {
       setLoading(false);
     }
@@ -537,40 +608,30 @@ function AgentPage() {
         body: JSON.stringify({ analysis_id: analysis.analysis_id, rating, comment: null }),
       });
       await readApiJson(response, '反馈提交失败');
-      setFeedbackStatus(rating === 'helpful' ? '已记录：这条 briefing 有帮助。' : '已记录：这类回答会进入后续评估。');
+      setFeedbackStatus(rating === 'helpful' ? '已记录：这条分析有帮助。' : '已记录：这类回答会进入后续评估。');
     } catch (feedbackError) {
       setFeedbackStatus(feedbackError.message || '反馈提交失败');
     }
   }
 
   return (
-    <main className="page-surface agent-page">
-      <section className="terminal-header">
-        <div>
-          <p className="eyebrow">Retail Suitability Workflow</p>
-          <h1>风险画像 Agent</h1>
-          <p>
-            先收集完整问卷，再把稳定预测解释成风险适配建议。输出包含证据、失效条件和禁止执行条件，不提供下单指令。
-          </p>
-        </div>
-        <div className={`profile-score level-${profileLevel === '高' ? 'high' : profileLevel === '中' ? 'medium' : 'low'}`}>
-          <span>问卷风险</span>
-          <strong>{profileLevel}</strong>
-          <small>score {profileScore}</small>
-        </div>
-      </section>
+    <div className="capability-panel">
+      <div className="capability-intro">
+        <p>
+          就任意黄金问题生成<strong>风险适配分析</strong>：方向观点、三情景执行框架、失效条件与禁止执行条件，
+          全部可回溯到证据卡与引用。市场基线来自行情与量化服务，<strong>不被你的问题改写</strong>。
+        </p>
+      </div>
 
-      <section className="agent-layout">
+      <section className="qa-layout">
         <form className="agent-form" onSubmit={handleSubmit}>
-          <PanelTitle icon={SlidersHorizontal} title="分析输入" subtitle="问题、周期和基础风险偏好" />
-
           <label className="field">
             <span>你的问题</span>
             <textarea
               value={question}
               onChange={(event) => setQuestion(event.target.value)}
-              rows={6}
-              placeholder="例：如果 CPI 高于预期，黄金短线和一周视角分别要怎么看？"
+              rows={5}
+              placeholder="例：如果 CPI 高于预期，黄金短期和一周视角分别要怎么看？"
             />
           </label>
 
@@ -591,32 +652,22 @@ function AgentPage() {
             />
           </div>
 
-          <PanelTitle
-            icon={WalletCards}
-            title="投资者画像"
-            subtitle="与「个性化研究」页共享同一份画像 · 用于限制输出强度，不改变市场预测基线"
-          />
-
-          <CoreProfileFields profile={profile} onChange={updateProfile} />
-          <AdvancedProfileFields profile={profile} onChange={updateProfile} defaultOpen />
-
-
           <RiskBudgetPanel budget={riskBudget} profile={investorProfile} />
           <SuitabilityGatePanel gate={suitabilityGate} />
 
-          {error ? <ErrorPanel title="Agent 分析失败" message={error} /> : null}
+          {error ? <ErrorPanel title="分析失败" message={error} /> : null}
 
           <button className="primary-action" type="submit" disabled={loading}>
             {loading ? <Loader2 size={17} className="spinning" /> : <BrainCircuit size={17} />}
-            {loading ? '生成 briefing 中' : '生成风险适配 briefing'}
+            {loading ? '生成分析中' : '生成风险适配分析'}
           </button>
         </form>
 
         <aside className="agent-context">
-          <PanelTitle icon={LockKeyhole} title="Agent 边界" subtitle="工业级研究终端的输出纪律" />
+          <PanelTitle icon={LockKeyhole} title="输出纪律" subtitle="工业级研究终端的边界" />
           <ul className="boundary-list">
-            <li>预测基线来自行情和量化服务，不被用户问题改写。</li>
-            <li>问卷只影响风险适配、建议强度和禁止执行条件。</li>
+            <li>市场基线来自行情和量化服务，不被用户问题改写。</li>
+            <li>画像只影响风险适配、输出强度和禁止执行条件。</li>
             <li>数据陈旧、证据冲突、提示注入或过度确定性语言会强制降级。</li>
             <li>所有结论必须能回到证据卡、引用或降级标记。</li>
           </ul>
@@ -630,7 +681,7 @@ function AgentPage() {
           ) : (
             <div className="sticky-forecast muted">
               <span>等待分析</span>
-              <strong>暂无 briefing</strong>
+              <strong>暂无结果</strong>
               <p>提交后这里会保留当前周期的稳定预测基线。</p>
             </div>
           )}
@@ -639,67 +690,63 @@ function AgentPage() {
       </section>
 
       <section ref={resultRef} className="analysis-output">
-        <SectionHeader
-          kicker="Agent Briefing"
-          title="风险适配分析"
-          description="输出方向、情景、失效条件和禁止执行条件，避免把研究解读误读成下单指令。"
-        />
-
         {!analysis && !loading ? (
-          <PlaceholderPanel icon={BookOpenCheck} text="填写问卷并提交后，这里会展示完整 briefing、证据卡和引用。" />
+          <PlaceholderPanel icon={BookOpenCheck} text="提交问题后，这里会展示完整分析、证据卡和引用。" />
         ) : null}
 
         {loading ? (
-          <PlaceholderPanel icon={Loader2} text="Agent 正在读取预测基线、新闻、历史类比和问卷门控。" spinning />
+          <PlaceholderPanel icon={Loader2} text="正在读取预测基线、新闻、历史类比和画像门控。" spinning />
         ) : null}
 
         {summary ? (
-          <div className="briefing-grid">
-            <section className="decision-panel">
-              <div className="decision-head">
-                <span className={`stance-badge ${stanceClass[summary.stance] || 'tone-neutral'}`}>{summary.stance}</span>
-                <span>{summary.confidence_band}置信度</span>
-              </div>
-              <h2>{summary.action}</h2>
-              <p>{summary.reasons?.[0]}</p>
-              <div className={`risk-banner level-${riskBanner?.level || 'medium'}`}>
-                <strong>{riskBanner?.title}</strong>
-                <span>{riskBanner?.message}</span>
-              </div>
-              <div className="reason-columns">
-                <SummaryList title="关键理由" items={summary.reasons || []} />
-                <SummaryList title="禁止执行 / 失效条件" items={summary.invalidators || []} />
-              </div>
-              <p className="disclaimer">{summary.disclaimer}</p>
-              <div className="feedback-row">
-                <span>这条 briefing 是否有帮助？</span>
-                <button type="button" onClick={() => submitFeedback('helpful')}>
-                  有帮助
-                </button>
-                <button type="button" onClick={() => submitFeedback('not_helpful')}>
-                  没帮助
-                </button>
-              </div>
-              {feedbackStatus ? <p className="feedback-status">{feedbackStatus}</p> : null}
-            </section>
+          <>
+            <SectionHeader
+              kicker="Analysis Briefing"
+              title="风险适配分析"
+              description="输出方向、情景、失效条件和禁止执行条件，避免把研究解读误读成下单指令。"
+            />
+            <div className="briefing-grid">
+              <section className="decision-panel">
+                <div className="decision-head">
+                  <span className={`stance-badge ${stanceClass[summary.stance] || 'tone-neutral'}`}>{summary.stance}</span>
+                  <span>{summary.confidence_band}置信度</span>
+                </div>
+                <h2>{summary.action}</h2>
+                <p>{summary.reasons?.[0]}</p>
+                <div className={`risk-banner level-${riskBanner?.level || 'medium'}`}>
+                  <strong>{riskBanner?.title}</strong>
+                  <span>{riskBanner?.message}</span>
+                </div>
+                <div className="reason-columns">
+                  <SummaryList title="关键理由" items={summary.reasons || []} />
+                  <SummaryList title="禁止执行 / 失效条件" items={summary.invalidators || []} />
+                </div>
+                <p className="disclaimer">{summary.disclaimer}</p>
+                <div className="feedback-row">
+                  <span>这条分析是否有帮助？</span>
+                  <button type="button" onClick={() => submitFeedback('helpful')}>有帮助</button>
+                  <button type="button" onClick={() => submitFeedback('not_helpful')}>没帮助</button>
+                </div>
+                {feedbackStatus ? <p className="feedback-status">{feedbackStatus}</p> : null}
+              </section>
 
-            <section className="evidence-panel">
-              <PanelTitle icon={FileSearch} title="证据卡片" subtitle={`${evidenceCards.length} 张证据 / ${citations.length} 条引用`} />
-              <div className="evidence-list">
-                {evidenceCards.map((card) => (
-                  <article key={card.id} className={`evidence-card ${card.direction}`}>
-                    <span>{card.signal_type}</span>
-                    <h3>{card.title}</h3>
-                    <p>{card.takeaway}</p>
-                    <small>{card.citation_ids.map((id) => `#${id}`).join(' ')}</small>
-                  </article>
-                ))}
-              </div>
-            </section>
-          </div>
+              <section className="evidence-panel">
+                <PanelTitle icon={FileSearch} title="证据卡片" subtitle={`${evidenceCards.length} 张证据 / ${citations.length} 条引用`} />
+                <div className="evidence-list">
+                  {evidenceCards.map((card) => (
+                    <article key={card.id} className={`evidence-card ${card.direction}`}>
+                      <span>{card.signal_type}</span>
+                      <h3>{card.title}</h3>
+                      <p>{card.takeaway}</p>
+                      <small>{card.citation_ids.map((id) => `#${id}`).join(' ')}</small>
+                    </article>
+                  ))}
+                </div>
+              </section>
+            </div>
+            <ExecutionScenarioPanel scenarios={executionScenarios} />
+          </>
         ) : null}
-
-        {summary ? <ExecutionScenarioPanel scenarios={executionScenarios} /> : null}
 
         {analysis ? (
           <section className="post-analysis-grid">
@@ -740,11 +787,7 @@ function AgentPage() {
           </section>
         ) : null}
       </section>
-      <TerminalFooter
-        left="GoldenSense Agent Workbench"
-        right="问卷、门控、证据与引用统一在 Agent 页收口"
-      />
-    </main>
+    </div>
   );
 }
 

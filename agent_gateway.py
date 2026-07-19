@@ -80,6 +80,15 @@ except Exception:  # pragma: no cover - optional dependency in local env
     AsyncOpenAI = None  # type: ignore[assignment]
 
 
+# User-facing horizon copy. Internal decision keys stay 24h/7d/30d and T+1/T+7
+# (the AgentDecision contract); only display strings are de-jargonised.
+_HORIZON_DISPLAY = {"24h": "短期", "7d": "中期", "30d": "长期"}
+
+
+def _horizon_zh(horizon: str) -> str:
+    return _HORIZON_DISPLAY.get(horizon, horizon)
+
+
 class RiskResult(TypedDict):
     decision: Literal["PASS", "REJECTED", "EXECUTED", "EXEC_FAILED"]
     executed_position: float
@@ -2686,7 +2695,7 @@ class AgentAnalysisService:
             confidence_band = "高" if probability >= 0.67 and basis == "ensemble_model" else "中"
             action = "降低暴露"
 
-        horizon_label = {"24h": "T+1", "7d": "T+7", "30d": "T+30"}[horizon]
+        horizon_label = {"24h": "短期", "7d": "中期", "30d": "长期"}[horizon]
         if basis == "degraded_fallback":
             basis_reason = f"{horizon_label} 量化暂不可用，当前已退回保守中性判断。"
         elif risk_profile.get("force_observation"):
@@ -2768,7 +2777,7 @@ class AgentAnalysisService:
             action = "降低暴露"
             confidence_band = "高" if probability >= 0.67 and basis == "ensemble_model" else "中"
 
-        horizon_label = {"24h": "T+1", "7d": "T+7", "30d": "T+30"}[horizon]
+        horizon_label = {"24h": "短期", "7d": "中期", "30d": "长期"}[horizon]
         if basis == "degraded_fallback":
             basis_reason = f"{horizon_label} 量化预测暂不可用，当前只保留保守占位。"
         elif basis == "heuristic_proxy":
@@ -2785,9 +2794,9 @@ class AgentAnalysisService:
             else "该卡只使用行情快照和量化模型输出，不随聊天输入改写。"
         )
         horizon_reason = {
-            "24h": "T+1 用于短线方向基线，适合和即时新闻解释分开阅读。",
-            "7d": "T+7 用于一周方向基线，避免单条问题改变市场预测。",
-            "30d": "T+30 用于中期参考，不等同于独立长期交易建议。",
+            "24h": "短期用于数日方向基线，适合和即时新闻解释分开阅读。",
+            "7d": "中期用于一周方向基线，避免单条问题改变市场预测。",
+            "30d": "长期用于一月中期参考，不等同于独立长期交易建议。",
         }[horizon]
 
         return HorizonForecastCard(
@@ -2868,7 +2877,7 @@ class AgentAnalysisService:
                     "量化引擎暂不可用，系统已用中性占位并降级为保守建议。"
                     if _forecast_is_degraded(bundle.forecast)
                     else (
-                        f"{bundle.horizon} 当前使用代理预测，概率 {((bundle.quant_probability or 0.0) * 100):.1f}%，更适合作为中期参考。"
+                        f"{_horizon_zh(bundle.horizon)}当前使用代理预测，概率 {((bundle.quant_probability or 0.0) * 100):.1f}%，更适合作为中期参考。"
                         if _forecast_basis(bundle.forecast) == "heuristic_proxy"
                         else (
                             f"方向信号 {bundle.forecast.get('direction_prediction')}，"
@@ -2902,8 +2911,8 @@ class AgentAnalysisService:
                     label="历史相似事件",
                     source_type="historical_analogs",
                     excerpt=(
-                        f"{first.headline}；T+1 {((first.gold_t1_return or 0.0) * 100):+.2f}%，"
-                        f"T+7 {((first.gold_t7_return or 0.0) * 100):+.2f}%。"
+                        f"{first.headline}；事件后 1 日 {((first.gold_t1_return or 0.0) * 100):+.2f}%，"
+                        f"7 日 {((first.gold_t7_return or 0.0) * 100):+.2f}%。"
                     ),
                 )
             )
@@ -2969,10 +2978,10 @@ class AgentAnalysisService:
                     "量化引擎当前暂不可用，系统已按中性概率处理并自动收紧建议。"
                     if _forecast_is_degraded(bundle.forecast)
                     else (
-                        f"{bundle.snapshot.asset} 的 {bundle.horizon} 当前采用代理预测，概率 {((bundle.quant_probability or 0.0) * 100):.1f}%。"
+                        f"{bundle.snapshot.asset} 的{_horizon_zh(bundle.horizon)}观点当前采用代理预测，概率 {((bundle.quant_probability or 0.0) * 100):.1f}%。"
                         if _forecast_basis(bundle.forecast) == "heuristic_proxy"
                         else (
-                        f"{bundle.snapshot.asset} 的 {bundle.horizon} 量化方向为 {quant_direction}，"
+                        f"{bundle.snapshot.asset} 的{_horizon_zh(bundle.horizon)}量化方向为 {quant_direction}，"
                         f"集成概率 {((bundle.quant_probability or 0.0) * 100):.1f}%。"
                         )
                     )
@@ -3020,7 +3029,7 @@ class AgentAnalysisService:
                     if bundle.memory_status != "ok"
                     else (
                         "历史相似事件均值表现 "
-                        f"{memory_avg * 100:+.2f}%（按 {'T+1' if bundle.horizon == '24h' else 'T+7'} 口径），"
+                        f"{memory_avg * 100:+.2f}%（按{'短期' if bundle.horizon == '24h' else '中期'}口径），"
                         "可用于判断新闻冲击是否容易延续。"
                     )
                 ),
@@ -3102,7 +3111,7 @@ class AgentAnalysisService:
             primary_reason = "量化引擎当前不可用，系统已切换为保守中性处理。"
         else:
             primary_reason = (
-                f"{bundle.horizon} 当前采用代理预测，主要参考趋势、美元、利率和自动抓取的新闻环境。"
+                f"{_horizon_zh(bundle.horizon)}观点当前采用代理预测，主要参考趋势、美元、利率和自动抓取的新闻环境。"
                 if _forecast_basis(bundle.forecast) == "heuristic_proxy"
                 else f"量化层方向为 {'偏多' if bundle.quant_direction > 0 else '偏空' if bundle.quant_direction < 0 else '中性'}（仅作参考）。"
             )
@@ -3159,7 +3168,7 @@ class AgentAnalysisService:
 
         follow_up_questions = [
             "如果你已经持有黄金仓位，我可以按你的风险偏好重写成持仓建议。",
-            "如果你想比较 T+1、T+7、T+30 哪个周期分歧最大，我可以直接帮你解释。",
+            "如果你想比较短期、中期、长期哪个周期分歧最大，我可以直接帮你解释。",
             "如果你想看这次判断最容易失效的情景，我可以单独展开风险清单。",
         ]
 

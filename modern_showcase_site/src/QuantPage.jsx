@@ -114,7 +114,7 @@ export default function QuantPage() {
       { id: 'q-cone', source: 'quant', title: '90 日蒙特卡洛情景锥', hint: 'P10 / P50 / P90 分布路径', route: '/quant', hash: 'panel-cone', keywords: ['monte carlo', '情景', '锥', '预测分布'] },
       { id: 'q-fair', source: 'quant', title: '宏观公允价值锚', hint: '实际利率 + 美元误差修正模型', route: '/quant', hash: 'panel-fair-value', keywords: ['fair value', '公允', '估值', '实际利率'] },
       { id: 'q-factors', source: 'quant', title: '宏观因子面板', hint: '实际利率 / 美元 / 通胀预期 / 资金流', route: '/quant', hash: 'panel-factors', keywords: ['因子', 'factor', '宏观'] },
-      { id: 'q-vol', source: 'quant', title: 'HAR-RV 波动率与收益分布带', hint: 'T+1 / T+5 / T+21 P10-P90 区间', route: '/quant', hash: 'panel-vol', keywords: ['波动率', 'har', '分位数', '区间'] },
+      { id: 'q-vol', source: 'quant', title: 'HAR-RV 波动率与收益分布带', hint: '1 / 5 / 21 日 P10-P90 区间', route: '/quant', hash: 'panel-vol', keywords: ['波动率', 'har', '分位数', '区间'] },
       { id: 'q-alloc', source: 'quant', title: '战略配置区间 (BL-lite)', hint: '按风险画像的黄金配置建议区间', route: '/quant', hash: 'panel-allocation', keywords: ['配置', 'allocation', 'black litterman'] },
       { id: 'q-calibration', source: 'quant', title: 'Agent 校准记分卡', hint: '历史判断命中率与 Brier 分数', route: '/quant', hash: 'panel-calibration', keywords: ['校准', '命中率', 'brier', 'scorecard'] },
     ]);
@@ -522,7 +522,7 @@ function ConePanel({ cone, degraded }) {
         </figure>
       )}
       <div className="cone-checkpoints">
-        {[['T+30', d30], ['T+90', d90]].map(([label, cp]) => (
+        {[['30 日', d30], ['90 日', d90]].map(([label, cp]) => (
           <div key={label} className="cone-checkpoint">
             <span className="cone-label">{label}</span>
             {cp ? (
@@ -684,9 +684,9 @@ function FactorPanel({ factors, degraded }) {
 /* -------------------------------- vol ------------------------------------ */
 function VolPanel({ volBands, degraded }) {
   const rows = [
-    ['h1', 'T+1'],
-    ['h5', 'T+5'],
-    ['h21', 'T+21'],
+    ['h1', '1 日'],
+    ['h5', '5 日'],
+    ['h21', '21 日'],
   ].filter(([key]) => volBands?.[key]);
 
   const bounds = useMemo(() => {

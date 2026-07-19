@@ -272,14 +272,17 @@ test('dashboard exposes source audit details for each indicator', async ({ page 
   await expect(page.getByText('研究口径 指标用于解释市场基线，不直接改写预测价格。')).toBeVisible();
 });
 
-test('agent submits full investor profile and renders risk briefing', async ({ page }) => {
-  await page.goto('/agent');
+test('unified workbench: shared profile + Q&A analysis renders risk briefing', async ({ page }) => {
+  await page.goto('/agent'); // alias of the unified /advisor workbench
 
-  // Unified profile: core fields + advanced layer (open by default on /agent).
+  // Shared profile card (visible on both capability tabs).
   await page.getByLabel('当前黄金仓位').fill('75');
   await page.getByLabel('最大回撤承受力').fill('3');
   await page.getByLabel('杠杆态度').selectOption('high');
   await page.getByRole('button', { name: '新手', exact: true }).click();
+
+  // Switch to the 提问分析 capability.
+  await page.getByRole('tab', { name: /提问分析/ }).click();
   await expect(page.getByRole('heading', { name: '适当性门控预检' })).toBeVisible();
   await expect(page.getByText('强制观望')).toBeVisible();
   await expect(page.getByText('禁止加杠杆')).toBeVisible();
@@ -287,7 +290,7 @@ test('agent submits full investor profile and renders risk briefing', async ({ p
   await expect(page.getByText('声明回撤承受力')).toBeVisible();
   // A 75% gold position maps to a long position in the legacy contract.
   await expect(page.locator('.position-mode-panel').getByText('已有多头', { exact: true })).toBeVisible();
-  await page.getByRole('button', { name: '生成风险适配 briefing' }).click();
+  await page.getByRole('button', { name: '生成风险适配分析' }).click();
 
   await expect(page.getByRole('heading', { name: '风险适配分析' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '观望' })).toBeVisible();
@@ -296,6 +299,16 @@ test('agent submits full investor profile and renders risk briefing', async ({ p
   await expect(page.getByText('量化引擎当前不可用')).toHaveCount(0);
   await expect(page.getByRole('heading', { name: '用户风险画像' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '三情景执行框架' })).toBeVisible();
+});
+
+test('unified workbench: allocation research tab is the default capability', async ({ page }) => {
+  await page.goto('/advisor');
+  await expect(page.getByRole('heading', { name: '个性化投研' })).toBeVisible();
+  // Default tab = 配置研究, with its generate action.
+  await expect(page.getByRole('button', { name: /生成个性化配置研究/ })).toBeVisible();
+  // Both capability tabs are present.
+  await expect(page.getByRole('tab', { name: /配置研究/ })).toBeVisible();
+  await expect(page.getByRole('tab', { name: /提问分析/ })).toBeVisible();
 });
 
 test('simple mode hides methodology internals until toggled', async ({ page }) => {

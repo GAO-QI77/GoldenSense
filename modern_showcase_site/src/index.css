@@ -203,16 +203,24 @@ select:focus-visible {
 .topnav a {
   align-items: center;
   min-height: 38px;
-  padding: 0 14px;
-  color: rgba(245, 240, 230, 0.72);
+  padding: 0 13px;
+  color: rgba(245, 240, 230, 0.82);
   text-decoration: none;
+  white-space: nowrap;      /* never wrap a nav label mid-word */
+  font-size: 0.9rem;
+}
+
+.topnav a:hover {
+  color: var(--surface);
 }
 
 .topnav a.active {
   color: var(--surface);
-  background: rgba(236, 211, 154, 0.12);
+  background: rgba(236, 211, 154, 0.14);
   box-shadow: inset 0 0 0 1px rgba(236, 211, 154, 0.16);
 }
+
+.topbar { gap: 14px; }
 
 .compliance-pill {
   justify-self: end;
@@ -1189,6 +1197,98 @@ select:focus-visible {
   gap: 16px;
   position: sticky;
   top: 86px;
+}
+
+/* ---- unified 个性化投研 workbench ---- */
+.profile-card {
+  margin-top: 18px;
+  padding: 20px;
+  border: 1px solid rgba(201, 154, 56, 0.2);
+  border-radius: 14px;
+  background: linear-gradient(165deg, rgba(26, 24, 18, 0.9), rgba(14, 13, 10, 0.96));
+}
+.profile-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 20px;
+  margin-top: 14px;
+}
+.profile-fields .advanced-profile-block { grid-column: 1 / -1; }
+@media (max-width: 760px) {
+  .profile-fields { grid-template-columns: 1fr; }
+}
+
+.capability-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 18px 0 4px;
+}
+.capability-tabs button {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-areas: 'icon label' 'icon sub';
+  column-gap: 10px;
+  align-items: center;
+  text-align: left;
+  padding: 14px 18px;
+  border: 1px solid rgba(201, 154, 56, 0.22);
+  border-radius: 12px;
+  background: rgba(20, 19, 14, 0.6);
+  color: var(--text-dim, #a49c86);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+.capability-tabs button svg { grid-area: icon; }
+.capability-tabs button span { grid-area: label; font-size: 1rem; font-weight: 600; }
+.capability-tabs button small { grid-area: sub; font-size: 0.74rem; opacity: 0.8; }
+.capability-tabs button:hover { border-color: rgba(201, 154, 56, 0.45); color: var(--text-main, #ddd6c4); }
+.capability-tabs button.active {
+  border-color: rgba(232, 201, 121, 0.7);
+  background: linear-gradient(120deg, rgba(201, 154, 56, 0.16), rgba(232, 201, 121, 0.08));
+  color: var(--gold-bright, #e8c979);
+  box-shadow: inset 0 0 0 1px rgba(232, 201, 121, 0.25);
+}
+@media (max-width: 640px) {
+  .capability-tabs { grid-template-columns: 1fr; }
+}
+
+.capability-panel { margin-top: 14px; }
+.capability-intro {
+  padding: 16px 18px;
+  border: 1px solid rgba(201, 154, 56, 0.16);
+  border-radius: 12px;
+  background: rgba(20, 19, 14, 0.5);
+  display: grid;
+  gap: 14px;
+}
+.capability-intro p { margin: 0; line-height: 1.7; color: var(--text-main, #ddd6c4); font-size: 0.9rem; }
+.capability-intro strong { color: var(--gold-bright, #e8c979); }
+.capability-intro .primary-action { justify-self: start; }
+
+.capability-empty {
+  margin-top: 16px;
+  padding: 34px 20px;
+  border: 1px dashed rgba(201, 154, 56, 0.25);
+  border-radius: 12px;
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+  text-align: center;
+  color: var(--text-dim, #97917f);
+}
+.capability-empty svg { color: var(--gold-soft); }
+.capability-empty p { margin: 0; max-width: 44ch; }
+
+.qa-layout {
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+  margin-top: 16px;
+}
+@media (max-width: 980px) {
+  .qa-layout { flex-direction: column; }
+  .qa-layout .agent-context { width: 100%; position: static; }
 }
 
 .field {
