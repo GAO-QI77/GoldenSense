@@ -56,9 +56,13 @@ from market_view import build_market_view
 from narrative_critic import verify_narrative
 from personal_research import (
     build_personal_facts,
+    build_three_dimensional_brief,
     check_no_directive_language,
     draft_personal_narrative,
 )
+from evidence_shield import EvidenceShieldError, ingest_evidence
+from research_case import ResearchCaseStore
+from research_orchestrator import build_research_case
 from signal_ledger import (
     JsonlLedgerStore,
     publish_weekly,
@@ -3257,6 +3261,8 @@ def create_app(
     http_client: Optional[httpx.AsyncClient] = None,
     signal_ledger_store: Optional[Any] = None,
     subscription_store: Optional[Any] = None,
+    research_case_store: Optional[ResearchCaseStore] = None,
+    research_ocr: Optional[Any] = None,
 ) -> FastAPI:
     tool_timeout_seconds = float(_env("AGENT_TOOL_TIMEOUT_SECONDS", "35.0"))
     tool_connect_timeout_seconds = float(_env("AGENT_TOOL_CONNECT_TIMEOUT_SECONDS", "1.5"))
@@ -3316,6 +3322,10 @@ def create_app(
         app.state.subscription_store = subscription_store or SubscriptionStore(
             _env("SUBSCRIPTIONS_PATH", "data_cache/subscriptions.jsonl")
         )
+        app.state.research_case_store = research_case_store or ResearchCaseStore(
+            max_items=int(_env("RESEARCH_CASE_MAX_ITEMS", "200"))
+        )
+        app.state.research_ocr = research_ocr
         app.state.trace_store = trace_store or AgentTraceStore(
             database_url,
             allow_memory_fallback=allow_trace_memory_fallback,
@@ -3549,11 +3559,146 @@ def create_app(
             ) from exc
         return JSONResponse(content=jsonable_encoder(build_market_view(ctx)))
 
+    @app.post("/api/v1/agent/research-cases", status_code=201)
+    async def create_research_case(request: Request) -> JSONResponse:
+        """Create one shared research blackboard from a question and optional
+        URL/PDF/image. External text is gated before expert orchestration; raw
+        file bytes and investor data are never written to the case store."""
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+
+        media_type = request.headers.get("content-type", "").lower()
+        question: Any = None
+        url: Any = None
+        mode: Any = "full"
+        filename: Optional[str] = None
+        upload_type: Optional[str] = None
+        payload: Optional[bytes] = None
+        if media_type.startswith("application/json"):
+            try:
+                body = await request.json()
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error_code": "invalid_json", "message": "request body must be valid JSON"},
+                ) from exc
+            question = body.get("question") if isinstance(body, dict) else None
+            url = body.get("url") if isinstance(body, dict) else None
+            mode = body.get("mode", "full") if isinstance(body, dict) else "full"
+        elif "multipart/form-data" in media_type or "application/x-www-form-urlencoded" in media_type:
+            try:
+                form = await request.form()
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error_code": "invalid_multipart", "message": "multipart form could not be parsed"},
+                ) from exc
+            question = form.get("question")
+            url = form.get("url")
+            mode = form.get("mode") or "full"
+            upload = form.get("file")
+            if upload is not None and hasattr(upload, "read"):
+                filename = getattr(upload, "filename", None)
+                upload_type = getattr(upload, "content_type", None)
+                payload = await upload.read()
+                if hasattr(upload, "close"):
+                    await upload.close()
+        else:
+            raise HTTPException(
+                status_code=415,
+                detail={"error_code": "unsupported_content_type", "message": "use JSON or multipart/form-data"},
+            )
+
+        if not isinstance(question, str) or not question.strip() or len(question.strip()) > 2000:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "invalid_question", "message": "question must contain 1-2000 characters"},
+            )
+        if mode not in {"draft", "full"}:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_code": "invalid_mode", "message": "mode must be draft or full"},
+            )
+        try:
+            packet = await ingest_evidence(
+                question=question.strip(),
+                url=str(url).strip() if url else None,
+                filename=filename,
+                content_type=upload_type,
+                payload=payload,
+                http=app.state.http,
+                ocr=app.state.research_ocr,
+            )
+        except EvidenceShieldError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"error_code": exc.code, "message": str(exc)},
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"error_code": "evidence_fetch_failed", "message": f"{type(exc).__name__}: {exc}"},
+            ) from exc
+
+        try:
+            ctx = await asyncio.to_thread(quant_research_context.get_context)
+            case = await asyncio.to_thread(
+                build_research_case, question.strip(), packet, ctx, mode=mode
+            )
+            saved = app.state.research_case_store.save(case)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"error_code": "research_case_unavailable", "message": f"{type(exc).__name__}: {exc}"},
+            ) from exc
+        return JSONResponse(status_code=201, content=jsonable_encoder(saved.model_dump()))
+
+    @app.get("/api/v1/agent/research-cases/{case_id}")
+    async def get_research_case(case_id: str, request: Request) -> JSONResponse:
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        case = app.state.research_case_store.get(case_id)
+        if case is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "research_case_not_found", "message": "research case not found"},
+            )
+        return JSONResponse(content=jsonable_encoder(case.model_dump()))
+
+    @app.post("/api/v1/agent/research-cases/{case_id}/personalize")
+    async def personalize_research_case(
+        case_id: str,
+        profile: PersonalResearchProfile,
+        request: Request,
+    ) -> JSONResponse:
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        case = app.state.research_case_store.get(case_id)
+        if case is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error_code": "research_case_not_found", "message": "research case not found"},
+            )
+        try:
+            ctx = await asyncio.to_thread(quant_research_context.get_context)
+            brief = build_three_dimensional_brief(profile, ctx, case)
+            saved = case.model_copy(update={"personalized_brief": brief, "investor_profile": None})
+            app.state.research_case_store.save(saved)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={"error_code": "personalization_unavailable", "message": f"{type(exc).__name__}: {exc}"},
+            ) from exc
+        return JSONResponse(content=jsonable_encoder(brief))
+
     @app.post("/api/v1/agent/personal-research")
     async def personal_research(
         profile: PersonalResearchProfile,
         request: Request,
         mode: Literal["draft", "full"] = "full",
+        research_case_id: Optional[str] = None,
     ) -> JSONResponse:
         """Personalized research analysis: deterministic rule-engine facts
         (reference range / position gap / risk flags / horizon evidence) plus
@@ -3612,6 +3757,19 @@ def create_app(
                     narrative = draft
                     generated_by = "deterministic_draft"
 
+        linked_brief: Optional[Dict[str, Any]] = None
+        if research_case_id:
+            linked_case = app.state.research_case_store.get(research_case_id)
+            if linked_case is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"error_code": "research_case_not_found", "message": "research case not found"},
+                )
+            linked_brief = build_three_dimensional_brief(profile, ctx, linked_case)
+            app.state.research_case_store.save(
+                linked_case.model_copy(update={"personalized_brief": linked_brief, "investor_profile": None})
+            )
+
         return JSONResponse(
             content=jsonable_encoder(
                 {
@@ -3622,6 +3780,8 @@ def create_app(
                     "generated_by": generated_by,
                     "critic_report": critic_report,
                     "mode": mode,
+                    "research_case_id": research_case_id,
+                    "three_dimensional_brief": linked_brief,
                 }
             )
         )

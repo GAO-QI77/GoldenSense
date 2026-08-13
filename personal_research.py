@@ -58,6 +58,92 @@ def check_no_directive_language(texts: List[str]) -> Tuple[bool, List[str]]:
     return (not violations), violations
 
 
+def build_three_dimensional_brief(
+    profile: InvestorProfile,
+    ctx: Dict[str, Any],
+    research_case: Any,
+) -> Dict[str, Any]:
+    """Join Agent interpretation, hard rules and live API/model state.
+
+    The returned object intentionally excludes the investor profile so it can
+    be attached to a case without persisting personal inputs server-side.
+    """
+    facts = build_personal_facts(profile, ctx)
+    horizon_key = _HORIZON_TO_SECTION[profile.horizon]
+    strategy = research_case.horizon_strategy.get(horizon_key)
+    if strategy is None:
+        core = "当前期限策略降级，本次只保留风险观察清单。"
+        scenarios: List[Dict[str, Any]] = []
+        triggers: List[str] = []
+        invalidation: List[str] = []
+        next_review_at = research_case.created_at.isoformat()
+    else:
+        core = strategy.base.description
+        scenarios = [
+            strategy.base.model_dump(), strategy.upside.model_dump(), strategy.downside.model_dump()
+        ]
+        triggers = list(strategy.triggers)
+        invalidation = list(strategy.invalidation)
+        next_review_at = strategy.next_review_at.isoformat()
+
+    hard_constraints = [
+        "输出仅是研究行动清单，不构成直接买卖或目标仓位指令。",
+        "任何模型都不能覆盖证据门控、数据陈旧标记或个人风险约束。",
+    ]
+    if profile.leverage_attitude in {"medium", "high"}:
+        hard_constraints.append("本系统不对杠杆黄金暴露给出配置结论。")
+
+    model_states = [
+        {
+            "model_id": card.model_id,
+            "label": card.label,
+            "state": card.state,
+            "role": card.role,
+            "can_influence_strategy": card.can_influence_strategy,
+            "degradation_reason": card.degradation_reason,
+        }
+        for card in research_case.model_registry
+    ]
+    brief = {
+        "case_id": research_case.case_id,
+        "agent": {
+            "core_conclusion": core,
+            "scenario_focus": scenarios,
+            "experience_mode": profile.experience,
+        },
+        "rules": {
+            "risk_flags": facts.get("risk_flags", []),
+            "hard_constraints": hard_constraints,
+            "reference_range": facts.get("reference_range"),
+            "position_gap": facts.get("position_gap"),
+        },
+        "api": {
+            "data_asof": ctx.get("data_asof"),
+            "data_age_days": ctx.get("data_age_days"),
+            "freshness": "stale" if ctx.get("data_stale") else "current",
+            "is_realtime": bool(ctx.get("is_realtime", False)),
+            "model_states": model_states,
+            "evidence_status": research_case.status,
+        },
+        "watchlist": triggers,
+        "invalidation": invalidation,
+        "next_review_at": next_review_at,
+        "degradation_flags": sorted(set(
+            list((facts.get("degraded") or {}).values())
+            + list(research_case.audit_report.issues)
+        )),
+        "disclaimer": facts.get("disclaimer", ALLOCATION_DISCLAIMER),
+    }
+    texts = [
+        str(brief["agent"]["core_conclusion"]),
+        *brief["watchlist"], *brief["invalidation"], *hard_constraints,
+    ]
+    safe, violations = check_no_directive_language(texts)
+    if not safe:  # deterministic output should never reach this branch
+        raise ValueError("three-dimensional brief violated directive gate: " + "; ".join(violations))
+    return brief
+
+
 # --------------------------------------------------------------------------- #
 def build_personal_facts(profile: InvestorProfile, ctx: Dict[str, Any]) -> Dict[str, Any]:
     """All personalized numbers, from validated blocks only."""
