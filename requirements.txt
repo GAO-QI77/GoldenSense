@@ -27,3 +27,6 @@ transformers==4.56.0
 sentence-transformers==5.1.0
 psycopg[binary]==3.3.3
 openai==2.30.0
+python-multipart==0.0.22
+pypdf==6.7.0
+Pillow==12.3.0
