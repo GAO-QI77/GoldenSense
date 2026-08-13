@@ -60,7 +60,7 @@ from personal_research import (
     check_no_directive_language,
     draft_personal_narrative,
 )
-from evidence_shield import EvidenceShieldError, ingest_evidence
+from evidence_shield import EvidenceShieldError, ingest_evidence, local_tesseract_ocr
 from research_case import ResearchCaseStore
 from research_orchestrator import build_research_case
 from signal_ledger import (
@@ -3325,7 +3325,7 @@ def create_app(
         app.state.research_case_store = research_case_store or ResearchCaseStore(
             max_items=int(_env("RESEARCH_CASE_MAX_ITEMS", "200"))
         )
-        app.state.research_ocr = research_ocr
+        app.state.research_ocr = research_ocr or local_tesseract_ocr
         app.state.trace_store = trace_store or AgentTraceStore(
             database_url,
             allow_memory_fallback=allow_trace_memory_fallback,

@@ -76,6 +76,17 @@ class EvidencePacket(StrictModel):
         return [fact for fact in self.facts if fact.status == "accepted"]
 
 
+def local_tesseract_ocr(payload: bytes) -> str:
+    """Local-only OCR adapter used by the gateway when Tesseract is present."""
+    import pytesseract
+
+    with Image.open(BytesIO(payload)) as image:
+        languages = set(pytesseract.get_languages(config=""))
+        preferred = [language for language in ("chi_sim", "eng") if language in languages]
+        language = "+".join(preferred) if preferred else None
+        return pytesseract.image_to_string(image.convert("RGB"), lang=language, config="--psm 6")
+
+
 def _is_public_address(raw: str) -> bool:
     address = ipaddress.ip_address(raw)
     return bool(address.is_global and not any((
@@ -306,12 +317,17 @@ async def ingest_evidence(
                     extraction_status = "abstain"
                     degradation.append("local_ocr_unavailable_or_complex_chart")
                 else:
-                    text = (ocr(payload) or "").strip()
+                    try:
+                        text = (ocr(payload) or "").strip()
+                    except Exception:
+                        text = ""
+                        degradation.append("local_ocr_failed")
                     if text:
                         locations = ["image full-frame"]
                     else:
                         extraction_status = "abstain"
-                        degradation.append("ocr_returned_no_reliable_text")
+                        if "local_ocr_failed" not in degradation:
+                            degradation.append("ocr_returned_no_reliable_text")
             else:
                 raise EvidenceShieldError("unsupported_mime", "only PDF, PNG, JPEG and WebP are accepted", status_code=415)
         else:

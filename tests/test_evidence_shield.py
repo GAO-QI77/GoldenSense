@@ -134,6 +134,16 @@ def test_image_uses_injected_local_ocr_and_abstains_when_ocr_is_unavailable():
     assert not abstained.accepted_facts
     assert next(g for g in abstained.gates if g.gate == "fact_location").decision == "abstain"
 
+    failed_engine = asyncio.run(ingest_evidence(
+        question="read chart",
+        filename="chart.png",
+        content_type="image/png",
+        payload=_png(),
+        ocr=lambda _: (_ for _ in ()).throw(RuntimeError("tesseract missing")),
+    ))
+    assert failed_engine.document.extraction_status == "abstain"
+    assert "local_ocr_failed" in failed_engine.document.degradation_flags
+
 
 def test_stale_replay_and_unit_conflict_lower_evidence_confidence():
     old = (datetime.now(timezone.utc) - timedelta(days=400)).date().isoformat()

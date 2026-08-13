@@ -8,6 +8,8 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
+    tesseract-ocr \
+    tesseract-ocr-chi-sim \
   && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.public.txt /app/requirements.public.txt
