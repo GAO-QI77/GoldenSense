@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 
 import { addSearchEntries } from './searchIndex';
+import { ActiveCaseRibbon, ModelGovernancePanel } from './ResearchCasePanel';
 
 const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
 const RESEARCH_URL =
@@ -139,6 +140,10 @@ export default function QuantPage() {
           {loading ? '加载中' : error ? '数据异常' : '量化链路正常'}
         </div>
       </section>
+
+      <ActiveCaseRibbon />
+
+      <ModelGovernancePanel />
 
       {error && (
         <div className="quant-error" role="alert">

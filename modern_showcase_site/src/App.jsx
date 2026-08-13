@@ -36,6 +36,7 @@ import EventAlertBanner from './EventAlertBanner';
 import GlobalSearch from './GlobalSearch';
 import QuantPage from './QuantPage';
 import SignalsPage from './SignalsPage';
+import { ActiveCaseRibbon, ResearchCaseWorkspace } from './ResearchCasePanel';
 import { AdvancedProfileFields, CoreProfileFields } from './profileFields';
 import { loadProfile, saveProfile, toLegacyAnalyzeProfile } from './profileStore';
 import { addSearchEntries } from './searchIndex';
@@ -330,6 +331,8 @@ function DashboardPage() {
         <StatusBadge status={dashboardStatus} loading={loading} />
       </section>
 
+      <ResearchCaseWorkspace />
+
       {error ? <ErrorPanel title="首页研究数据不可用" message={error} /> : null}
 
       <section className="market-strip" aria-label="Market summary">
@@ -483,6 +486,8 @@ function AdvisorWorkbench() {
           <small>score {profileScore}</small>
         </div>
       </section>
+
+      <ActiveCaseRibbon />
 
       <section className="profile-card">
         <PanelTitle

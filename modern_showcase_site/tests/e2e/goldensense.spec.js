@@ -214,6 +214,76 @@ const analysisPayload = {
   timing_ms: { total: 90 },
 };
 
+const researchCasePayload = {
+  case_id: 'rc_playwright_closed_loop',
+  question: 'FOMC statement impact on gold',
+  asset: 'XAUUSD',
+  created_at: '2026-08-13T08:00:00Z',
+  data_asof: '2026-08-12',
+  status: 'complete',
+  investor_profile: null,
+  evidence_documents: [{
+    document_id: 'doc_mock', kind: 'url', filename: null, sha256: 'a'.repeat(64),
+    source_url: 'https://www.federalreserve.gov/mock', content_type: 'text/html',
+    source_tier: 'primary', retrieved_at: '2026-08-13T08:00:00Z', persisted_raw: false,
+    extraction_status: 'complete', degradation_flags: [],
+  }],
+  fact_claims: [{
+    claim_id: 'fact_mock', document_id: 'doc_mock', text: 'Real yields fell after the statement.',
+    locator: 'https://www.federalreserve.gov/mock', status: 'accepted', confidence: 0.9, tags: [],
+  }],
+  gate_report: [
+    ['access', 'pass'], ['provenance_time', 'pass'], ['fact_location', 'pass'],
+    ['ai_attack', 'pass'], ['dedup_replay', 'pass'], ['consistency', 'pass'],
+    ['market_coherence', 'review'], ['output_audit', 'pass'],
+  ].map(([gate, decision]) => ({
+    gate, decision, reason: `${gate} mock audit`,
+    confidence_multiplier: decision === 'review' ? 0.9 : 1, evidence_refs: ['fact_mock'],
+  })),
+  model_registry: [
+    { model_id: 'flagship', label: 'Integrated flagship', state: 'production', role: 'champion', oos_metric: 'Sharpe 0.70 / max drawdown -21%', can_influence_strategy: true },
+    { model_id: 'transformer', label: 'Transformer', state: 'watch', role: 'challenger', degradation_reason: 'not_walk_forward_validated', can_influence_strategy: false },
+  ],
+  conflicts: [{
+    topic: 'macro vs flows', majority_view: 'no majority', minority_view: 'ETF flow disagrees',
+    agent_ids: ['macro_event', 'technical_flows'], resolution: 'Preserve minority view.',
+  }],
+  horizon_strategy: Object.fromEntries([
+    ['short_term', 'risk'], ['mid_term', 'bullish'], ['long_term', 'neutral'],
+  ].map(([horizon, stance]) => [horizon, {
+    horizon, stance, confidence: 0.6, priced_in: 'uncertain',
+    base: { label: 'base', probability: 0.6, description: `${horizon} base case` },
+    upside: { label: 'upside', probability: 0.2, description: `${horizon} upside` },
+    downside: { label: 'downside', probability: 0.2, description: `${horizon} downside` },
+    triggers: ['real yields', 'USD reaction'], invalidation: ['market reaction reverses'],
+    next_review_at: '2026-08-20T08:00:00Z', degradation_flags: horizon === 'short_term' ? ['unsupported_direction_model_direction_abstained'] : [],
+  }])),
+  audit_report: { passed: true, issues: [], checked_at: '2026-08-13T08:00:00Z' },
+};
+
+const personalResearchPayload = {
+  profile_echo: { risk_tolerance: 'balanced', horizon: 'mid', current_gold_pct: 10, experience: 'novice' },
+  facts: {
+    reference_range: { available: true, range_pct: [5, 15], midpoint: 10 },
+    position_gap: { status: 'within', current_gold_pct: 10, gap_pct: 0 },
+    risk_flags: [],
+    horizon_evidence: { horizon: 'mid_term', section: { available: true, evidence: ['HMM elevated 70%'] } },
+  },
+  narrative: {
+    overview: '研究画像摘要', position_analysis: '当前处于参考区间内。', risk_notes: [],
+    horizon_note: '中期状态保持观察。', disclaimer: '仅用于教育型研究参考，不构成投资建议。',
+  },
+  degradation_flags: [], generated_by: 'deterministic_draft', mode: 'draft',
+  research_case_id: 'rc_playwright_closed_loop',
+  three_dimensional_brief: {
+    case_id: 'rc_playwright_closed_loop',
+    agent: { core_conclusion: '中期基础情景保持偏多观察。', scenario_focus: [] },
+    rules: { risk_flags: [], hard_constraints: ['不输出直接买卖指令。'] },
+    api: { data_asof: '2026-08-12', freshness: 'current', model_states: researchCasePayload.model_registry },
+    watchlist: ['real yields'], invalidation: ['market reaction reverses'], next_review_at: '2026-08-20T08:00:00Z',
+  },
+};
+
 test.beforeEach(async ({ page }) => {
   await page.route('**/api/v1/agent/dashboard/current', async (route) => {
     await route.fulfill({ json: dashboardPayload });
@@ -226,6 +296,18 @@ test.beforeEach(async ({ page }) => {
   });
   await page.route('**/api/v1/agent/feedback', async (route) => {
     await route.fulfill({ json: { analysis_id: 'analysis-playwright', status: 'recorded' } });
+  });
+  await page.route('**/api/v1/agent/research-cases', async (route) => {
+    await route.fulfill({ status: 201, json: researchCasePayload });
+  });
+  await page.route('**/api/v1/agent/research-cases/*', async (route) => {
+    await route.fulfill({ json: researchCasePayload });
+  });
+  await page.route('**/api/v1/agent/personal-research?*', async (route) => {
+    const url = new URL(route.request().url());
+    await route.fulfill({
+      json: { ...personalResearchPayload, mode: url.searchParams.get('mode') || 'full' },
+    });
   });
 });
 
@@ -335,4 +417,39 @@ test('mobile dashboard does not create horizontal overflow', async ({ page }) =>
     () => document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
   );
   expect(hasHorizontalOverflow).toBe(false);
+});
+
+test('one research case connects intake, shield, models, strategy and personalization', async ({ page }) => {
+  await usePro(page);
+  await page.goto('/');
+
+  await expect(page.getByRole('heading', { name: '创建统一研究案件' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'URL' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'PDF' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '图片' })).toBeVisible();
+  await page.getByLabel('研究问题').fill('FOMC statement impact on gold');
+  await page.getByLabel('证据 URL').fill('https://www.federalreserve.gov/mock');
+  await page.getByRole('button', { name: '运行研究闭环' }).click();
+
+  await expect(page.getByText('rc_playwright_closed_loop', { exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Evidence Shield · 8层证据护盾' })).toBeVisible();
+  await expect(page.getByText('AI攻击门')).toBeVisible();
+
+  await page.getByRole('link', { name: /量化研究/ }).click();
+  await expect(page.getByText('rc_playwright_closed_loop', { exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '模型冠军—挑战者治理' })).toBeVisible();
+  await expect(page.getByText('Transformer')).toBeVisible();
+  await expect(page.getByText('观察', { exact: true })).toBeVisible();
+
+  await page.getByRole('link', { name: /观点书与台账/ }).click();
+  await expect(page.getByRole('heading', { name: '当前案件三期限策略' })).toBeVisible();
+  await expect(page.getByText('少数意见保留')).toBeVisible();
+
+  await page.getByRole('link', { name: /个性化投研/ }).click();
+  await expect(page.getByText('rc_playwright_closed_loop', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: /生成个性化配置研究/ }).click();
+  await expect(page.getByRole('heading', { name: 'Agent × 规则 × API 三维建议' })).toBeVisible();
+  await expect(page.getByText('Agent解释层')).toBeVisible();
+  await expect(page.getByText('硬规则层')).toBeVisible();
+  await expect(page.getByText('实时API层')).toBeVisible();
 });

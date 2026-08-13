@@ -10,6 +10,8 @@ import {
 } from 'lucide-react';
 
 import { toPersonalResearchBody } from './profileStore';
+import { ThreeDimensionalBrief } from './ResearchCasePanel';
+import { useActiveResearchCase } from './researchCaseStore';
 
 const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
 const PERSONAL_URL =
@@ -40,8 +42,10 @@ const horizonSectionLabels = {
   long_term: '长期观点',
 };
 
-async function postPersonal(body, mode, signal) {
-  const response = await fetch(`${PERSONAL_URL}?mode=${mode}`, {
+async function postPersonal(body, mode, signal, caseId = null) {
+  const params = new URLSearchParams({ mode });
+  if (caseId) params.set('research_case_id', caseId);
+  const response = await fetch(`${PERSONAL_URL}?${params.toString()}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
     body: JSON.stringify(body),
@@ -64,6 +68,7 @@ async function postPersonal(body, mode, signal) {
 // profile is owned by the parent workbench and passed in; this component only
 // renders the "generate" action and its output.
 export default function AllocationResearchPanel({ profile }) {
+  const activeCase = useActiveResearchCase();
   const [result, setResult] = useState(null);
   const [phase, setPhase] = useState('idle'); // idle | draft-loading | polishing | done | draft-only
   const [error, setError] = useState('');
@@ -77,7 +82,7 @@ export default function AllocationResearchPanel({ profile }) {
 
     // Phase 1: deterministic draft — every number, in about a second.
     try {
-      const draft = await postPersonal(body, 'draft');
+      const draft = await postPersonal(body, 'draft', undefined, activeCase?.case_id);
       if (generationRef.current !== generation) return;
       setResult(draft);
       setPhase('polishing');
@@ -90,7 +95,7 @@ export default function AllocationResearchPanel({ profile }) {
 
     // Phase 2: LLM polish — swap the narrative in place when it lands.
     try {
-      const full = await postPersonal(body, 'full');
+      const full = await postPersonal(body, 'full', undefined, activeCase?.case_id);
       if (generationRef.current !== generation) return;
       setResult(full);
       setPhase('done');
@@ -249,6 +254,7 @@ export default function AllocationResearchPanel({ profile }) {
               <p className="disclaimer">{narrative?.disclaimer}</p>
             </section>
           </div>
+          <ThreeDimensionalBrief brief={result.three_dimensional_brief} />
         </div>
       ) : (
         phase === 'idle' ? (

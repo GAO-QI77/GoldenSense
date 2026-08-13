@@ -34,6 +34,7 @@ const confidenceTone = { 高: 'bull', 中: 'neutral', 低: 'risk' };
 
 // eslint-disable-next-line import/order
 import { useViewMode } from './viewMode';
+import { ActiveCaseRibbon, CaseStrategyPanel } from './ResearchCasePanel';
 
 function headers() {
   return { 'X-API-Key': API_KEY };
@@ -109,6 +110,10 @@ export default function SignalsPage() {
           append-only · 不回填
         </div>
       </section>
+
+      <ActiveCaseRibbon />
+
+      <CaseStrategyPanel />
 
       {meta ? (
         <div className={`freshness-banner ${meta.data_stale ? 'stale' : ''}`}>
