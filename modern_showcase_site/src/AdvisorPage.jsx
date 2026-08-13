@@ -11,7 +11,7 @@ import {
 
 import { toPersonalResearchBody } from './profileStore';
 import { ThreeDimensionalBrief } from './ResearchCasePanel';
-import { useActiveResearchCase } from './researchCaseStore';
+import { getResearchHeaders, useActiveResearchCase } from './researchCaseStore';
 
 const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
 const PERSONAL_URL =
@@ -47,7 +47,7 @@ async function postPersonal(body, mode, signal, caseId = null) {
   if (caseId) params.set('research_case_id', caseId);
   const response = await fetch(`${PERSONAL_URL}?${params.toString()}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
+    headers: { 'Content-Type': 'application/json', ...getResearchHeaders(API_KEY) },
     body: JSON.stringify(body),
     signal,
   });

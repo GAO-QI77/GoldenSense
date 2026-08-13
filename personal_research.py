@@ -43,8 +43,11 @@ _DIRECTIVE_PATTERNS = [
     r"必须\s*(买|卖|持有)",
     r"抄底",
     r"(买入|卖出)信号",
+    r"\b(?:buy|sell)\s+(?:gold|xau|now)\b",
+    r"\b(?:go|move)\s+all[- ]in\b",
+    r"\bmust\s+(?:buy|sell)\b",
 ]
-_DIRECTIVE_RES = [re.compile(p) for p in _DIRECTIVE_PATTERNS]
+_DIRECTIVE_RES = [re.compile(p, re.I) for p in _DIRECTIVE_PATTERNS]
 
 
 def check_no_directive_language(texts: List[str]) -> Tuple[bool, List[str]]:
@@ -122,6 +125,8 @@ def build_three_dimensional_brief(
             "data_age_days": ctx.get("data_age_days"),
             "freshness": "stale" if ctx.get("data_stale") else "current",
             "is_realtime": bool(ctx.get("is_realtime", False)),
+            "series_asof": ctx.get("series_asof", {}),
+            "stale_series": ctx.get("stale_series", []),
             "model_states": model_states,
             "evidence_status": research_case.status,
         },

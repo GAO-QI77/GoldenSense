@@ -3534,6 +3534,10 @@ select {
 }
 
 .case-workspace-result .active-case-ribbon { margin: 0; border: 0; }
+.case-narrative { padding: 14px 18px; border-top: 1px solid rgba(157, 107, 33, 0.15); background: rgba(255, 251, 239, 0.88); }
+.case-narrative span { color: var(--amber); font-size: 0.72rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+.case-narrative p { margin: 5px 0 0; color: var(--ink); line-height: 1.65; }
+.case-narrative small { display: block; margin-top: 5px; color: var(--danger); }
 
 .active-case-ribbon.blocked {
   border-color: rgba(165, 72, 54, 0.5);

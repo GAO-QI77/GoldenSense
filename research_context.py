@@ -93,6 +93,25 @@ class LocalQuantContext:
             context["data_stale"] = age_days > DATA_STALE_AFTER_DAYS
             context["data_stale_after_days"] = DATA_STALE_AFTER_DAYS
             context["is_realtime"] = False
+            # Per-series clock: a newly appended row may contain forward-filled
+            # values from sources that have not published yet.  Surface each
+            # series' last observed change instead of letting the frame's max
+            # date masquerade as universal freshness.
+            series_asof: Dict[str, str] = {}
+            series_age_days: Dict[str, int] = {}
+            for column in raw.columns:
+                values = raw[column].dropna()
+                if values.empty:
+                    continue
+                changed = values.ne(values.shift(1))
+                last_change = pd.Timestamp(values.index[changed][-1])
+                series_asof[str(column)] = str(last_change.date())
+                series_age_days[str(column)] = int((now - last_change.normalize()).days)
+            context["series_asof"] = series_asof
+            context["series_age_days"] = series_age_days
+            context["stale_series"] = sorted(
+                name for name, age in series_age_days.items() if age > DATA_STALE_AFTER_DAYS
+            )
             if source == "base":
                 # The long extended dataset never made it into this deploy;
                 # every quant block silently fell back to the short sample.

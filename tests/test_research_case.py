@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from pydantic import ValidationError
@@ -13,6 +13,9 @@ from research_case import (
     HorizonStrategy,
     ResearchCase,
     ResearchCaseStore,
+    JsonlResearchCaseStore,
+    OutcomeCheckpoint,
+    score_due_outcomes,
 )
 
 
@@ -136,3 +139,78 @@ def test_gate_confidence_multiplier_is_bounded():
             reason="uncertain",
             confidence_multiplier=1.5,
         )
+
+
+def test_jsonl_store_is_append_only_and_loads_latest_revision(tmp_path):
+    path = tmp_path / "research_cases.jsonl"
+    store = JsonlResearchCaseStore(path, max_items=5)
+    original = _case("rc_append")
+    store.save(original)
+    store.save(original.model_copy(update={"personalized_brief": {"case_id": "rc_append"}}))
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert all('"personalized_brief":null' in line for line in lines)
+    assert store.get("rc_append").personalized_brief is None
+
+    restored = JsonlResearchCaseStore(path, max_items=5)
+    assert restored.get("rc_append").personalized_brief is None
+
+
+def test_due_outcomes_are_scored_forward_without_touching_future_checkpoints():
+    case = _case("rc_score")
+    published = case.created_at
+    case.horizon_strategy["short_term"] = case.horizon_strategy["mid_term"].model_copy(
+        update={
+            "horizon": "short_term",
+            "stance": "risk",
+            "next_review_at": published,
+        }
+    )
+    case.outcome_schedule = [
+        OutcomeCheckpoint(
+            horizon="short_term", due_at=published, status="scheduled", entry_price=3000.0,
+        ),
+        OutcomeCheckpoint(
+            horizon="long_term", due_at=datetime(2027, 8, 13, tzinfo=timezone.utc),
+            status="scheduled", entry_price=3000.0,
+        ),
+    ]
+
+    scored = score_due_outcomes(case, as_of=published, price_at=lambda _: 3060.0)
+
+    short, future = scored.outcome_schedule
+    assert short.status == "scored"
+    assert short.realized_return == pytest.approx(0.02)
+    assert short.direction_score is None  # risk/abstain calls are not directionally scored
+    assert future.status == "scheduled" and future.realized_return is None
+
+
+def test_forward_scoring_uses_each_checkpoint_due_date_price():
+    case = _case("rc_due_prices")
+    start = case.created_at
+    case.outcome_schedule = [
+        OutcomeCheckpoint(horizon="short_term", due_at=start, entry_price=100.0),
+        OutcomeCheckpoint(horizon="mid_term", due_at=start + timedelta(days=1), entry_price=100.0),
+    ]
+    prices = {start: 101.0, start + timedelta(days=1): 110.0}
+
+    scored = score_due_outcomes(
+        case,
+        as_of=start + timedelta(days=2),
+        price_at=lambda due_at: prices.get(due_at),
+    )
+
+    assert [item.realized_return for item in scored.outcome_schedule] == pytest.approx([0.01, 0.10])
+
+
+def test_matured_checkpoint_retries_when_due_date_price_arrives_later():
+    case = _case("rc_retry_price")
+    due = case.created_at
+    case.outcome_schedule = [OutcomeCheckpoint(horizon="short_term", due_at=due, entry_price=100.0)]
+    waiting = score_due_outcomes(case, as_of=due, price_at=lambda _: None)
+    assert waiting.outcome_schedule[0].status == "matured"
+
+    scored = score_due_outcomes(waiting, as_of=due + timedelta(days=1), price_at=lambda _: 102.0)
+    assert scored.outcome_schedule[0].status == "scored"
+    assert scored.outcome_schedule[0].realized_return == pytest.approx(0.02)

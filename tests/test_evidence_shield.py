@@ -67,6 +67,53 @@ def test_redirect_is_revalidated_and_private_target_is_blocked():
         asyncio.run(run())
 
 
+def test_connected_peer_must_match_validated_dns_address():
+    class Peer:
+        def get_extra_info(self, key):
+            return ("127.0.0.1", 443) if key == "server_addr" else None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            text="Gold evidence text.",
+            extensions={"network_stream": Peer()},
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await ingest_evidence(
+                question="impact",
+                url="https://example.com/report",
+                http=client,
+                resolver=_resolver,
+            )
+
+    with pytest.raises(EvidenceShieldError, match="validated public address"):
+        asyncio.run(run())
+
+
+def test_url_body_is_rejected_when_stream_crosses_size_limit():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            content=b"x" * (5 * 1024 * 1024 + 1),
+        )
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await ingest_evidence(
+                question="impact",
+                url="https://example.com/report",
+                http=client,
+                resolver=_resolver,
+            )
+
+    with pytest.raises(EvidenceShieldError, match="5 MB"):
+        asyncio.run(run())
+
+
 def test_pdf_text_becomes_page_located_facts_and_raw_bytes_are_not_retained():
     packet = asyncio.run(ingest_evidence(
         question="What changed?",
@@ -145,6 +192,19 @@ def test_image_uses_injected_local_ocr_and_abstains_when_ocr_is_unavailable():
     assert "local_ocr_failed" in failed_engine.document.degradation_flags
 
 
+def test_image_declared_mime_must_match_detected_format():
+    jpeg = BytesIO()
+    Image.new("RGB", (20, 20), "white").save(jpeg, format="JPEG")
+    with pytest.raises(EvidenceShieldError, match="signature"):
+        asyncio.run(ingest_evidence(
+            question="read image",
+            filename="spoof.png",
+            content_type="image/png",
+            payload=jpeg.getvalue(),
+            ocr=lambda _: "Gold evidence text.",
+        ))
+
+
 def test_stale_replay_and_unit_conflict_lower_evidence_confidence():
     old = (datetime.now(timezone.utc) - timedelta(days=400)).date().isoformat()
     packet = asyncio.run(ingest_evidence(
@@ -161,3 +221,5 @@ def test_stale_replay_and_unit_conflict_lower_evidence_confidence():
     assert next(g for g in packet.gates if g.gate == "dedup_replay").decision == "review"
     assert next(g for g in packet.gates if g.gate == "consistency").decision == "review"
     assert packet.confidence < 1.0
+    assert not packet.accepted_facts
+    assert all(fact.status == "review" for fact in packet.facts)

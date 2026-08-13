@@ -70,6 +70,20 @@ def test_expert_selection_is_dynamic_but_quant_risk_is_always_present():
     ]
 
 
+def test_draft_mode_keeps_basic_strategy_without_running_domain_experts():
+    case = build_research_case(
+        "CPI and ETF flows",
+        _packet("Inflation and ETF inflows affected gold."),
+        _ctx(),
+        mode="draft",
+    )
+
+    agents = {view.agent for view in case.agent_views}
+    assert "macro_event" not in agents and "technical_flows" not in agents
+    assert agents == {"quant_model_risk", "strategy_arbitrator"}
+    assert set(case.horizon_strategy) == {"short_term", "mid_term", "long_term"}
+
+
 def test_case_has_three_horizons_and_short_term_refuses_unsupported_direction():
     case = build_research_case(
         "How does CPI affect gold?",
@@ -125,3 +139,60 @@ def test_model_registry_exposes_oos_governance_not_accuracy_marketing():
     assert "Sharpe" in champion.oos_metric
     assert transformer.state == "watch"
     assert transformer.degradation_reason == "not_walk_forward_validated"
+
+
+def test_validated_flagship_without_embedded_governance_is_not_falsely_demoted():
+    ctx = _ctx()
+    ctx["flagship"].pop("governance")
+
+    case = build_research_case("gold outlook", _packet("Gold market update."), ctx)
+
+    flagship = next(card for card in case.model_registry if card.model_id == "flagship")
+    assert flagship.state == "production"
+    assert flagship.can_influence_strategy is True
+
+
+def test_degraded_champion_cannot_influence_strategy():
+    ctx = _ctx()
+    ctx["degraded"] = {"regime_posterior": "fit_failed", "vol_bands": "coverage_failed"}
+
+    case = build_research_case("gold outlook", _packet("Gold market update."), ctx)
+
+    hmm = next(card for card in case.model_registry if card.model_id == "hmm")
+    har = next(card for card in case.model_registry if card.model_id == "har_rv")
+    assert hmm.state == har.state == "degraded"
+    assert not hmm.can_influence_strategy and not har.can_influence_strategy
+    assert case.horizon_strategy["mid_term"].stance == "abstain"
+    assert "production_model_degraded" in case.horizon_strategy["mid_term"].degradation_flags
+
+
+def test_evidence_confidence_and_disagreement_discount_strategy_confidence():
+    clean = build_research_case(
+        "Fed cuts",
+        _packet("Rate cuts and falling real yields support gold."),
+        _ctx(),
+    )
+    conflict = build_research_case(
+        "Fed cuts and ETF flows",
+        _packet("Rate cuts support gold. ETF outflows pressure gold."),
+        _ctx(),
+    )
+
+    assert conflict.horizon_strategy["mid_term"].confidence < clean.horizon_strategy["mid_term"].confidence
+    assert "agent_disagreement_preserved" in conflict.horizon_strategy["mid_term"].degradation_flags
+
+
+def test_reviewed_intake_fact_never_reaches_an_agent():
+    packet = _packet("Gold reacted to old policy news on 2025-01-01.")
+    case = build_research_case(
+        "Fed impact",
+        packet,
+        _ctx(),
+        now=datetime(2026, 8, 13, tzinfo=timezone.utc),
+    )
+
+    assert any(gate.decision == "review" for gate in case.gate_report)
+    assert all(not view.supporting_fact_ids for view in case.agent_views)
+    assert {view.agent for view in case.agent_views} == {"quant_model_risk", "strategy_arbitrator"}
+    assert case.status == "degraded"
+    assert case.audit_report.passed is False

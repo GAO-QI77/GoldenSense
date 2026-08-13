@@ -16,7 +16,7 @@ import {
   Sparkles,
 } from 'lucide-react';
 
-import { saveActiveCase, useActiveResearchCase } from './researchCaseStore';
+import { getResearchHeaders, saveActiveCase, useActiveResearchCase } from './researchCaseStore';
 
 const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
 const CASES_URL =
@@ -108,7 +108,7 @@ export function ResearchCaseWorkspace() {
       setLoading(true);
       const response = await fetch(CASES_URL, {
         method: 'POST',
-        headers: { 'X-API-Key': API_KEY },
+        headers: getResearchHeaders(API_KEY),
         body,
       });
       saveActiveCase(await readJson(response));
@@ -186,6 +186,15 @@ export function ResearchCaseWorkspace() {
       {activeCase ? (
         <div className="case-workspace-result" aria-live="polite">
           <ActiveCaseRibbon activeCase={activeCase} />
+          {activeCase.narrative ? (
+            <article className="case-narrative" aria-label="研究叙事摘要">
+              <span>{activeCase.narrative.generated_by === 'llm' ? 'Full · LLM叙事已审计' : 'Draft · 确定性叙事'}</span>
+              <p>{activeCase.narrative.overview}</p>
+              {activeCase.narrative.degradation_flags?.length ? (
+                <small>降级：{activeCase.narrative.degradation_flags.join(' · ')}</small>
+              ) : null}
+            </article>
+          ) : null}
           <EvidenceShieldPanel activeCase={activeCase} />
         </div>
       ) : null}

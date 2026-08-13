@@ -12,10 +12,12 @@ import re
 import socket
 from datetime import datetime, timezone
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Callable, List, Optional
 from urllib.parse import urljoin, urlparse
 
 import httpx
+import httpcore
 from bs4 import BeautifulSoup
 from PIL import Image
 from pydantic import Field
@@ -74,6 +76,43 @@ class EvidencePacket(StrictModel):
     @property
     def accepted_facts(self) -> List[FactClaim]:
         return [fact for fact in self.facts if fact.status == "accepted"]
+
+
+class _PinnedNetworkBackend(httpcore.AsyncNetworkBackend):
+    """Resolve once, then connect to that exact address while retaining TLS SNI."""
+
+    def __init__(self, host: str, address: str) -> None:
+        from httpcore._backends.auto import AutoBackend
+
+        self._host = host
+        self._address = address
+        self._backend = AutoBackend()
+
+    async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        if host.rstrip(".").lower() != self._host:
+            raise httpcore.ConnectError("unpinned hostname")
+        return await self._backend.connect_tcp(
+            self._address,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+    async def connect_unix_socket(self, path, timeout=None, socket_options=None):
+        raise httpcore.ConnectError("unix sockets are not allowed for evidence fetches")
+
+    async def sleep(self, seconds):
+        await self._backend.sleep(seconds)
+
+
+def _pinned_client(validated: ValidatedURL, template: httpx.AsyncClient) -> httpx.AsyncClient:
+    transport = httpx.AsyncHTTPTransport(trust_env=False, retries=0)
+    transport._pool._network_backend = _PinnedNetworkBackend(  # type: ignore[attr-defined]
+        validated.host,
+        validated.addresses[0],
+    )
+    return httpx.AsyncClient(transport=transport, timeout=template.timeout, trust_env=False)
 
 
 def local_tesseract_ocr(payload: bytes) -> str:
@@ -187,10 +226,18 @@ def _pdf_text(payload: bytes) -> tuple[str, List[str]]:
         raise EvidenceShieldError("pdf_unparseable", "PDF could not be safely parsed", status_code=422) from exc
 
 
-def _image_verified(payload: bytes) -> None:
+def _image_verified(payload: bytes, declared_mime: str) -> None:
+    expected_formats = {
+        "image/png": "PNG",
+        "image/jpeg": "JPEG",
+        "image/webp": "WEBP",
+    }
     try:
         with Image.open(BytesIO(payload)) as image:
+            detected = (image.format or "").upper()
             image.verify()
+        if detected != expected_formats.get(declared_mime):
+            raise ValueError(f"declared {declared_mime}, detected {detected or 'unknown'}")
     except Exception as exc:
         raise EvidenceShieldError("image_signature_mismatch", "image signature does not match MIME") from exc
 
@@ -204,19 +251,56 @@ async def _fetch_public_url(
     current = url
     for _ in range(MAX_REDIRECTS + 1):
         validated = validate_public_https_url(current, resolver=resolver)
-        response = await client.get(validated.url, follow_redirects=False)
+        injected_mock = isinstance(getattr(client, "_transport", None), httpx.MockTransport)
+        request_client = client if injected_mock else _pinned_client(validated, client)
+        request = request_client.build_request("GET", validated.url)
+        response = await request_client.send(request, stream=True, follow_redirects=False)
+        # If the transport exposes its peer socket, bind the fetch to the
+        # address set approved immediately before connect. Injected test
+        # transports do not expose a socket and remain covered by resolver
+        # validation and redirect revalidation.
+        network_stream = response.extensions.get("network_stream")
+        if network_stream is not None:
+            peer = network_stream.get_extra_info("server_addr") or network_stream.get_extra_info("peername")
+            peer_ip = str(peer[0] if isinstance(peer, tuple) else peer or "")
+            if not peer_ip or peer_ip not in validated.addresses or not _is_public_address(peer_ip):
+                await response.aclose()
+                if request_client is not client:
+                    await request_client.aclose()
+                raise EvidenceShieldError("dns_rebinding", "connected peer did not match the validated public address")
         if response.status_code in {301, 302, 303, 307, 308}:
             location = response.headers.get("location")
+            await response.aclose()
+            if request_client is not client:
+                await request_client.aclose()
             if not location:
                 raise EvidenceShieldError("redirect_missing", "redirect response has no location")
             current = urljoin(current, location)
             continue
-        response.raise_for_status()
-        content = response.content
-        if len(content) > URL_MAX_BYTES:
-            raise EvidenceShieldError("url_too_large", "URL response exceeds 5 MB", status_code=413)
-        content_type = response.headers.get("content-type", "text/html").split(";", 1)[0].lower()
-        return current, content, content_type, validated.host
+        try:
+            response.raise_for_status()
+            declared_length = response.headers.get("content-length")
+            if declared_length:
+                try:
+                    declared_bytes = int(declared_length)
+                except ValueError as exc:
+                    raise EvidenceShieldError("invalid_content_length", "URL response has an invalid Content-Length") from exc
+                if declared_bytes > URL_MAX_BYTES:
+                    raise EvidenceShieldError("url_too_large", "URL response exceeds 5 MB", status_code=413)
+            chunks: List[bytes] = []
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > URL_MAX_BYTES:
+                    raise EvidenceShieldError("url_too_large", "URL response exceeds 5 MB", status_code=413)
+                chunks.append(chunk)
+            content = b"".join(chunks)
+            content_type = response.headers.get("content-type", "text/html").split(";", 1)[0].lower()
+            return current, content, content_type, validated.host
+        finally:
+            await response.aclose()
+            if request_client is not client:
+                await request_client.aclose()
     raise EvidenceShieldError("too_many_redirects", "URL exceeded redirect limit")
 
 
@@ -290,15 +374,23 @@ async def ingest_evidence(
             source_url, raw, content_type, host = await _fetch_public_url(
                 url, client=client, resolver=resolver
             )
+            parsed_source = urlparse(source_url)
+            source_url = parsed_source._replace(query="", fragment="").geturl()
             kind = "url"
             if content_type == "application/pdf":
                 if not raw.startswith(b"%PDF"):
                     raise EvidenceShieldError("mime_signature_mismatch", "PDF signature does not match MIME")
                 text, locations = _pdf_text(raw)
-            else:
+            elif content_type in {"text/html", "text/plain"}:
                 decoded = raw.decode("utf-8", errors="replace")
                 text = BeautifulSoup(decoded, "html.parser").get_text(" ", strip=True)
                 locations = [source_url]
+            else:
+                raise EvidenceShieldError(
+                    "unsupported_url_mime",
+                    "URL must return HTML, plain text or PDF",
+                    status_code=415,
+                )
         elif payload is not None:
             mime = (content_type or "").lower().split(";", 1)[0]
             if mime == "application/pdf":
@@ -312,7 +404,7 @@ async def ingest_evidence(
                 kind = "image"
                 if len(payload) > IMAGE_MAX_BYTES:
                     raise EvidenceShieldError("image_too_large", "image exceeds 10 MB", status_code=413)
-                _image_verified(payload)
+                _image_verified(payload, mime)
                 if ocr is None:
                     extraction_status = "abstain"
                     degradation.append("local_ocr_unavailable_or_complex_chart")
@@ -386,15 +478,18 @@ async def ingest_evidence(
                 0.0 if attack or not facts else 1.0, fact_ids,
             ),
         ]
+        review = stale or duplicate or unit_conflict
         if attack:
             facts = [fact.model_copy(update={"status": "blocked", "confidence": 0.0}) for fact in facts]
+        elif review:
+            facts = [fact.model_copy(update={"status": "review"}) for fact in facts]
         multiplier = 1.0
         for gate in gates:
             multiplier *= gate.confidence_multiplier
         document = EvidenceDocument(
             document_id=document_id,
             kind=kind,
-            filename=filename,
+            filename=(f"upload{Path(filename).suffix.lower()}" if filename else None),
             sha256=sha,
             source_url=source_url,
             content_type=content_type or "application/octet-stream",

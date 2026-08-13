@@ -191,6 +191,15 @@ AGENT_ALLOW_TRACE_MEMORY_FALLBACK=0
 
 生产模式应接入经过授权的行情与新闻供应商。它和黑客松 `APP_ENV=demo` 的免费源回退策略是两个不同的运行档位。
 
+ResearchCase 生产发布还需确认：
+
+- 镜像包含 `tesseract-ocr` 和 `tesseract-ocr-chi-sim`；不可用时图片分析必须显式 `abstain`。
+- `RESEARCH_CASE_LEDGER_PATH` 位于持久卷或换成等价持久化实现。JSONL为追加式修订记录，不覆盖历史。
+- 账本仅保存文档哈希、证据定位、事实卡、门控和研究结果；原始上传文件与投资者画像不落盘。
+- URL输入每次重定向重新执行公网HTTPS校验，拒绝私网、回环、链路本地和保留地址。
+- 前端为案件请求发送随机 `X-Research-Session`；服务端按会话哈希隔离案件，不能跨会话读取或个性化。
+- 通过内部 cron 调用 `POST /api/v1/agent/research-cases/score-due`，完成到期 checkpoint 前向评分。
+
 发布前检查：
 
 ```bash

@@ -221,6 +221,11 @@ const researchCasePayload = {
   created_at: '2026-08-13T08:00:00Z',
   data_asof: '2026-08-12',
   status: 'complete',
+  research_mode: 'full',
+  narrative: {
+    overview: 'Accepted evidence was assembled into audited scenarios.',
+    horizon_notes: {}, watchlist: [], generated_by: 'llm', degradation_flags: [],
+  },
   investor_profile: null,
   evidence_documents: [{
     document_id: 'doc_mock', kind: 'url', filename: null, sha256: 'a'.repeat(64),
@@ -432,6 +437,11 @@ test('one research case connects intake, shield, models, strategy and personaliz
   await page.getByRole('button', { name: '运行研究闭环' }).click();
 
   await expect(page.getByText('rc_playwright_closed_loop', { exact: true })).toBeVisible();
+  await expect(page.getByText('Full · LLM叙事已审计')).toBeVisible();
+  const persistedReference = await page.evaluate(() => (
+    JSON.parse(window.localStorage.getItem('gs_active_research_case_v1'))
+  ));
+  expect(persistedReference).toEqual({ case_id: 'rc_playwright_closed_loop' });
   await expect(page.getByRole('heading', { name: 'Evidence Shield · 8层证据护盾' })).toBeVisible();
   await expect(page.getByText('AI攻击门')).toBeVisible();
 

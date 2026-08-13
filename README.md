@@ -1,6 +1,6 @@
 # GoldenSense
 
-GoldenSense 是一个面向中文用户的黄金投资辅助 Agent。它不执行交易，也不伪装成“自动赚钱系统”；它的目标是把量化预测、市场快照、新闻事件、历史类比和风险约束压缩成一份可追溯、可降级、可审计的分析结果。
+GoldenSense 是一个面向中文用户的黄金投资研究 Agent。它不执行交易，也不伪装成“自动赚钱系统”；它用统一 `ResearchCase` 把 URL/PDF/图片证据、8层门控、多专家 Agent、短中长期策略、量化模型治理、个性化和前向校准压缩成一条可追溯、可降级、可审计的闭环。
 
 当前仓库只保留正式 Agent 主链路，不再包含旧的直播平台或历史 demo 分支。
 
@@ -11,9 +11,9 @@ GoldenSense 当前是一款可演示 MVP，面向需要快速理解黄金市场�
 | 维度 | 当前设计 |
 | --- | --- |
 | 核心问题 | 黄金研究信号分散、结论难追溯、风险提示与用户情况脱节 |
-| 用户主流程 | 研究主页 → 提交问题与风险画像 → 三周期分析 → 证据卡 / 引用 / 失效条件 → 风险提示 → 反馈 |
+| 用户主流程 | URL/PDF/图片 → Evidence Shield → 专家Agent → 短中长期策略 → Agent×规则×API个性化 → 信号台账/前向校准 |
 | 产品边界 | 研究辅助，不执行交易，不承诺收益，不提供交易所级实时行情 |
-| 可信机制 | 数据新鲜度检查、显式降级、模型状态标记、多源冲突提示、风险画像门控、内部 Trace |
+| 可信机制 | 8层证据门、页码/图片定位、AI攻击隔离、数据新鲜度、冠军—挑战者治理、少数意见、追加式案件账本 |
 | 当前状态 | 已完成可演示 MVP；尚未披露真实用户使用数据 |
 | 下一步验证 | 计划开展 5 - 10 位目标用户访谈与可用性测试，重点验证任务完成率、结果可理解性和风险提示识别率 |
 
@@ -60,6 +60,10 @@ flowchart LR
     MKT --> REDIS["Redis"]
     NEWS --> REDIS
     GW --> TRACE["Trace Store<br/>Postgres or bounded dev-memory fallback"]
+    UI --> CASE["ResearchCase<br/>active case shared across pages"]
+    CASE --> SHIELD["Evidence Shield<br/>8 deterministic gates"]
+    SHIELD --> GW
+    GW --> LEDGER["Append-only case ledger<br/>hashes, claims, results only"]
 ```
 
 ## 服务拓扑
@@ -80,6 +84,9 @@ flowchart LR
 | 路径 | 说明 |
 | --- | --- |
 | [`agent_gateway.py`](agent_gateway.py) | 正式 Agent 网关、鉴权、限流、审计与输出编排 |
+| [`research_case.py`](research_case.py) | 统一研究案件领域模型 + 有界内存/追加式JSONL存储 |
+| [`evidence_shield.py`](evidence_shield.py) | HTTPS/PDF/图片摄取、本地OCR、8层门控和攻击隔离 |
+| [`research_orchestrator.py`](research_orchestrator.py) | 动态专家出席、模型治理、分歧保留和三期限策略仲裁 |
 | [`data_sources.py`](data_sources.py) | 扩展数据层：FRED 实际利率/盈亏平衡通胀 + 2004 年起长历史行情，带缓存与显式降级 |
 | [`vol_models.py`](vol_models.py) | 短期层：HAR-RV 波动率预测 + P10/P50/P90 经验分位收益带 |
 | [`regime_probabilistic.py`](regime_probabilistic.py) | 三状态 Gaussian HMM（numpy EM），输出 calm/elevated/stress 后验概率 |
@@ -116,6 +123,7 @@ flowchart LR
 - Docker / Docker Compose（推荐用于完整联调）
 - PostgreSQL `16+`，如需向量检索建议启用 `pgvector`
 - Redis `7`
+- Tesseract OCR（图片文字/表格识别；Docker镜像已包含中英文包）
 
 `Python 3.12` 是当前代码、Docker 和 CI 的正式基线。不要把本仓库视为 `Python 3.13` 已支持项目。
 
@@ -218,6 +226,8 @@ export AGENT_INTERNAL_API_KEYS=dev-internal-key
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `APP_ENV` | `development` | 除 `development` 外都会强制要求显式配置非默认 public / internal keys |
+| `RESEARCH_CASE_LEDGER_PATH` | `data_cache/research_cases.jsonl` | 追加式案件账本；不存原文与画像 |
+| `RESEARCH_CASE_MAX_ITEMS` | `200` | 进程内最近案件索引上限 |
 | `AGENT_PUBLIC_API_KEYS` | `dev-public-key`（仅 dev） | 逗号分隔的对外 API key 列表 |
 | `AGENT_INTERNAL_API_KEYS` | `dev-internal-key`（仅 dev） | 逗号分隔的内部 API key 列表 |
 | `AGENT_ANALYZE_RATE_LIMIT_PER_MINUTE` | `60` | `analyze` 限流阈值 |
@@ -231,6 +241,39 @@ export AGENT_INTERNAL_API_KEYS=dev-internal-key
 | `VIX_CIRCUIT_BREAKER_THRESHOLD` | `30` | 风险熔断阈值 |
 | `INFERENCE_MODEL_CHECKPOINTS_DIR_T1` | `model_checkpoints` | T+1 模型 checkpoint 目录 |
 | `INFERENCE_MODEL_CHECKPOINTS_DIR_T7` | `model_checkpoints` | T+7 模型 checkpoint 目录；默认不再指向不存在的目录 |
+
+### 统一研究案件 API
+
+```bash
+curl -X POST http://localhost:8020/api/v1/agent/research-cases \
+  -H 'X-API-Key: dev-public-key' \
+  -H 'X-Research-Session: replace-with-an-opaque-session-token' \
+  -F 'question=这份FOMC材料如何影响黄金？' \
+  -F 'file=@statement.pdf;type=application/pdf'
+```
+
+URL、PDF、PNG/JPEG/WebP每次选一种主证据。PDF上限20 MB，图片上限10 MB。图片OCR仅处理可靠文字/表格；复杂纯图表或OCR引擎不可用时返回 `abstain`。
+
+研究案件端点还要求浏览器/客户端生成的 `X-Research-Session` 不透明令牌；服务端只保存它与API key指纹组合后的哈希，用于隔离不同会话的案件。前端 `localStorage` 只保存当前 `case_id`，完整案件状态只存在当前浏览器会话。
+
+`mode=draft` 只运行确定性门控、量化模型风险 Agent 和基础三期限策略；`mode=full` 再动态调用领域专家并尝试生成 LLM 叙事。LLM 只接收已通过门控的事实卡，输出还会经过数字落地与非指令化检查；模型不可用或审计失败时返回确定性叙事并附降级标记。
+
+本地三分钟演示：
+
+```bash
+python3 scripts/demo_research_case.py
+```
+
+演示依次创建干净PDF案件、带提示注入的攻击PDF案件，再对干净案件生成Agent×规则×API三维个性化结果。
+
+到期前向评分由内部定时任务调用：
+
+```bash
+curl -X POST http://localhost:8020/api/v1/agent/research-cases/score-due \
+  -H 'X-API-Key: dev-internal-key'
+```
+
+评分使用每个 checkpoint 到期日之后的首个可得黄金收盘价，不使用任务执行时的统一最新价。
 
 ### 下游服务地址
 

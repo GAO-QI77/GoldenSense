@@ -1,7 +1,7 @@
 # GoldenSense 一体化黄金研究闭环设计
 
-日期：2026-08-13  
-状态：用户已批准  
+日期：2026-08-13
+状态：用户已批准
 分支：`codex/integrated-research-loop`
 
 ## 目标
