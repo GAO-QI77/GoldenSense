@@ -24,6 +24,7 @@ MID_CONF_HIGH = 0.75
 MID_CONF_MED = 0.60
 # |z| at/above this marks a structural valuation deviation (matches fair_value).
 LONG_TERM_STRUCTURAL_Z = 2.0
+LONG_TERM_STRUCTURAL_PCT = 50.0
 
 _STATE_ZH = {"calm": "平静", "elevated": "抬升", "stress": "压力"}
 
@@ -137,7 +138,11 @@ def _long_term(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     deviation_pct = fair.get("deviation_pct")
     deviation_z = fair.get("deviation_z")
-    structural = deviation_z is not None and abs(float(deviation_z)) >= LONG_TERM_STRUCTURAL_Z
+    structural = bool(fair.get("regime_break")) or (
+        deviation_z is not None and abs(float(deviation_z)) >= LONG_TERM_STRUCTURAL_Z
+    ) or (
+        deviation_pct is not None and abs(float(deviation_pct)) >= LONG_TERM_STRUCTURAL_PCT
+    )
 
     if deviation_pct is None:
         return _unavailable("fair_value_deviation_missing")

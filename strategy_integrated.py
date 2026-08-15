@@ -92,6 +92,7 @@ class FlagshipResult:
 
     def as_dict(self) -> Dict:
         return {
+            "evidence_class": "backtest",
             "metrics": self.metrics,
             "benchmark": self.benchmark,
             "curve": {

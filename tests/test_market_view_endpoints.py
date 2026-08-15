@@ -41,10 +41,15 @@ def test_market_view_contract(client):
     assert book["meta"]["is_realtime"] is False
 
 
-def test_signals_current_empty_ledger_404(client):
+def test_signals_current_empty_ledger_is_an_explicit_success_state(client):
     resp = client.get("/api/v1/signals/current", headers=PUBLIC_HEADERS)
-    assert resp.status_code == 404
-    assert resp.json()["detail"]["error_code"] == "no_publication"
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["status"] == "empty"
+    assert payload["error_code"] == "first_publication_required"
+    assert payload["evidence_class"] == "live_forward"
+    assert payload["next_action"] == "publish_first_weekly_signal"
+    assert payload["guidance"]
 
 
 def test_publish_requires_internal_key(client):

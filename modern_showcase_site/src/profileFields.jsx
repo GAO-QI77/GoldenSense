@@ -37,6 +37,16 @@ const goalOptions = [
   ['trend_following', '趋势跟随'],
   ['speculation', '投机博弈'],
 ];
+const lossCapacityOptions = [['', '未填写'], ['low', '低'], ['medium', '中'], ['high', '高']];
+const portfolioContextOptions = [['', '未确认'], ['true', '已覆盖全部主要资产'], ['false', '仅提供黄金仓位']];
+const liabilitiesOptions = [['', '未填写'], ['low', '低'], ['medium', '中'], ['high', '高']];
+const instrumentOptions = [
+  ['', '未填写'], ['physical', '实物金'], ['unlevered_etf', '无杠杆黄金ETF'],
+  ['unallocated_spot', '无杠杆账户金'], ['futures', '黄金期货'], ['options', '黄金期权'],
+  ['cfd', '黄金CFD'], ['other', '其他'],
+];
+const jurisdictionOptions = [['', '未填写'], ['CN', '中国大陆'], ['SG', '新加坡'], ['HK', '中国香港'], ['US', '美国'], ['OTHER', '其他']];
+const currencyOptions = [['', '未填写'], ['CNY', '人民币 CNY'], ['USD', '美元 USD'], ['SGD', '新元 SGD'], ['HKD', '港币 HKD'], ['OTHER', '其他']];
 
 export function SegmentedRow({ label, value, options, onChange }) {
   return (
@@ -108,7 +118,7 @@ export function AdvancedProfileFields({ profile, onChange, defaultOpen = false }
         onClick={() => setOpen((v) => !v)}
       >
         <ChevronRight size={14} className={open ? 'open' : ''} />
-        进阶画像（可选 · 填写后解锁更多风险规则）
+        适当性画像（补全后才显示个人仓位差距）
       </button>
       {open ? (
         <div className="advanced-fields">
@@ -147,6 +157,37 @@ export function AdvancedProfileFields({ profile, onChange, defaultOpen = false }
             options={goalOptions}
             onChange={(v) => onChange('investment_goal', v || null)}
           />
+          <SelectRow
+            label="损失承受能力"
+            value={profile.loss_capacity || ''}
+            options={lossCapacityOptions}
+            onChange={(v) => onChange('loss_capacity', v || null)}
+          />
+          <SelectRow
+            label="组合上下文"
+            value={profile.portfolio_context_known == null ? '' : String(profile.portfolio_context_known)}
+            options={portfolioContextOptions}
+            onChange={(v) => onChange('portfolio_context_known', v === '' ? null : v === 'true')}
+          />
+          <label className="field compact-field">
+            <span>应急资金月数</span>
+            <div className="number-input">
+              <input
+                type="number"
+                min="0"
+                max="120"
+                step="1"
+                placeholder="未填写"
+                value={profile.emergency_fund_months ?? ''}
+                onChange={(event) => onChange('emergency_fund_months', event.target.value === '' ? null : event.target.value)}
+              />
+              <small>月</small>
+            </div>
+          </label>
+          <SelectRow label="负债水平" value={profile.liabilities_level || ''} options={liabilitiesOptions} onChange={(v) => onChange('liabilities_level', v || null)} />
+          <SelectRow label="黄金工具" value={profile.gold_instrument || ''} options={instrumentOptions} onChange={(v) => onChange('gold_instrument', v || null)} />
+          <SelectRow label="运营法域" value={profile.jurisdiction || ''} options={jurisdictionOptions} onChange={(v) => onChange('jurisdiction', v || null)} />
+          <SelectRow label="基础货币" value={profile.base_currency || ''} options={currencyOptions} onChange={(v) => onChange('base_currency', v || null)} />
         </div>
       ) : null}
     </div>

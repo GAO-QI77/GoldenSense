@@ -20,6 +20,10 @@ CaseStatus = Literal["created", "gated", "researching", "complete", "blocked", "
 Horizon = Literal["short_term", "mid_term", "long_term"]
 Stance = Literal["bullish", "bearish", "neutral", "risk", "abstain"]
 ModelState = Literal["production", "watch", "degraded", "retired"]
+EvidenceDomain = Literal[
+    "macro_event", "technical_flows", "long_term_fundamental", "product_rules", "general"
+]
+ProbabilityKind = Literal["calibrated_probability", "research_weight", "abstention"]
 
 
 class StrictModel(BaseModel):
@@ -51,6 +55,7 @@ class FactClaim(StrictModel):
     units: Optional[str] = None
     published_at: Optional[datetime] = None
     tags: List[str] = Field(default_factory=list)
+    domains: List[EvidenceDomain] = Field(default_factory=lambda: ["general"])
 
 
 class GateDecision(StrictModel):
@@ -70,11 +75,40 @@ class GateDecision(StrictModel):
     evidence_refs: List[str] = Field(default_factory=list)
 
 
+class ConfidenceBasis(StrictModel):
+    method: str
+    calibrated: bool = False
+    sample_size: Optional[int] = Field(default=None, ge=1)
+    calibration_period: Optional[str] = None
+    source_refs: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def calibrated_confidence_has_audit_metadata(self) -> "ConfidenceBasis":
+        if self.calibrated and (
+            self.sample_size is None
+            or not self.calibration_period
+            or not self.source_refs
+        ):
+            raise ValueError(
+                "calibrated confidence requires sample size, calibration period and sources"
+            )
+        return self
+
+
+def _unspecified_confidence_basis() -> ConfidenceBasis:
+    return ConfidenceBasis(
+        method="legacy_unspecified",
+        calibrated=False,
+        source_refs=[],
+    )
+
+
 class AgentView(StrictModel):
     agent: Literal[
         "macro_event",
         "technical_flows",
         "long_term_fundamental",
+        "product_rules_review",
         "quant_model_risk",
         "strategy_arbitrator",
     ]
@@ -86,6 +120,7 @@ class AgentView(StrictModel):
     counter_fact_ids: List[str] = Field(default_factory=list)
     invalidation: List[str] = Field(default_factory=list)
     degradation_flags: List[str] = Field(default_factory=list)
+    confidence_basis: ConfidenceBasis = Field(default_factory=_unspecified_confidence_basis)
 
 
 class ResearchConflict(StrictModel):
@@ -100,6 +135,10 @@ class HorizonScenario(StrictModel):
     label: Literal["base", "upside", "downside"]
     probability: float = Field(ge=0.0, le=1.0)
     description: str
+    probability_kind: ProbabilityKind = "research_weight"
+    method: str = "legacy_unspecified"
+    sample_size: Optional[int] = Field(default=None, ge=1)
+    calibration_error: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
 
 class HorizonStrategy(StrictModel):
@@ -114,12 +153,29 @@ class HorizonStrategy(StrictModel):
     invalidation: List[str]
     next_review_at: datetime
     degradation_flags: List[str] = Field(default_factory=list)
+    confidence_basis: ConfidenceBasis = Field(default_factory=_unspecified_confidence_basis)
+    priced_in_basis: str = "not_assessed"
 
     @model_validator(mode="after")
     def probabilities_sum_to_one(self) -> "HorizonStrategy":
         total = self.base.probability + self.upside.probability + self.downside.probability
         if abs(total - 1.0) > 1e-6:
             raise ValueError("scenario probabilities must sum to 1")
+        scenarios = (self.base, self.upside, self.downside)
+        probability_kinds = {scenario.probability_kind for scenario in scenarios}
+        if len(probability_kinds) != 1:
+            raise ValueError("scenarios must use the same probability kind")
+        if probability_kinds == {"calibrated_probability"} and any(
+            scenario.sample_size is None
+            or scenario.calibration_error is None
+            or scenario.method == "legacy_unspecified"
+            for scenario in scenarios
+        ):
+            raise ValueError(
+                "calibrated probability requires sample size, calibration error and method"
+            )
+        if probability_kinds == {"abstention"} and self.stance != "abstain":
+            raise ValueError("abstention probabilities require an abstain strategy")
         return self
 
 
@@ -148,6 +204,12 @@ class OutcomeCheckpoint(StrictModel):
     realized_price: Optional[float] = Field(default=None, gt=0.0)
     realized_return: Optional[float] = None
     direction_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    neutral_band_pct: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    scenario_outcome: Optional[Literal["base", "upside", "downside"]] = None
+    scenario_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    scenario_score_kind: Optional[Literal["brier", "weight_brier"]] = None
+    confidence_error: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    scoring_method: Optional[str] = None
     scored_at: Optional[datetime] = None
 
 
@@ -193,14 +255,35 @@ class ResearchCase(StrictModel):
 
     @model_validator(mode="after")
     def agent_references_only_accepted_facts(self) -> "ResearchCase":
-        accepted = {claim.claim_id for claim in self.fact_claims if claim.status == "accepted"}
+        accepted = {
+            claim.claim_id: claim
+            for claim in self.fact_claims
+            if claim.status == "accepted"
+        }
+        agent_domains = {
+            "macro_event": "macro_event",
+            "technical_flows": "technical_flows",
+            "long_term_fundamental": "long_term_fundamental",
+        }
         for view in self.agent_views:
             refs = set(view.supporting_fact_ids + view.counter_fact_ids)
-            unknown = refs - accepted
+            unknown = refs - set(accepted)
             if unknown:
                 raise ValueError(
                     "agent evidence must reference an accepted fact: " + ", ".join(sorted(unknown))
                 )
+            expected_domain = agent_domains.get(view.agent)
+            if expected_domain:
+                cross_domain = sorted(
+                    ref
+                    for ref in refs
+                    if expected_domain not in accepted[ref].domains
+                )
+                if cross_domain:
+                    raise ValueError(
+                        "domain agent must reference its own evidence domain: "
+                        + ", ".join(cross_domain)
+                    )
         return self
 
 
@@ -303,6 +386,7 @@ def score_due_outcomes(
     price_at: Callable[[datetime], Optional[float]],
 ) -> ResearchCase:
     """Score each matured checkpoint at its own due-date market close."""
+    neutral_bands = {"short_term": 0.015, "mid_term": 0.04, "long_term": 0.08}
     checkpoints: List[OutcomeCheckpoint] = []
     for checkpoint in case.outcome_schedule:
         if checkpoint.status in {"scheduled", "matured"} and checkpoint.due_at <= as_of:
@@ -313,17 +397,53 @@ def score_due_outcomes(
             realized_return = realized_price / checkpoint.entry_price - 1.0
             strategy = case.horizon_strategy.get(checkpoint.horizon)
             score: Optional[float] = None
+            neutral_band = neutral_bands[checkpoint.horizon]
+            scenario_outcome = (
+                "upside" if realized_return > neutral_band
+                else "downside" if realized_return < -neutral_band
+                else "base"
+            )
+            scenario_score: Optional[float] = None
+            scenario_score_kind: Optional[str] = None
+            confidence_error: Optional[float] = None
             if strategy and strategy.stance == "bullish":
                 score = 1.0 if realized_return > 0 else 0.0
             elif strategy and strategy.stance == "bearish":
                 score = 1.0 if realized_return < 0 else 0.0
             elif strategy and strategy.stance == "neutral":
-                score = 1.0 if abs(realized_return) <= 0.03 else 0.0
+                score = 1.0 if abs(realized_return) <= neutral_band else 0.0
+            if strategy:
+                forecasts = {
+                    "base": strategy.base.probability,
+                    "upside": strategy.upside.probability,
+                    "downside": strategy.downside.probability,
+                }
+                kinds = {
+                    strategy.base.probability_kind,
+                    strategy.upside.probability_kind,
+                    strategy.downside.probability_kind,
+                }
+                if kinds != {"abstention"}:
+                    scenario_score = sum(
+                        (forecast - (1.0 if label == scenario_outcome else 0.0)) ** 2
+                        for label, forecast in forecasts.items()
+                    ) / 3.0
+                    scenario_score_kind = (
+                        "brier" if kinds == {"calibrated_probability"} else "weight_brier"
+                    )
+                if score is not None:
+                    confidence_error = abs(strategy.confidence - score)
             checkpoints.append(checkpoint.model_copy(update={
                 "status": "scored",
                 "realized_price": realized_price,
                 "realized_return": realized_return,
                 "direction_score": score,
+                "neutral_band_pct": neutral_band,
+                "scenario_outcome": scenario_outcome,
+                "scenario_score": scenario_score,
+                "scenario_score_kind": scenario_score_kind,
+                "confidence_error": confidence_error,
+                "scoring_method": "horizon_band_multiclass_v1",
                 "scored_at": as_of,
             }))
         else:

@@ -16,6 +16,7 @@ from outcome_tracker import (
     backfill_outcomes,
     calibration_summary,
     committee_weight_adjustments,
+    extract_analysis_record,
 )
 
 
@@ -167,6 +168,16 @@ def test_calibration_summary_hit_rate_and_brier():
     assert 0.0 <= summary["brier_score"] <= 1.0
     assert summary["by_stance"]["偏多"]["hit_rate"] == 1.0
     assert summary["by_stance"]["偏空"]["hit_rate"] == 0.0
+    assert summary["evidence_class"] == "live_forward"
+    assert summary["by_stance"]["偏多"]["evidence_class"] == "live_forward"
+
+
+def test_public_horizons_are_not_collapsed_to_legacy_one_day_scoring():
+    created = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    assert extract_analysis_record(_row(created, "偏多", horizon="short_term"))["horizon"] == "short_term"
+    assert extract_analysis_record(_row(created, "偏多", horizon="mid_term"))["horizon"] == "mid_term"
+    assert extract_analysis_record(_row(created, "偏多", horizon="long_term"))["horizon"] == "long_term"
 
 
 def test_weight_adjustment_requires_samples_and_is_capped():

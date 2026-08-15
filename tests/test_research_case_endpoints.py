@@ -244,6 +244,8 @@ def test_personalize_returns_agent_rules_api_without_persisting_profile(monkeypa
         assert result.status_code == 200
         payload = result.json()
         assert {"agent", "rules", "api", "watchlist", "invalidation", "next_review_at"} <= payload.keys()
+        assert payload["rules"]["suitability"]["status"] == "insufficient"
+        assert payload["rules"]["position_gap"]["status"] == "withheld"
         combined = str(payload)
         assert "建议买入" not in combined and "立即卖出" not in combined
         stored = client.get(
@@ -251,6 +253,33 @@ def test_personalize_returns_agent_rules_api_without_persisting_profile(monkeypa
         ).json()
         assert stored["investor_profile"] is None
         assert stored["personalized_brief"] is None
+
+
+def test_complete_suitability_profile_unlocks_position_gap_for_unlevered_gold(monkeypatch):
+    with _client(monkeypatch) as client:
+        case = client.post(
+            "/api/v1/agent/research-cases", headers=HEADERS,
+            json={"question": "gold outlook"},
+        ).json()
+        response = client.post(
+            f"/api/v1/agent/research-cases/{case['case_id']}/personalize",
+            headers=HEADERS,
+            json={
+                "risk_tolerance": "balanced", "horizon": "mid",
+                "current_gold_pct": 10, "experience": "experienced",
+                "max_drawdown_pct": 12, "liquidity_need": "medium",
+                "leverage_attitude": "none", "investment_goal": "capital_preservation",
+                "loss_capacity": "medium", "portfolio_context_known": True,
+                "emergency_fund_months": 9, "liabilities_level": "low",
+                "gold_instrument": "unlevered_etf", "jurisdiction": "SG",
+                "base_currency": "SGD",
+            },
+        )
+
+    assert response.status_code == 200
+    rules = response.json()["rules"]
+    assert rules["suitability"]["status"] == "eligible"
+    assert rules["position_gap"]["status"] == "within"
 
 
 def test_missing_case_is_404(monkeypatch):

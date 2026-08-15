@@ -59,6 +59,7 @@ def test_build_publication_has_hash_disclaimer_and_midpoints():
     assert balanced["range_pct"] == [5.0, 12.0]
     assert balanced["midpoint"] == pytest.approx(8.5)
     assert record["evidence_snapshot"]["fair_value_deviation_pct"] == 12.0
+    assert record["evidence_class"] == "live_forward"
     # Market view summary is frozen in, one line per horizon.
     assert set(record["market_view_summary"]) == {"short_term", "mid_term", "long_term"}
 
@@ -114,6 +115,8 @@ def test_empty_ledger_scores_empty():
     assert result["per_profile"]["balanced"]["cum_return"] is None
     assert result["matured_through"] is None
     assert result["disclaimer"]
+    assert result["evidence_class"] == "simulated_forward"
+    assert result["per_profile"]["balanced"]["evidence_class"] == "simulated_forward"
 
 
 def test_single_immature_week_not_scored():
@@ -144,3 +147,5 @@ def test_two_weeks_scored_with_cost():
     bench = result["benchmarks"]["gold_buy_hold"]
     assert bench["cum_return"] == pytest.approx(110.0 / 100.0 - 1.0, abs=5e-7)
     assert result["matured_through"] == "2026-W30"
+    assert prof["evidence_class"] == "simulated_forward"
+    assert bench["evidence_class"] == "simulated_forward"

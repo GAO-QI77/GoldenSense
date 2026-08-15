@@ -21,7 +21,16 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-HORIZON_DAYS = {"24h": 1, "7d": 7, "30d": 30}
+HORIZON_DAYS = {
+    "short_term": 21,
+    "mid_term": 180,
+    "long_term": 365,
+    # Read-only compatibility for analyses persisted before the public
+    # three-horizon migration.
+    "24h": 1,
+    "7d": 7,
+    "30d": 30,
+}
 STANCE_TO_DIRECTION = {"偏多": 1, "偏空": -1, "中性": 0, "高风险观望": 0}
 CONFIDENCE_TO_PROB = {"高": 0.75, "中": 0.65, "低": 0.55}
 
@@ -46,13 +55,14 @@ def extract_analysis_record(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     created = _parse_ts(row.get("created_at"))
     if created is None or not summary:
         return None
-    horizon = request.get("horizon") or summary.get("horizon") or "24h"
+    horizon = request.get("horizon") or summary.get("horizon") or "short_term"
     return {
         "analysis_id": row.get("analysis_id"),
         "created_at": created,
-        "horizon": horizon if horizon in HORIZON_DAYS else "24h",
+        "horizon": horizon if horizon in HORIZON_DAYS else "short_term",
         "stance": summary.get("stance", "中性"),
         "confidence_band": summary.get("confidence_band", "中"),
+        "evidence_class": "live_forward",
     }
 
 
@@ -116,6 +126,7 @@ def calibration_summary(outcomes: List[Dict[str, Any]]) -> Dict[str, Any]:
     neutral_count = len(outcomes) - len(directional)
 
     summary: Dict[str, Any] = {
+        "evidence_class": "live_forward",
         "total_scored": len(outcomes),
         "directional_calls": len(directional),
         "neutral_or_gated": neutral_count,
@@ -145,7 +156,11 @@ def calibration_summary(outcomes: List[Dict[str, Any]]) -> Dict[str, Any]:
         for o in directional:
             groups.setdefault(o[group_field], []).append(1.0 if o["hit"] else 0.0)
         summary[key] = {
-            k: {"n": len(v), "hit_rate": round(float(np.mean(v)), 4)}
+            k: {
+                "n": len(v),
+                "hit_rate": round(float(np.mean(v)), 4),
+                "evidence_class": "live_forward",
+            }
             for k, v in groups.items()
         }
     return summary

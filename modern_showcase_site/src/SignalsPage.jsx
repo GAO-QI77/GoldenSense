@@ -42,9 +42,16 @@ function headers() {
 
 async function fetchJson(url, { allow404 = false } = {}) {
   const response = await fetch(url, { headers: headers() });
-  if (allow404 && response.status === 404) return null;
   const text = await response.text();
   const json = text ? JSON.parse(text) : null;
+  if (allow404 && response.status === 404) {
+    const detail = json?.detail;
+    return {
+      status: 'empty',
+      ...(detail && typeof detail === 'object' ? detail : {}),
+      message: typeof detail === 'string' ? detail : detail?.message,
+    };
+  }
   if (!response.ok) {
     const detail = json?.detail;
     throw new Error(
@@ -93,6 +100,7 @@ export default function SignalsPage() {
   }, []);
 
   const meta = book?.meta;
+  const hasCurrentPublication = Boolean(current?.publication_id);
 
   return (
     <main className="page-surface signals-page">
@@ -114,6 +122,24 @@ export default function SignalsPage() {
       <ActiveCaseRibbon />
 
       <CaseStrategyPanel />
+
+      <section className="truth-class-grid" aria-label="结果证据类型">
+        <article>
+          <span className="truth-class-badge class-backtest">历史回测</span>
+          <strong>模型实验结果</strong>
+          <small>只说明历史样本表现，不冒充未来兑现。</small>
+        </article>
+        <article>
+          <span className="truth-class-badge class-simulated">模拟前向</span>
+          <strong>影子组合记分</strong>
+          <small>发布后按假设组合计分，不是真实账户收益。</small>
+        </article>
+        <article>
+          <span className="truth-class-badge class-live">真实前向</span>
+          <strong>不可变周度发布</strong>
+          <small>{hasCurrentPublication ? '当前 ' + current.publication_id : '等待第一期发布，不回填历史。'}</small>
+        </article>
+      </section>
 
       {meta ? (
         <div className={`freshness-banner ${meta.data_stale ? 'stale' : ''}`}>
@@ -194,10 +220,10 @@ export default function SignalsPage() {
             <ScrollText size={16} />
             <div>
               <h2>本周发布</h2>
-              <span>{current ? current.publication_id : '台账为空'}</span>
+              <span>{hasCurrentPublication ? current.publication_id : '台账为空'}</span>
             </div>
           </div>
-          {current ? (
+          {hasCurrentPublication ? (
             <>
               <div className="ledger-alloc-grid">
                 {Object.entries(current.allocations || {}).map(([profile, alloc]) => (
@@ -220,9 +246,11 @@ export default function SignalsPage() {
               <p className="disclaimer">{current.disclaimer}</p>
             </>
           ) : (
-            <p className="muted-copy">
-              追踪记录自首次发布起前向累积，不回填历史。首次发布后这里会出现本周的三档参考区间。
-            </p>
+            <div className="ledger-empty-guidance">
+              <strong>需要第一期真实前向发布</strong>
+              <p>{current?.guidance || '追踪记录自首次发布起前向累积，不回填历史。'}</p>
+              <small>运维动作：冻结本周研究后执行内部发布任务。</small>
+            </div>
           )}
         </section>
 
@@ -260,7 +288,7 @@ export default function SignalsPage() {
                     : '—'}
                 </span>
               </div>
-              <p className="disclaimer">{trackRecord.disclaimer}</p>
+              <p className="disclaimer">证据类型：模拟前向 · {trackRecord.disclaimer}</p>
             </div>
           ) : (
             <p className="muted-copy">记分服务暂不可用。</p>

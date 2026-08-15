@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -40,6 +42,7 @@ class MarketSnapshotConfig:
     stale_after_seconds: int = 180
     allow_synthetic_fallback: bool = True
     provider_name: str = "yfinance"
+    refresh_coalesce_seconds: float = 2.0
 
 
 class SnapshotPersistence:
@@ -212,18 +215,31 @@ def build_market_snapshot(
     latest_price = float(gold_series.iloc[-1])
     price_change_pct_1d = _series_change_pct(gold_series)
 
+    if source == "synthetic_fallback":
+        gold_asset = "GOLD_SYNTHETIC"
+        gold_label = "黄金模拟序列"
+        gold_type = "synthetic"
+    elif "spot" in source.lower():
+        gold_asset = "XAUUSD"
+        gold_label = "黄金现货"
+        gold_type = "spot"
+    else:
+        gold_asset = "GC=F"
+        gold_label = "COMEX 黄金期货"
+        gold_type = "futures"
+
     mapping = {
-        "Gold": ("XAUUSD", "黄金"),
-        "USD_Index": ("DXY", "美元指数"),
-        "VIX": ("VIX", "波动率指数"),
-        "10Y_Bond": ("US10Y", "10年美债收益率"),
-        "2Y_Bond": ("US2Y", "2年美债收益率"),
-        "S&P500": ("SPX", "标普500"),
-        "Crude_Oil": ("WTI", "原油"),
+        "Gold": (gold_asset, gold_label, gold_type, "USD", "USD/troy_oz", "GC=F"),
+        "USD_Index": ("DXY", "美元指数", "index", "USD", "index_points", "DX-Y.NYB"),
+        "VIX": ("VIX", "波动率指数", "index", "USD", "index_points", "^VIX"),
+        "10Y_Bond": ("US10Y", "10年美债收益率", "yield", "USD", "percent", "^TNX"),
+        "2Y_Bond": ("US2Y", "2年美债收益率", "yield", "USD", "percent", "2YY=F"),
+        "S&P500": ("SPX", "标普500", "equity", "USD", "index_points", "^GSPC"),
+        "Crude_Oil": ("WTI", "原油", "commodity", "USD", "USD/barrel", "CL=F"),
     }
 
     instruments = []
-    for col, (symbol, label) in mapping.items():
+    for col, (symbol, label, instrument_type, quote_currency, unit, provider_symbol) in mapping.items():
         if col not in market_df.columns:
             continue
         series = market_df[col].dropna()
@@ -237,6 +253,10 @@ def build_market_snapshot(
                 change_pct_1d=_series_change_pct(series),
                 source=source,
                 as_of=as_of,
+                instrument_type=instrument_type,
+                quote_currency=quote_currency,
+                unit=unit,
+                provider_symbol=provider_symbol,
             )
         )
 
@@ -280,7 +300,7 @@ def build_market_snapshot(
         is_stale=False,
     )
     return MarketSnapshotResponse(
-        asset="XAUUSD",
+        asset=gold_asset,
         as_of=as_of,
         freshness_seconds=freshness_seconds,
         stale_after_seconds=stale_after_seconds,
@@ -820,8 +840,15 @@ def build_gold_price_history(
                 )
             )
 
+    asset = (
+        "GOLD_SYNTHETIC"
+        if source == "synthetic_fallback"
+        else "XAUUSD"
+        if "spot" in source.lower()
+        else "GC=F"
+    )
     return GoldPriceHistoryResponse(
-        asset="XAUUSD",
+        asset=asset,
         as_of=now or datetime.now(timezone.utc),
         source=source,
         points=points,
@@ -858,6 +885,7 @@ async def _resolve_snapshot(
         market_df = await asyncio.to_thread(loader.fetch_data, "6mo", "1d")
         snapshot = build_market_snapshot(
             market_df,
+            source=getattr(loader, "provider_name", cfg.provider_name),
             stale_after_seconds=cfg.stale_after_seconds,
         )
         return snapshot, None
@@ -871,16 +899,91 @@ async def _resolve_snapshot(
         )
 
 
-async def _refresh_loop(app: FastAPI) -> None:
+def _candidate_validation_error(
+    candidate: MarketSnapshotResponse,
+    trusted: Optional[MarketSnapshotResponse],
+) -> Optional[str]:
+    price = candidate.latest_price
+    if not math.isfinite(price) or price <= 0:
+        return "instrument_identity_violation"
+
+    gold = next(
+        (item for item in candidate.instruments if item.symbol == candidate.asset),
+        None,
+    )
+    if gold is None or not math.isclose(gold.price, price, rel_tol=0.0, abs_tol=1e-9):
+        return "instrument_identity_violation"
+
+    if candidate.asset == "GC=F":
+        if gold.provider_symbol != "GC=F" or gold.instrument_type != "futures":
+            return "instrument_identity_violation"
+        # Wide enough for historical/future regimes, narrow enough to reject
+        # the DXY, VIX, silver and yield values observed in cross-ticker races.
+        if not 200.0 <= price <= 20_000.0:
+            return "instrument_identity_violation"
+
+    if (
+        trusted is not None
+        and trusted.asset == candidate.asset
+        and trusted.latest_price > 0
+        and abs(price / trusted.latest_price - 1.0) > 0.20
+    ):
+        return "price_jump_quarantined"
+    return None
+
+
+async def _refresh_and_store(app: FastAPI) -> MarketSnapshotResponse:
     cfg: MarketSnapshotConfig = app.state.cfg
     loader: MarketDataProvider = app.state.market_loader
     persistence: SnapshotPersistence = app.state.persistence
+    async with app.state.refresh_lock:
+        trusted = getattr(app.state, "latest_snapshot", None) or persistence.load()
+        now_monotonic = time.monotonic()
+        if (
+            trusted is not None
+            and cfg.refresh_coalesce_seconds > 0
+            and now_monotonic - app.state.last_refresh_monotonic < cfg.refresh_coalesce_seconds
+        ):
+            return _with_freshness(
+                trusted,
+                stale_after_seconds=cfg.stale_after_seconds,
+            )
+        candidate, fallback_error = await _resolve_snapshot(loader, cfg)
+        app.state.last_refresh_monotonic = now_monotonic
+        validation_error = _candidate_validation_error(candidate, trusted)
+        if validation_error:
+            app.state.last_error = validation_error
+            if trusted is not None:
+                return _with_freshness(
+                    trusted.model_copy(
+                        update={
+                            "status": "degraded",
+                            "degraded_reason": validation_error,
+                        }
+                    ),
+                    stale_after_seconds=cfg.stale_after_seconds,
+                )
+            if not cfg.allow_synthetic_fallback:
+                raise ValueError(validation_error)
+            fallback = build_synthetic_market_snapshot(
+                stale_after_seconds=cfg.stale_after_seconds,
+                degraded_reason=validation_error,
+            )
+            persistence.save(fallback)
+            app.state.latest_snapshot = fallback
+            return fallback
+
+        persistence.save(candidate)
+        app.state.latest_snapshot = candidate
+        app.state.last_error = fallback_error
+        return _with_freshness(candidate, stale_after_seconds=cfg.stale_after_seconds)
+
+
+async def _refresh_loop(app: FastAPI) -> None:
+    cfg: MarketSnapshotConfig = app.state.cfg
     while True:
         try:
-            snapshot, fallback_error = await _resolve_snapshot(loader, cfg)
-            persistence.save(snapshot)
-            app.state.latest_snapshot = snapshot
-            app.state.last_error = fallback_error
+            await _refresh_and_store(app)
         except Exception as exc:
             app.state.last_error = str(exc)
         await asyncio.sleep(cfg.refresh_seconds)
@@ -907,6 +1010,7 @@ def create_app(
             "MARKET_DATA_PROVIDER",
             "yfinance" if app_env == "development" else "external_required",
         ),
+        refresh_coalesce_seconds=float(os.environ.get("MARKET_REFRESH_COALESCE_SECONDS", "2")),
     )
     background_enabled = (
         os.environ.get("MARKET_START_BACKGROUND_TASK", "1") != "0"
@@ -924,6 +1028,8 @@ def create_app(
         app.state.persistence = persistence
         app.state.latest_snapshot = persistence.load()
         app.state.last_error = None
+        app.state.refresh_lock = asyncio.Lock()
+        app.state.last_refresh_monotonic = 0.0
         task = None
         if background_enabled:
             task = asyncio.create_task(_refresh_loop(app))
@@ -973,13 +1079,9 @@ def create_app(
     @app.post("/api/v1/market/snapshot/refresh", response_model=MarketSnapshotResponse)
     async def refresh_market_snapshot() -> MarketSnapshotResponse:
         try:
-            snapshot, fallback_error = await _resolve_snapshot(loader, cfg)
+            return await _refresh_and_store(app)
         except Exception as exc:
             raise HTTPException(status_code=503, detail=f"market_refresh_failed: {exc}") from exc
-        persistence.save(snapshot)
-        app.state.latest_snapshot = snapshot
-        app.state.last_error = fallback_error
-        return _with_freshness(snapshot, stale_after_seconds=cfg.stale_after_seconds)
 
     @app.get("/api/v1/market/snapshot/latest", response_model=MarketSnapshotResponse)
     async def get_latest_market_snapshot() -> MarketSnapshotResponse:

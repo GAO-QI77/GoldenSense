@@ -86,8 +86,16 @@ def _ctx(*, stress=0.05, band_width=0.06, deviation_z=0.9, stale=False) -> dict:
 
 
 def _profile(**over) -> InvestorProfile:
-    base = dict(risk_tolerance="balanced", horizon="mid",
-                current_gold_pct=8.0, experience="experienced")
+    base = dict(
+        risk_tolerance="balanced", horizon="mid",
+        current_gold_pct=8.0, experience="experienced",
+        max_drawdown_pct=12.0, liquidity_need="medium",
+        leverage_attitude="none", investment_goal="capital_preservation",
+        loss_capacity="medium", portfolio_context_known=True,
+        emergency_fund_months=9.0, liabilities_level="low",
+        gold_instrument="unlevered_etf", jurisdiction="SG",
+        base_currency="SGD",
+    )
     base.update(over)
     return InvestorProfile(**base)
 
@@ -228,11 +236,24 @@ def test_advanced_fields_optional_and_backward_compatible():
     assert p.liquidity_need is None
     assert p.leverage_attitude is None
     assert p.investment_goal is None
-    # And facts computation is unchanged when advanced fields are absent.
+    # The request remains valid, but personal position comparison is withheld
+    # until suitability-critical context is provided.
     facts = build_personal_facts(p, _ctx())
-    flags = {f["flag"] for f in facts["risk_flags"]}
-    assert not flags & {"drawdown_tolerance_mismatch", "leverage_out_of_scope",
-                        "liquidity_horizon_mismatch"}
+    assert facts["suitability"]["status"] == "insufficient"
+    assert facts["suitability"]["missing_fields"]
+    assert facts["position_gap"]["status"] == "withheld"
+    assert facts["position_gap"]["gap_pct"] is None
+
+
+def test_suitability_gate_allows_unlevered_complete_profile_and_blocks_derivatives():
+    eligible = build_personal_facts(_profile(), _ctx())
+    assert eligible["suitability"]["status"] == "eligible"
+    assert eligible["position_gap"]["status"] == "within"
+
+    restricted = build_personal_facts(_profile(gold_instrument="cfd"), _ctx())
+    assert restricted["suitability"]["status"] == "restricted"
+    assert restricted["position_gap"]["status"] == "withheld"
+    assert "instrument_out_of_scope" in restricted["suitability"]["reasons"]
 
 
 def test_advanced_field_validation():

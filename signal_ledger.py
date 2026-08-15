@@ -133,6 +133,7 @@ def build_publication(ctx: Dict[str, Any], *, now: datetime) -> Dict[str, Any]:
     factors = ctx.get("macro_factors") or {}
 
     record: Dict[str, Any] = {
+        "evidence_class": "live_forward",
         "publication_id": publication_id_for(now),
         "published_at": (
             now if now.tzinfo else now.replace(tzinfo=timezone.utc)
@@ -239,6 +240,7 @@ def score_track_record(
             points.append((record, resolved[1]))
 
     result: Dict[str, Any] = {
+        "evidence_class": "simulated_forward",
         "per_profile": {},
         "benchmarks": {},
         "matured_through": None,
@@ -263,7 +265,10 @@ def score_track_record(
             turnover_cost = abs(weight - prev_weight) * cost_bps / 10000.0
             weekly_returns.append((1.0 + weight * gold_ret) * (1.0 - turnover_cost) - 1.0)
             prev_weight = weight
-        result["per_profile"][profile] = _profile_stats(weekly_returns)
+        result["per_profile"][profile] = {
+            **_profile_stats(weekly_returns),
+            "evidence_class": "simulated_forward",
+        }
 
     # Benchmarks over the same matured span, cost-free by construction.
     if matured_pairs:
@@ -271,6 +276,7 @@ def score_track_record(
         p_last = matured_pairs[-1][1][1]
         gold_cum = p_last / p_first - 1.0
         result["benchmarks"]["gold_buy_hold"] = {
+            "evidence_class": "simulated_forward",
             "cum_return": round(gold_cum, 6),
             "description": "同期 100% 黄金买入持有（无成本）",
         }
@@ -286,12 +292,17 @@ def score_track_record(
             for r in static_returns:
                 equity *= 1.0 + r
             result["benchmarks"]["static_midpoint"] = {
+                "evidence_class": "simulated_forward",
                 "cum_return": round(equity - 1.0, 6),
                 "weight_pct": first_mid,
                 "description": "首次发布的 balanced 中点恒定持有（无成本）",
             }
     else:
-        result["benchmarks"]["gold_buy_hold"] = {"cum_return": None}
-        result["benchmarks"]["static_midpoint"] = {"cum_return": None}
+        result["benchmarks"]["gold_buy_hold"] = {
+            "evidence_class": "simulated_forward", "cum_return": None
+        }
+        result["benchmarks"]["static_midpoint"] = {
+            "evidence_class": "simulated_forward", "cum_return": None
+        }
 
     return result

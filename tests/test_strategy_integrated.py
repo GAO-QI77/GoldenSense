@@ -83,6 +83,7 @@ def test_evaluate_flagship_returns_curves_and_metrics():
     assert len(result.curve_dates) == len(result.flagship_equity) == len(result.benchmark_equity)
     assert len(result.curve_dates) <= 221
     assert result.flagship_equity[0] > 0
+    assert result.as_dict()["evidence_class"] == "backtest"
 
 
 def test_evaluate_flagship_dsr_in_unit_interval():

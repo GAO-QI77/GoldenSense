@@ -34,11 +34,14 @@ import {
 import AllocationResearchPanel from './AdvisorPage';
 import EventAlertBanner from './EventAlertBanner';
 import GlobalSearch from './GlobalSearch';
+import ProfileStepper from './ProfileStepper';
 import QuantPage from './QuantPage';
 import SignalsPage from './SignalsPage';
 import { ActiveCaseRibbon, ResearchCaseWorkspace } from './ResearchCasePanel';
+import { MarketSnapshotHero, PrimarySourceFeed, ResearchSummary } from './DashboardExperience';
 import { AdvancedProfileFields, CoreProfileFields } from './profileFields';
-import { loadProfile, saveProfile, toLegacyAnalyzeProfile } from './profileStore';
+import { getProfileCompletion, loadProfile, saveProfile, toLegacyAnalyzeProfile } from './profileStore';
+import { deriveDashboardState } from './presentationPolicy';
 import { addSearchEntries } from './searchIndex';
 import { ViewModeContext, loadViewMode, saveViewMode, useViewMode } from './viewMode';
 
@@ -48,18 +51,17 @@ const DASHBOARD_URL =
 const FEEDBACK_URL = import.meta.env.VITE_AGENT_FEEDBACK_URL || API_URL.replace('/analyze', '/feedback');
 const API_KEY = import.meta.env.VITE_AGENT_API_KEY || 'dev-public-key';
 
-// User-facing horizon labels. Internal API keys stay 24h/7d/30d; only the
-// copy is de-jargonised to 短/中/长期 (no T+N).
+// Public research periods. Legacy T+ model keys never reach the UI.
 const horizonLabels = {
-  '24h': '短期',
-  '7d': '中期',
-  '30d': '长期',
+  short_term: '短期',
+  mid_term: '中期',
+  long_term: '长期',
 };
 
 const horizonSubLabels = {
-  '24h': '未来数日',
-  '7d': '未来一周',
-  '30d': '未来一月',
+  short_term: '1–21天',
+  mid_term: '1–6月',
+  long_term: '6月以上',
 };
 
 const horizonShortLabels = horizonLabels;
@@ -188,7 +190,7 @@ function AppShell({ children }) {
   }, []);
 
   return (
-    <div className="terminal-shell">
+    <div className={`terminal-shell mode-${mode}`}>
       <header className="topbar">
         <Link to="/" className="brand-lockup" aria-label="GoldenSense home">
           <span className="brand-mark">
@@ -243,6 +245,12 @@ function AppShell({ children }) {
           </div>
         </div>
       </header>
+      <nav className="mobile-nav" aria-label="移动端主导航">
+        <NavLink to="/" end aria-label="研究主页"><LineChart size={18} /><span>市场</span></NavLink>
+        <NavLink to="/quant" aria-label="量化研究"><Radar size={18} /><span>模型</span></NavLink>
+        <NavLink to="/signals" aria-label="观点书与台账"><BookOpenCheck size={18} /><span>验证</span></NavLink>
+        <NavLink to="/advisor" aria-label="个性化投研"><WalletCards size={18} /><span>我的</span></NavLink>
+      </nav>
       <EventAlertBanner />
       <ViewModeContext.Provider value={{ mode, setMode }}>
         {children}
@@ -257,6 +265,7 @@ function DashboardPage() {
   const [dashboard, setDashboard] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -283,7 +292,7 @@ function DashboardPage() {
     }
     loadDashboard();
     return () => controller.abort();
-  }, []);
+  }, [reloadKey]);
 
   const market = dashboard?.market_status;
   const forecasts = dashboard?.horizon_forecasts || [];
@@ -311,8 +320,7 @@ function DashboardPage() {
     );
   }, [dashboard]);
 
-  const primaryForecast = forecasts[0];
-  const dashboardStatus = loading ? 'loading' : error ? 'error' : dataQuality?.status || 'ok';
+  const dashboardState = deriveDashboardState({ loading, error, dashboard });
   const dashboardInsights = useMemo(
     () => buildDashboardInsights({ market, forecasts, groups, news, dataQuality, degradationFlags }),
     [market, forecasts, groups, news, dataQuality, degradationFlags],
@@ -328,44 +336,19 @@ function DashboardPage() {
             主页只展示稳定市场基线和指标证据；个人风险画像、周期选择和适配建议放在独立 Agent 页处理。
           </p>
         </div>
-        <StatusBadge status={dashboardStatus} loading={loading} />
+        <StatusBadge status={dashboardState.kind === 'unavailable' ? 'error' : dashboardState.kind} loading={loading} />
       </section>
 
-      <ResearchCaseWorkspace />
+      <MarketSnapshotHero dashboard={dashboard} state={dashboardState} onRetry={() => setReloadKey((value) => value + 1)} />
+      <PrimarySourceFeed news={news} state={dashboardState} />
+      <ResearchSummary insights={dashboardInsights} state={dashboardState} />
 
-      {error ? <ErrorPanel title="首页研究数据不可用" message={error} /> : null}
-
-      <section className="market-strip" aria-label="Market summary">
-        <MetricTile
-          label="XAUUSD"
-          value={loading ? '读取中' : market ? formatPrice(market.latest_price) : 'N/A'}
-          detail={market ? `1D ${formatPercent(market.price_change_pct_1d)}` : '等待市场快照'}
-          tone={market?.price_change_pct_1d >= 0 ? 'bull' : market?.price_change_pct_1d < 0 ? 'bear' : 'neutral'}
-          icon={market?.price_change_pct_1d >= 0 ? TrendingUp : TrendingDown}
-        />
-        <MetricTile
-          label="主预测"
-          value={primaryForecast ? primaryForecast.stance : loading ? '读取中' : 'N/A'}
-          detail={primaryForecast ? `${primaryForecast.action} · ${primaryForecast.confidence_band}置信度` : '短期基线'}
-          tone={primaryForecast ? toneName(primaryForecast.stance) : 'neutral'}
-          icon={Radar}
-        />
-        <MetricTile
-          label="数据新鲜度"
-          value={market ? `${market.freshness_seconds}s` : loading ? '读取中' : 'N/A'}
-          detail={market?.is_stale ? '快照陈旧' : dataQuality?.status === 'degraded' ? '含降级数据' : '当前可用'}
-          tone={market?.is_stale || dataQuality?.status === 'degraded' ? 'risk' : 'bull'}
-          icon={DatabaseZap}
-        />
-        <MetricTile
-          label="质量提示"
-          value={degradationFlags.length ? `${degradationFlags.length} 项` : loading ? '读取中' : '正常'}
-          detail={degradationFlags[0] || dataQuality?.indicator_status || '无降级标记'}
-          tone={degradationFlags.length ? 'risk' : 'neutral'}
-          icon={BadgeCheck}
-        />
+      <section data-dashboard-section="research-case" className="research-case-stage">
+        <ResearchCaseWorkspace />
       </section>
 
+      {dashboardState.kind !== 'unavailable' ? (
+      <>
       <section className="research-brief-grid">
         <CoreThesisPanel thesis={dashboardInsights.thesis} />
         <DriverMatrix groups={groups} drivers={dashboardInsights.drivers} />
@@ -410,10 +393,9 @@ function DashboardPage() {
         </div>
 
         <aside className="side-rail">
-          <MarketViewSummaryPanel />
+          <div className="historical-reference"><span>历史研究参考</span><MarketViewSummaryPanel /></div>
           <QualityPanel quality={dataQuality} flags={degradationFlags} />
           {isPro ? <SourceHealthPanel sources={sourceHealth} loading={loading} /> : null}
-          <NewsPanel news={news} loading={loading} />
           {isPro ? <CitationPanel citations={citations} /> : null}
           <Link className="agent-entry" to="/advisor">
             <span>
@@ -431,6 +413,13 @@ function DashboardPage() {
           </Link>
         </aside>
       </section>
+      </>
+      ) : (
+        <section className="historical-reference standalone">
+          <span>历史研究参考 · 非当前判断</span>
+          <MarketViewSummaryPanel />
+        </section>
+      )}
       <TerminalFooter
         left="GoldenSense Research Dashboard"
         right="价格、指标、来源健康与风险提示统一在首页收口"
@@ -443,12 +432,14 @@ function AdvisorWorkbench() {
   // One shared profile powers both capabilities; the workbench owns it.
   const [profile, setProfile] = useState(loadProfile);
   const [tab, setTab] = useState('allocation'); // 'allocation' | 'qa'
+  const [step, setStep] = useState(1);
 
   useEffect(() => {
     saveProfile(profile);
   }, [profile]);
 
   const investorProfile = useMemo(() => toLegacyAnalyzeProfile(profile), [profile]);
+  const profileCompletion = useMemo(() => getProfileCompletion(profile), [profile]);
   const profileScore = useMemo(() => {
     let score = 0;
     if (Number(investorProfile.capital_allocation_pct) >= 50) score += 3;
@@ -480,28 +471,49 @@ function AdvisorWorkbench() {
             <strong>可追溯的风险适配分析</strong>。画像只存本机浏览器、随请求发送，服务端不存储；输出永不构成买卖指令。
           </p>
         </div>
-        <div className={`profile-score level-${profileLevel === '高' ? 'high' : profileLevel === '中' ? 'medium' : 'low'}`}>
-          <span>画像风险</span>
-          <strong>{profileLevel}</strong>
-          <small>score {profileScore}</small>
-        </div>
+        {profileCompletion.suitabilityComplete ? (
+          <div className={`profile-score level-${profileLevel === '高' ? 'high' : profileLevel === '中' ? 'medium' : 'low'}`}>
+            <span>画像风险</span>
+            <strong>{profileLevel}</strong>
+            <small>score {profileScore}</small>
+          </div>
+        ) : (
+          <div className="profile-score incomplete">
+            <span>画像未完成</span>
+            <strong>待补全</strong>
+            <small>暂不计算个人风险等级</small>
+          </div>
+        )}
       </section>
 
       <ActiveCaseRibbon />
 
-      <section className="profile-card">
+      <ProfileStepper
+        step={step}
+        onStepChange={setStep}
+        completion={profileCompletion}
+        core={<section className="profile-card">
         <PanelTitle
           icon={SlidersHorizontal}
-          title="投资者画像"
-          subtitle="核心 4 项 · 进阶可选 · 两种能力共用；仅用于限制输出强度，不改变市场基线"
+          title="第一步：核心画像"
+          subtitle="先说明你的期限、经验和当前黄金占比"
         />
         <div className="profile-fields">
           <CoreProfileFields profile={profile} onChange={updateProfile} />
-          <AdvancedProfileFields profile={profile} onChange={updateProfile} defaultOpen />
         </div>
-      </section>
-
-      <div className="capability-tabs" role="tablist" aria-label="能力切换">
+      </section>}
+        suitability={<section className="profile-card">
+          <PanelTitle
+            icon={ShieldCheck}
+            title="第二步：适当性边界"
+            subtitle={`还有 ${profileCompletion.suitabilityMissing.length} 项待补全 · 全部只存本机`}
+          />
+          <div className="profile-fields">
+            <AdvancedProfileFields profile={profile} onChange={updateProfile} defaultOpen />
+          </div>
+        </section>}
+        research={<section className="profile-research-step">
+        <div className="capability-tabs" role="tablist" aria-label="能力切换">
         <button
           type="button"
           role="tab"
@@ -533,8 +545,11 @@ function AdvisorWorkbench() {
           profile={profile}
           investorProfile={investorProfile}
           profileScore={profileScore}
+          profileComplete={profileCompletion.suitabilityComplete}
         />
       )}
+      </section>}
+      />
 
       <TerminalFooter
         left="GoldenSense 个性化投研"
@@ -544,9 +559,9 @@ function AdvisorWorkbench() {
   );
 }
 
-function QaAnalysisPanel({ profile, investorProfile, profileScore }) {
+function QaAnalysisPanel({ profile, investorProfile, profileScore, profileComplete }) {
   const [question, setQuestion] = useState(starterPrompts[0]);
-  const [horizon, setHorizon] = useState('24h');
+  const [horizon, setHorizon] = useState('short_term');
   const [analysis, setAnalysis] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -562,10 +577,13 @@ function QaAnalysisPanel({ profile, investorProfile, profileScore }) {
   const recentNews = analysis?.recent_news || [];
   const selectedForecast = forecasts.find((item) => item.horizon === horizon) || forecasts[0];
 
-  const riskBudget = useMemo(() => buildRiskBudget(investorProfile, profileScore), [investorProfile, profileScore]);
+  const riskBudget = useMemo(
+    () => buildRiskBudget(investorProfile, profileScore, profileComplete),
+    [investorProfile, profileScore, profileComplete],
+  );
   const suitabilityGate = useMemo(
-    () => buildSuitabilityGate(investorProfile, profileScore, riskBudget),
-    [investorProfile, profileScore, riskBudget],
+    () => buildSuitabilityGate(investorProfile, profileScore, riskBudget, profileComplete),
+    [investorProfile, profileScore, riskBudget, profileComplete],
   );
   const executionScenarios = useMemo(
     () => buildExecutionScenarios({ summary, selectedForecast, riskBudget, investorProfile }),
@@ -1501,14 +1519,14 @@ function buildDashboardInsights({ market, forecasts, groups, news, dataQuality, 
     },
     {
       name: '偏多情景',
-      path: '分批观察上行延续',
+      path: '观察上行条件是否得到确认',
       trigger: '美元走弱、实际利率回落、ETF 或避险资金确认。',
       invalidator: '冲高后资金不跟随，回到观望。',
       tone: 'bull',
     },
     {
       name: '偏空情景',
-      path: '降低暴露或等待回撤',
+      path: '观察下行情景是否持续',
       trigger: '美元与实际利率同步上行，技术面跌破关键区间。',
       invalidator: '避险需求重新抬升且金价收复关键位。',
       tone: 'bear',
@@ -1517,16 +1535,16 @@ function buildDashboardInsights({ market, forecasts, groups, news, dataQuality, 
   return { thesis, drivers, events, scenarios };
 }
 
-function buildRiskBudget(profile, profileScore) {
+function buildRiskBudget(profile, profileScore, profileComplete = true) {
   // All figures are % of the user's portfolio: the product never assumes a
   // capital amount, and never phrases exposure as advice.
   const allocation = Number(profile.capital_allocation_pct || 0);
   const maxDrawdown = Number(profile.max_drawdown_pct || 0);
   const leverageHaircut = { none: 1, low: 0.75, medium: 0.5, high: 0.25 }[profile.leverage_attitude] || 1;
-  const scoreHaircut = profileScore >= 5 ? 0.35 : profileScore >= 2 ? 0.65 : 1;
+  const scoreHaircut = profileComplete ? (profileScore >= 5 ? 0.35 : profileScore >= 2 ? 0.65 : 1) : 0;
   const liquidityHaircut = profile.liquidity_need === 'high' ? 0.6 : profile.liquidity_need === 'medium' ? 0.85 : 1;
   const suggestedExposurePct = allocation * leverageHaircut * scoreHaircut * liquidityHaircut;
-  const level = profileScore >= 5 ? 'high' : profileScore >= 2 ? 'medium' : 'low';
+  const level = profileComplete ? (profileScore >= 5 ? 'high' : profileScore >= 2 ? 'medium' : 'low') : 'neutral';
   const positionGuidance = {
     none: '无持仓时先看触发条件，研究口径不覆盖一次性打满风险预算的路径。',
     long: '已有多头时先关注存量仓位与失效条件，新增暴露的研究前提是确认信号出现。',
@@ -1538,7 +1556,9 @@ function buildRiskBudget(profile, profileScore) {
     maxDrawdown <= 5 ? '回撤触线即停止' : '按失效条件复盘',
     profile.leverage_attitude === 'high' ? '高杠杆超出研究口径' : '不放大杠杆',
   ];
-  const guidance = level === 'high'
+  const guidance = !profileComplete
+    ? '适当性边界尚未补全，暂不计算个人风险等级或暴露上限。'
+    : level === 'high'
     ? '画像风险偏高：研究参考口径下，实际暴露显著低于计划值、并等待确认信号，是与该画像一致的路径。'
     : level === 'medium'
       ? '风险预算可用的研究前提：分批、且每一步有明确失效条件。'
@@ -1554,10 +1574,21 @@ function buildRiskBudget(profile, profileScore) {
   };
 }
 
-function buildSuitabilityGate(profile, profileScore, riskBudget) {
+function buildSuitabilityGate(profile, profileScore, riskBudget, profileComplete = true) {
   const allocation = Number(profile.capital_allocation_pct || 0);
   const maxDrawdown = Number(profile.max_drawdown_pct || 0);
   const rules = [];
+
+  if (!profileComplete) {
+    return {
+      level: 'neutral',
+      decision: '暂不评级',
+      subtitle: '适当性信息未完成',
+      summary: '请先补全回撤、流动性、工具与法域等边界；当前只能进行一般教育型研究。',
+      scoreLabel: '画像未完成',
+      rules: ['补全适当性边界后再进行个人风险评级'],
+    };
+  }
 
   if (allocation >= 50) rules.push('禁止重仓追价');
   if (maxDrawdown <= 5) rules.push('回撤触线即停止');
@@ -1573,7 +1604,7 @@ function buildSuitabilityGate(profile, profileScore, riskBudget) {
     (allocation >= 50 && maxDrawdown <= 5) ||
     (profile.leverage_attitude === 'high' && profile.experience_level === 'beginner');
   const level = forceObservation ? 'high' : profileScore >= 3 ? 'medium' : 'low';
-  const decision = forceObservation ? '强制观望' : level === 'medium' ? '降低暴露' : '可继续分析';
+  const decision = forceObservation ? '强制观望' : level === 'medium' ? '风险限制' : '可继续分析';
   const subtitle = level === 'high' ? '高风险门控' : level === 'medium' ? '中风险限制' : '低风险预检';
   const exposureText = formatPctPlain(riskBudget.suggestedExposurePct);
   const summary = forceObservation
@@ -1629,26 +1660,24 @@ function buildTrendChart(points, keyNodes) {
 }
 
 function buildExecutionScenarios({ summary, selectedForecast, riskBudget, investorProfile }) {
-  const action = summary?.action || selectedForecast?.action || '观望';
-  const exposureText = `${formatPctPlain(riskBudget.suggestedExposurePct)}（组合占比）`;
   return [
     {
       name: '基准观察',
-      action: action === '观望' ? '等待确认' : `${action}，研究参考上限 ${exposureText}`,
+      action: '观察基础情景是否得到确认',
       condition: summary?.reasons?.[0] || selectedForecast?.reasons?.[0] || '稳定预测维持当前方向。',
-      stop: '若触发任一失效条件，停止新增暴露。',
+      stop: '若触发任一失效条件，基础情景作废。',
       tone: 'base',
     },
     {
       name: '偏多突破',
-      action: investorProfile.current_position === 'long' ? '只允许小幅加仓' : '先小仓试探',
-      condition: '美元走弱、实际利率回落、资金流确认后再行动。',
-      stop: '突破后无法站稳或新闻反转，取消追随。',
+      action: '观察上行条件是否持续',
+      condition: '美元走弱、实际利率回落、资金流确认作为情景成立依据。',
+      stop: '突破后无法站稳或新闻反转，上行情景失效。',
       tone: 'bull',
     },
     {
       name: '偏空防守',
-      action: investorProfile.current_position === 'long' ? '优先减仓' : '保持现金等待',
+      action: '观察下行风险是否持续',
       condition: '美元和实际利率同步上行，或技术面跌破关键区间。',
       stop: '避险需求重新抬升时重新评估。',
       tone: 'bear',

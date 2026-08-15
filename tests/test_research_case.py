@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from research_case import (
     AgentView,
     AuditReport,
+    ConfidenceBasis,
     EvidenceDocument,
     FactClaim,
     GateDecision,
@@ -39,6 +40,7 @@ def _case(case_id: str = "rc_test") -> ResearchCase:
         locator="page 2",
         status="accepted",
         confidence=0.92,
+        domains=["macro_event"],
     )
     return ResearchCase(
         case_id=case_id,
@@ -105,6 +107,32 @@ def test_agent_view_rejects_references_to_unaccepted_or_missing_facts():
 
     with pytest.raises(ValueError, match="accepted fact"):
         ResearchCase.model_validate(case.model_dump())
+
+
+def test_domain_agent_cannot_reference_another_domain_fact():
+    case = _case()
+    case.fact_claims[0] = case.fact_claims[0].model_copy(update={"domains": ["technical_flows"]})
+
+    with pytest.raises(ValueError, match="own evidence domain"):
+        ResearchCase.model_validate(case.model_dump())
+
+
+def test_calibrated_confidence_requires_sample_and_period():
+    with pytest.raises(ValueError, match="calibrated confidence"):
+        ConfidenceBasis(method="historical_reliability", calibrated=True)
+
+
+def test_strategy_rejects_mixed_or_unsubstantiated_probability_kinds():
+    strategy = _case().horizon_strategy["mid_term"]
+    payload = strategy.model_dump()
+    payload["base"]["probability_kind"] = "calibrated_probability"
+    with pytest.raises(ValueError, match="same probability kind"):
+        HorizonStrategy.model_validate(payload)
+
+    for scenario in ("base", "upside", "downside"):
+        payload[scenario]["probability_kind"] = "calibrated_probability"
+    with pytest.raises(ValueError, match="calibrated probability"):
+        HorizonStrategy.model_validate(payload)
 
 
 def test_models_forbid_unknown_fields():
@@ -179,12 +207,58 @@ def test_due_outcomes_are_scored_forward_without_touching_future_checkpoints():
 
     scored = score_due_outcomes(case, as_of=published, price_at=lambda _: 3060.0)
 
+    checkpoint = scored.outcome_schedule[0]
+    assert checkpoint.scenario_outcome == "upside"
+    assert checkpoint.scenario_score is not None
+    assert checkpoint.scenario_score_kind == "weight_brier"
+    assert checkpoint.neutral_band_pct == pytest.approx(0.015)
+    assert checkpoint.confidence_error is None  # risk/abstain has no direction claim
     short, future = scored.outcome_schedule
     assert short.status == "scored"
     assert short.realized_return == pytest.approx(0.02)
-    assert short.direction_score is None  # risk/abstain calls are not directionally scored
+    assert short.direction_score is None
     assert future.status == "scheduled" and future.realized_return is None
 
+
+def test_outcome_scoring_uses_horizon_specific_neutral_bands():
+    case = _case("rc_horizon_bands")
+    published = case.created_at
+    case.horizon_strategy["short_term"] = case.horizon_strategy["mid_term"].model_copy(
+        update={"horizon": "short_term", "stance": "neutral"}
+    )
+    case.horizon_strategy["long_term"] = case.horizon_strategy["mid_term"].model_copy(
+        update={"horizon": "long_term", "stance": "neutral"}
+    )
+    case.outcome_schedule = [
+        OutcomeCheckpoint(horizon="short_term", due_at=published, entry_price=100.0),
+        OutcomeCheckpoint(horizon="long_term", due_at=published, entry_price=100.0),
+    ]
+
+    scored = score_due_outcomes(case, as_of=published, price_at=lambda _: 106.0)
+
+    assert scored.outcome_schedule[0].direction_score == 0.0
+    assert scored.outcome_schedule[1].direction_score == 1.0
+    assert scored.outcome_schedule[0].neutral_band_pct < scored.outcome_schedule[1].neutral_band_pct
+
+
+def test_abstention_weights_are_not_scored_as_forecast_probabilities():
+    case = _case("rc_abstain_score")
+    published = case.created_at
+    strategy = case.horizon_strategy["mid_term"]
+    case.horizon_strategy["mid_term"] = strategy.model_copy(update={
+        "stance": "abstain",
+        "base": strategy.base.model_copy(update={"probability": 1.0, "probability_kind": "abstention"}),
+        "upside": strategy.upside.model_copy(update={"probability": 0.0, "probability_kind": "abstention"}),
+        "downside": strategy.downside.model_copy(update={"probability": 0.0, "probability_kind": "abstention"}),
+    })
+    case.outcome_schedule = [
+        OutcomeCheckpoint(horizon="mid_term", due_at=published, entry_price=100.0),
+    ]
+
+    scored = score_due_outcomes(case, as_of=published, price_at=lambda _: 110.0)
+
+    assert scored.outcome_schedule[0].scenario_score is None
+    assert scored.outcome_schedule[0].scenario_score_kind is None
 
 def test_forward_scoring_uses_each_checkpoint_due_date_price():
     case = _case("rc_due_prices")

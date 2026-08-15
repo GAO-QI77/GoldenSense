@@ -21,6 +21,8 @@ import {
 
 import { addSearchEntries } from './searchIndex';
 import { ActiveCaseRibbon, ModelGovernancePanel } from './ResearchCasePanel';
+import { dedupeOutcomes, presentHalfLife } from './presentationPolicy';
+import { useViewMode } from './viewMode';
 
 const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
 const RESEARCH_URL =
@@ -80,6 +82,8 @@ const fmt = {
 };
 
 export default function QuantPage() {
+  const { mode } = useViewMode();
+  const isPro = mode === 'pro';
   const [research, setResearch] = useState(null);
   const [calibration, setCalibration] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -145,6 +149,11 @@ export default function QuantPage() {
 
       <ModelGovernancePanel />
 
+      <div className="quant-truth-label" role="note">
+        <span className="truth-class-badge class-backtest">历史回测</span>
+        <p>本页模型指标来自历史样本和样本外验证；真实前向兑现请到「策略验证」查看。</p>
+      </div>
+
       {error && (
         <div className="quant-error" role="alert">
           <AlertTriangle size={16} />
@@ -152,19 +161,19 @@ export default function QuantPage() {
         </div>
       )}
 
-      {!error && research?.flagship && <FlagshipHero flagship={research.flagship} />}
+      {!error && research?.flagship && <FlagshipHero flagship={research.flagship} isPro={isPro} />}
 
       {!error && research && <DataFreshnessBanner research={research} />}
 
       {!error && (
         <div className="quant-grid">
-          <RegimePanel regime={research?.regime_posterior} degraded={degraded.regime_posterior} />
-          <ConePanel cone={research?.scenario_cone} degraded={degraded.scenario_cone} />
-          <FairValuePanel fairValue={research?.fair_value} degraded={degraded.fair_value} />
+          <RegimePanel regime={research?.regime_posterior} degraded={degraded.regime_posterior} isPro={isPro} />
+          <ConePanel cone={research?.scenario_cone} degraded={degraded.scenario_cone} isPro={isPro} />
+          <FairValuePanel fairValue={research?.fair_value} degraded={degraded.fair_value} isPro={isPro} />
           <FactorPanel factors={research?.macro_factors} degraded={degraded.macro_factors} />
-          <VolPanel volBands={research?.vol_bands} degraded={degraded.vol_bands} />
-          <AllocationPanel allocation={research?.allocation} degraded={degraded.allocation} />
-          <CalibrationPanel calibration={calibration} />
+          <VolPanel volBands={research?.vol_bands} degraded={degraded.vol_bands} isPro={isPro} />
+          <AllocationPanel allocation={research?.allocation} degraded={degraded.allocation} isPro={isPro} />
+          <CalibrationPanel calibration={calibration} isPro={isPro} />
         </div>
       )}
 
@@ -205,7 +214,7 @@ function drawdownFrom(equity) {
   });
 }
 
-function FlagshipHero({ flagship }) {
+function FlagshipHero({ flagship, isPro }) {
   const [view, setView] = useState('drawdown'); // drawdown | equity
   const m = flagship.metrics;
   const b = flagship.benchmark;
@@ -263,7 +272,7 @@ function FlagshipHero({ flagship }) {
     { key: 'sortino', label: 'Sortino', value: fmt.num(m.sortino, 2), bench: fmt.num(b.sortino, 2) },
     { key: 'calmar', label: 'Calmar', value: fmt.num(m.calmar, 2), bench: fmt.num(b.calmar, 2) },
     { key: 'dsr', label: 'Deflated Sharpe', value: fmt.pct(m.dsr, 0), note: '多重检验修正后' },
-  ];
+  ].filter((tile) => isPro || tile.key === 'dd');
 
   return (
     <section className="flagship-hero">
@@ -271,10 +280,9 @@ function FlagshipHero({ flagship }) {
         <div className="flagship-title">
           <span className="flagship-badge"><Trophy size={14} /> 旗舰策略 · {flagship.sample?.start?.slice(0, 4)}–{flagship.sample?.end?.slice(0, 4)} 回测</span>
           <h2>以约一半的回撤，跑出更优的风险调整收益</h2>
-          <p>
-            多周期趋势 × 实际利率顺风 × HMM 状态去险 × 波动率目标，全流程因果（无未来信息）、
-            含 {flagship.cost_bps} bps/边成本；对比买入持有。
-          </p>
+          <p>{isPro
+            ? `多周期趋势 × 实际利率顺风 × HMM 状态去险 × 波动率目标，全流程因果（无未来信息）、含 ${flagship.cost_bps} bps/边成本；对比买入持有。`
+            : '策略同时参考趋势、实际利率和市场压力，并把历史回撤作为首要约束。'}</p>
         </div>
         <div className="flagship-toggle" role="tablist" aria-label="图表视图">
           <button
@@ -340,9 +348,10 @@ function FlagshipHero({ flagship }) {
 
       <p className="flagship-foot">
         <ShieldCheck size={13} />
-        参数取自跨资产趋势/波动率管理文献（未对本样本拟合），HMM 走前重拟合 + 前向滤波，
-        OOS by construction；Deflated Sharpe {fmt.pct(m.dsr, 0)} 表示经多重检验修正后仍显著。
-        历史回测不代表未来表现，非投资建议。
+        {isPro
+          ? `参数取自跨资产趋势/波动率管理文献（未对本样本拟合），HMM 走前重拟合 + 前向滤波，OOS by construction；Deflated Sharpe ${fmt.pct(m.dsr, 0)}。`
+          : '这是历史回测，已考虑交易成本，但不代表未来表现。'}
+        非投资建议。
       </p>
     </section>
   );
@@ -409,7 +418,7 @@ function PanelShell({ id, icon: Icon, title, subtitle, degraded, children, wide 
 }
 
 /* ------------------------------ regime ---------------------------------- */
-function RegimePanel({ regime, degraded }) {
+function RegimePanel({ regime, degraded, isPro }) {
   const latest = regime?.latest;
   const series = regime?.series_tail;
   const dates = regime?.dates_tail || [];
@@ -440,8 +449,8 @@ function RegimePanel({ regime, degraded }) {
     <PanelShell
       id="panel-regime"
       icon={Waves}
-      title="市场状态 · HMM 后验概率"
-      subtitle="三状态高斯隐马尔可夫模型，日收益 + 已实现波动率拟合；概率加权驱动暴露折扣"
+      title={isPro ? '市场状态 · HMM 后验概率' : '当前市场波动状态'}
+      subtitle={isPro ? '三状态高斯隐马尔可夫模型，日收益 + 已实现波动率拟合；概率加权驱动暴露折扣' : '把市场分成平静、波动升高和压力三种环境，用于识别风险。'}
       degraded={degraded}
       wide
     >
@@ -474,7 +483,7 @@ function RegimePanel({ regime, degraded }) {
 }
 
 /* ------------------------------- cone ----------------------------------- */
-function ConePanel({ cone, degraded }) {
+function ConePanel({ cone, degraded, isPro }) {
   const chart = useMemo(() => {
     if (!cone?.percentile_paths) return null;
     const { p10, p50, p90 } = cone.percentile_paths;
@@ -502,7 +511,7 @@ function ConePanel({ cone, degraded }) {
       id="panel-cone"
       icon={Compass}
       title="90 日情景锥 · 蒙特卡洛"
-      subtitle={`基于 HMM 状态转移的 ${cone?.n_paths?.toLocaleString() || '—'} 条模拟路径；分布代替点预测`}
+      subtitle={isPro ? `基于 HMM 状态转移的 ${cone?.n_paths?.toLocaleString() || '—'} 条模拟路径；分布代替点预测` : '用多种可能路径展示未来区间，不给单一点位承诺。'}
       degraded={degraded}
       wide
     >
@@ -550,8 +559,9 @@ function ConePanel({ cone, degraded }) {
 }
 
 /* ----------------------------- fair value -------------------------------- */
-function FairValuePanel({ fairValue, degraded }) {
+function FairValuePanel({ fairValue, degraded, isPro }) {
   const deviation = fairValue?.deviation_pct;
+  const structuralBreak = Boolean(fairValue?.regime_break) || Math.abs(Number(deviation)) > 50;
   const tail = fairValue?.deviation_series_tail || [];
   const spark = useMemo(() => {
     if (tail.length < 2) return null;
@@ -576,11 +586,11 @@ function FairValuePanel({ fairValue, degraded }) {
       id="panel-fair-value"
       icon={Gauge}
       title="宏观公允价值锚"
-      subtitle="log(金价) ~ 实际利率 + 美元指数，滚动十年窗口误差修正框架"
+      subtitle={isPro ? 'log(金价) ~ 实际利率 + 美元指数，滚动十年窗口误差修正框架' : '对比金价与实际利率、美元长期关系，用于识别结构性偏离。'}
       degraded={degraded}
     >
       {(() => {
-        const regimeBreak = Boolean(fairValue?.regime_break);
+        const regimeBreak = structuralBreak;
         const tone = regimeBreak ? 'break' : deviation >= 0 ? 'rich' : 'cheap';
         const label = regimeBreak
           ? '结构性偏离期'
@@ -613,17 +623,17 @@ function FairValuePanel({ fairValue, degraded }) {
               </div>
               <div>
                 <dt>误差修正半衰期</dt>
-                <dd>{fairValue?.half_life_days ? `${Math.round(fairValue.half_life_days)} 日` : '未见回归'}</dd>
+                <dd>{presentHalfLife(fairValue?.half_life_days).label}</dd>
               </div>
             </dl>
           </div>
         );
       })()}
 
-      {fairValue?.interpretation && (
-        <p className={`fair-value-interpretation${fairValue?.regime_break ? ' is-break' : ''}`}>
-          {fairValue?.regime_break && <AlertTriangle size={14} />}
-          {fairValue.interpretation}
+      {fairValue && (
+        <p className={`fair-value-interpretation${structuralBreak ? ' is-break' : ''}`}>
+          {structuralBreak && <AlertTriangle size={14} />}
+          {structuralBreak ? '估值关系显著偏离，暂停均值回归解释，先检查结构变化与数据口径。' : fairValue.interpretation}
         </p>
       )}
       {spark && (
@@ -687,7 +697,7 @@ function FactorPanel({ factors, degraded }) {
 }
 
 /* -------------------------------- vol ------------------------------------ */
-function VolPanel({ volBands, degraded }) {
+function VolPanel({ volBands, degraded, isPro }) {
   const rows = [
     ['h1', '1 日'],
     ['h5', '5 日'],
@@ -707,7 +717,7 @@ function VolPanel({ volBands, degraded }) {
       id="panel-vol"
       icon={Activity}
       title="波动率与收益分布带"
-      subtitle={`HAR-RV 波动率预测 + 经验分位数；年化波动预测 ${volBands?.h1 ? fmt.pct(volBands.h1.ann_vol_forecast, 1) : '—'}`}
+      subtitle={isPro ? `HAR-RV 波动率预测 + 经验分位数；年化波动预测 ${volBands?.h1 ? fmt.pct(volBands.h1.ann_vol_forecast, 1) : '—'}` : `用历史波动范围表示潜在收益区间；年化波动参考 ${volBands?.h1 ? fmt.pct(volBands.h1.ann_vol_forecast, 1) : '—'}`}
       degraded={degraded}
     >
       <div className="vol-band-table">
@@ -738,14 +748,14 @@ function VolPanel({ volBands, degraded }) {
 }
 
 /* ----------------------------- allocation -------------------------------- */
-function AllocationPanel({ allocation, degraded }) {
+function AllocationPanel({ allocation, degraded, isPro }) {
   const profiles = ['conservative', 'balanced', 'aggressive'].filter((p) => allocation?.[p]);
   const maxPct = 25;
   return (
     <PanelShell
       id="panel-allocation"
       icon={PieChart}
-      title="战略配置参考区间 · BL-lite"
+      title={isPro ? '战略配置参考区间 · BL-lite' : '不同风险画像的黄金参考区间'}
       subtitle="风险画像先验 × 状态观点 × 估值观点（观点只倾斜先验，上限 ±25%）· 研究参考，非投资建议"
       degraded={degraded}
     >
@@ -793,20 +803,21 @@ function AllocationPanel({ allocation, degraded }) {
 }
 
 /* ---------------------------- calibration -------------------------------- */
-function CalibrationPanel({ calibration }) {
+function CalibrationPanel({ calibration, isPro }) {
   const hasData = calibration && calibration.total_scored > 0;
   return (
     <PanelShell
       id="panel-calibration"
       icon={Target}
       title="Agent 校准记分卡"
-      subtitle="系统回头给自己的历史判断打分：命中率、Brier 分数与最近判定"
+      subtitle={isPro ? '系统回头给自己的历史判断打分：命中率、Brier 分数与最近判定' : '系统回看历史判断是否兑现，避免只展示正确案例。'}
       degraded={calibration ? null : '校准服务暂不可用'}
       wide
     >
+      <span className="truth-class-badge class-live">真实前向</span>
       {!hasData && (
         <p className="quant-note">
-          尚无足够的已到期历史判断可供评分。每次分析都会入库，24h / 7d / 30d 到期后自动回填实际金价走势并计分。
+          尚无足够的已到期历史判断可供评分。短期、中期、长期研究会按各自复核日回填实际金价走势并计分。
         </p>
       )}
       {calibration?.governance && <GovernanceBadge governance={calibration.governance} />}
@@ -822,7 +833,7 @@ function CalibrationPanel({ calibration }) {
               <strong>{calibration.hit_rate != null ? fmt.pct(calibration.hit_rate, 0) : '—'}</strong>
             </div>
             <div className="calib-tile">
-              <small>Brier 分数（越低越好）</small>
+              <small>{isPro ? 'Brier 分数（越低越好）' : '概率误差（越低越好）'}</small>
               <strong>{calibration.brier_score != null ? fmt.num(calibration.brier_score, 3) : '—'}</strong>
             </div>
             <div className="calib-tile">
@@ -839,7 +850,7 @@ function CalibrationPanel({ calibration }) {
           </div>
           {calibration.recent_outcomes?.length > 0 && (
             <div className="calib-list">
-              {calibration.recent_outcomes.slice(-8).reverse().map((o) => (
+              {dedupeOutcomes(calibration.recent_outcomes).slice(-8).reverse().map((o) => (
                 <div key={o.analysis_id} className="calib-item">
                   <span className={`calib-hit ${o.hit === true ? 'hit' : o.hit === false ? 'miss' : ''}`}>
                     {o.hit === true ? '命中' : o.hit === false ? '未中' : '观望'}
@@ -852,7 +863,7 @@ function CalibrationPanel({ calibration }) {
             </div>
           )}
           <p className="quant-note">
-            校准结果以硬上限（±20%）反哺委员会置信度：{calibration.weight_adjustment?.basis || '—'}。
+            {isPro ? `校准结果以硬上限（±20%）反哺委员会置信度：${calibration.weight_adjustment?.basis || '—'}。` : '历史表现变差时，系统会自动降低未来判断的置信度。'}
           </p>
         </>
       )}

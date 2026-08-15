@@ -54,6 +54,13 @@ const horizonLabels = {
   mid_term: '中期 · 1–6月',
   long_term: '长期 · 6月以上',
 };
+const agentLabels = {
+  macro_event: '事件宏观 Agent',
+  technical_flows: '技术与资金流 Agent',
+  long_term_fundamental: '长期基本面 Agent',
+  quant_model_risk: '量化与模型风险 Agent',
+  strategy_arbitrator: '策略仲裁 Agent',
+};
 
 async function readJson(response) {
   const text = await response.text();
@@ -301,11 +308,47 @@ export function CaseStrategyPanel() {
             <span>{horizonLabels[key] || key}</span>
             <strong>{strategy.stance} · {Math.round((strategy.confidence || 0) * 100)}%</strong>
             <p>{strategy.base?.description}</p>
-            <small>已定价：{strategy.priced_in} · 下次复核 {strategy.next_review_at?.slice(0, 10)}</small>
+            <div className="scenario-weight-audit">
+              <b>{strategy.base?.probability_kind === 'calibrated_probability' ? '校准概率' : strategy.base?.probability_kind === 'abstention' ? '弃权分配' : '研究权重 · 非校准概率'}</b>
+              <span>基准 {Math.round((strategy.base?.probability || 0) * 100)} · 上行 {Math.round((strategy.upside?.probability || 0) * 100)} · 下行 {Math.round((strategy.downside?.probability || 0) * 100)}</span>
+              <code>{strategy.base?.method || 'method unavailable'}</code>
+            </div>
+            <small>方向一致性：{strategy.priced_in} · 下次复核 {strategy.next_review_at?.slice(0, 10)}</small>
+            <small>置信来源：{strategy.confidence_basis?.method || '未记录'} · {strategy.confidence_basis?.calibrated ? '已校准' : '未校准'}</small>
             <ul>{(strategy.invalidation || []).slice(0, 2).map((line) => <li key={line}>{line}</li>)}</ul>
           </article>
         ))}
       </div>
+      <section className="agent-evidence-ledger">
+        <h2>Agent 专属证据账本</h2>
+        <div>
+          {(activeCase.agent_views || []).map((view) => (
+            <article key={`${view.agent}-${view.horizon}`}>
+              <span>{agentLabels[view.agent] || view.agent}</span>
+              <strong>{view.stance} · {Math.round((view.confidence || 0) * 100)}%</strong>
+              <p>{view.thesis}</p>
+              <small>专属支持 {view.supporting_fact_ids?.length || 0} · 反方 {view.counter_fact_ids?.length || 0}</small>
+              <code>{view.confidence_basis?.method || '未记录置信来源'}</code>
+            </article>
+          ))}
+        </div>
+      </section>
+      {activeCase.outcome_schedule?.length ? (
+        <section className="case-outcome-audit">
+          <h2>案件前向校准</h2>
+          <div>{activeCase.outcome_schedule.map((checkpoint) => (
+            <article key={`${checkpoint.horizon}-${checkpoint.due_at}`}>
+              <span>{horizonLabels[checkpoint.horizon] || checkpoint.horizon}</span>
+              <strong>{checkpoint.status === 'scored'
+                ? checkpoint.scenario_score != null
+                  ? `${checkpoint.scenario_score_kind === 'brier' ? '概率' : '权重'} Brier ${Number(checkpoint.scenario_score).toFixed(3)}`
+                  : '已到期 · 评分不可用'
+                : '等待到期'}</strong>
+              <small>{checkpoint.status === 'scored' ? `实际 ${checkpoint.scenario_outcome} · 收益 ${(Number(checkpoint.realized_return) * 100).toFixed(2)}%` : `到期 ${checkpoint.due_at?.slice(0, 10)}`}</small>
+            </article>
+          ))}</div>
+        </section>
+      ) : null}
       {(activeCase.conflicts || []).map((conflict) => (
         <div className="case-conflict" key={conflict.topic}>
           <AlertTriangle size={15} /><div><strong>{conflict.topic}</strong><p>{conflict.minority_view}</p><small>{conflict.resolution}</small></div>

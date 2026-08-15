@@ -28,7 +28,17 @@ load_env_file()
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from horizon_contracts import (
+    HORIZON_LABELS,
+    PUBLIC_HORIZONS,
+    PublicHorizon,
+    horizon_window,
+    public_horizon_payload,
+    to_legacy_quant_horizon,
+)
+from investment_output_policy import find_directive_language, sanitize_research_language
 
 from service_contracts import (
     GoldPriceHistoryPoint,
@@ -42,6 +52,7 @@ from service_contracts import (
     NewsEventItem,
     RecentNewsResponse,
 )
+from news_provenance import classify_news_items
 from analyst_committee import build_committee
 from model_governance import (
     GovernanceVerdict,
@@ -97,11 +108,6 @@ except Exception:  # pragma: no cover - optional dependency in local env
     AsyncOpenAI = None  # type: ignore[assignment]
 
 
-# User-facing horizon copy. Internal decision keys stay 24h/7d/30d and T+1/T+7
-# (the AgentDecision contract); only display strings are de-jargonised.
-_HORIZON_DISPLAY = {"24h": "短期", "7d": "中期", "30d": "长期"}
-
-
 def _research_owner_hash(auth_ctx: Dict[str, str], request: Request) -> str:
     token = request.headers.get("X-Research-Session", "").strip()
     if not re.fullmatch(r"[A-Za-z0-9._-]{16,128}", token):
@@ -121,7 +127,10 @@ def _public_case_payload(case: ResearchCase) -> Dict[str, Any]:
 
 
 def _horizon_zh(horizon: str) -> str:
-    return _HORIZON_DISPLAY.get(horizon, horizon)
+    try:
+        return HORIZON_LABELS[public_horizon_payload(horizon)]
+    except ValueError:
+        return horizon
 
 
 class RiskResult(TypedDict):
@@ -188,9 +197,8 @@ class AgentTriggerResponse(BaseModel):
 
 
 RiskProfile = Literal["conservative", "balanced", "aggressive"]
-PublicHorizon = Literal["24h", "7d", "30d"]
 SummaryStance = Literal["偏多", "偏空", "中性", "高风险观望"]
-SummaryAction = Literal["观望", "小仓试探", "分批布局", "降低暴露"]
+SummaryAction = Literal["观望", "观察确认", "关注上行情景", "关注下行情景"]
 ConfidenceBand = Literal["低", "中", "高"]
 ForecastBasis = Literal["ensemble_model", "heuristic_proxy", "degraded_fallback"]
 
@@ -215,9 +223,21 @@ class AgentAnalyzeRequest(BaseModel):
     question: str = Field(min_length=1, max_length=3000)
     optional_news_text: Optional[str] = Field(default=None, max_length=5000)
     risk_profile: RiskProfile = "conservative"
-    horizon: PublicHorizon = "24h"
+    horizon: PublicHorizon = "short_term"
     locale: Literal["zh-CN"] = "zh-CN"
     investor_profile: Optional[InvestorProfile] = None
+
+    @field_validator("horizon", mode="before")
+    @classmethod
+    def normalize_legacy_horizon(cls, value: Any) -> Any:
+        """Accept old clients during migration but always store public keys."""
+
+        if isinstance(value, str):
+            try:
+                return public_horizon_payload(value)
+            except ValueError:
+                return value
+        return value
 
 
 class SummaryCard(BaseModel):
@@ -251,6 +271,48 @@ class CitationItem(BaseModel):
     source_type: Literal["market_snapshot", "quant_forecast", "recent_news", "historical_analogs", "macro_context", "risk_profile"]
     excerpt: str
     url: Optional[str] = None
+
+
+def _sanitize_public_narrative(narrative: NarrativeOutput) -> NarrativeOutput:
+    """Apply the same deterministic language policy to draft and LLM text."""
+
+    summary = narrative.summary_card.model_copy(
+        update={
+            "reasons": [sanitize_research_language(item) for item in narrative.summary_card.reasons],
+            "invalidators": [sanitize_research_language(item) for item in narrative.summary_card.invalidators],
+            "disclaimer": sanitize_research_language(narrative.summary_card.disclaimer),
+        }
+    )
+    risk_banner = narrative.risk_banner.model_copy(
+        update={
+            "title": sanitize_research_language(narrative.risk_banner.title),
+            "message": sanitize_research_language(narrative.risk_banner.message),
+        }
+    )
+    sanitized = NarrativeOutput(
+        summary_card=summary,
+        risk_banner=risk_banner,
+        follow_up_questions=[
+            sanitize_research_language(item) for item in narrative.follow_up_questions
+        ],
+    )
+    public_texts = [
+        *sanitized.summary_card.reasons,
+        *sanitized.summary_card.invalidators,
+        sanitized.summary_card.disclaimer,
+        sanitized.risk_banner.title,
+        sanitized.risk_banner.message,
+        *sanitized.follow_up_questions,
+    ]
+    if find_directive_language(public_texts):  # pragma: no cover - fail closed
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_code": "public_language_policy_failed",
+                "message": "研究结论未通过投资输出安全审计。",
+            },
+        )
+    return sanitized
 
 
 class RiskBanner(BaseModel):
@@ -734,11 +796,7 @@ def _forecast_basis(payload: Dict[str, Any]) -> ForecastBasis:
 
 
 def _public_to_internal_horizon(horizon: PublicHorizon) -> str:
-    if horizon == "24h":
-        return "T+1"
-    if horizon == "7d":
-        return "T+7"
-    return "T+30"
+    return to_legacy_quant_horizon(horizon)
 
 
 def _snapshot_uses_fallback(snapshot: MarketSnapshotResponse) -> bool:
@@ -754,22 +812,22 @@ def _risk_profile_dict(profile: RiskProfile) -> Dict[str, Any]:
         "conservative": {
             "profile": "conservative",
             "label": "保守型",
-            "preferred_action": "小仓试探",
-            "max_action": "小仓试探",
-            "description": "优先保护本金，只接受分批、小仓位和明确止损框架。",
+            "preferred_action": "观察确认",
+            "max_action": "观察确认",
+            "description": "优先保护本金，只研究证据充分且风险边界明确的情景。",
         },
         "balanced": {
             "profile": "balanced",
             "label": "平衡型",
-            "preferred_action": "分批布局",
-            "max_action": "分批布局",
+            "preferred_action": "关注上行情景",
+            "max_action": "关注上行情景",
             "description": "接受波动，但希望每一步都有证据和失效条件。",
         },
         "aggressive": {
             "profile": "aggressive",
             "label": "进取型",
-            "preferred_action": "分批布局",
-            "max_action": "分批布局",
+            "preferred_action": "关注上行情景",
+            "max_action": "关注上行情景",
             "description": "愿意承担更高波动，但仍需遵守节奏和风险边界。",
         },
     }
@@ -1017,7 +1075,8 @@ class ApiKeyAuthorizer:
 
 
 class SlidingWindowRateLimiter:
-    def __init__(self, *, limit: int, window_seconds: int):
+    def __init__(self, *, bucket_name: str, limit: int, window_seconds: int):
+        self._bucket_name = bucket_name
         self._limit = max(0, int(limit))
         self._window_seconds = max(1, int(window_seconds))
         self._buckets: Dict[str, Deque[float]] = {}
@@ -1033,12 +1092,18 @@ class SlidingWindowRateLimiter:
             while bucket and now - bucket[0] >= self._window_seconds:
                 bucket.popleft()
             if len(bucket) >= self._limit:
+                retry_after = max(1, math.ceil(self._window_seconds - (now - bucket[0])))
                 raise HTTPException(
                     status_code=429,
                     detail={
                         "error_code": "rate_limit_exceeded",
-                        "message": f"Analyze rate limit exceeded. Try again later (limit={self._limit}/{self._window_seconds}s).",
+                        "message": "请求过于频繁，请稍后重试。",
+                        "bucket": self._bucket_name,
+                        "retry_after_seconds": retry_after,
+                        "limit": self._limit,
+                        "window_seconds": self._window_seconds,
                     },
+                    headers={"Retry-After": str(retry_after)},
                 )
             bucket.append(now)
 
@@ -1445,15 +1510,11 @@ class HttpResearchToolbox:
         self._cfg = cfg
 
     async def get_market_snapshot(self) -> MarketSnapshotResponse:
-        refresh_url = self._cfg.market_snapshot_url.replace("/latest", "/refresh")
-        try:
-            resp = await self._http.post(refresh_url, json={})
-            resp.raise_for_status()
-            return MarketSnapshotResponse(**resp.json())
-        except Exception:
-            resp = await self._http.get(self._cfg.market_snapshot_url)
-            resp.raise_for_status()
-            return MarketSnapshotResponse(**resp.json())
+        # Public reads must never mutate or refetch third-party market data.
+        # Refreshing is owned by the market service's background/internal path.
+        resp = await self._http.get(self._cfg.market_snapshot_url)
+        resp.raise_for_status()
+        return MarketSnapshotResponse(**resp.json())
 
     async def get_market_indicators(self) -> MarketIndicatorsResponse:
         resp = await self._http.get(self._cfg.market_indicators_url)
@@ -1954,6 +2015,16 @@ class AgentAnalysisService:
         self._governance: Optional[GovernanceVerdict] = None
         self._governance_at: float = 0.0
         self._governance_ttl = float(_env("AGENT_GOVERNANCE_TTL_SECONDS", "900"))
+        # The dashboard fans out to market, indicators, history, news and three
+        # forecast horizons.  A short shared cache keeps a burst of browsers
+        # from multiplying identical downstream work while preserving the
+        # source-provided as_of/freshness fields in the response.
+        self._dashboard_cache: Optional[AgentDashboardResponse] = None
+        self._dashboard_cache_at: float = 0.0
+        self._dashboard_cache_ttl = max(
+            0.0, float(_env("AGENT_DASHBOARD_CACHE_TTL_SECONDS", "15"))
+        )
+        self._dashboard_cache_lock = asyncio.Lock()
         # Optional metrics registry; set by create_app after construction.
         self.metrics: Optional[MetricsRegistry] = None
 
@@ -1979,6 +2050,7 @@ class AgentAnalysisService:
                     "confidence_band": o["confidence_band"],
                     "realized_return": o["realized_return"],
                     "hit": o.get("hit"),
+                    "evidence_class": o.get("evidence_class", "live_forward"),
                 }
                 for o in outcomes[-30:]
             ]
@@ -2049,7 +2121,10 @@ class AgentAnalysisService:
         }
         news_sentiment = self._derive_news_sentiment(req, news)
         risk_profile = self._toolbox.get_user_risk_profile(req.risk_profile)
-        risk_gate = _investor_profile_gate(req.investor_profile, req.question)
+        risk_gate = _investor_profile_gate(
+            req.investor_profile,
+            "\n".join(part for part in [req.question, req.optional_news_text] if part),
+        )
         if req.investor_profile is not None:
             risk_profile = dict(risk_profile)
             risk_profile["investor_profile"] = risk_gate["investor_profile"]
@@ -2080,7 +2155,7 @@ class AgentAnalysisService:
                 forecast=forecast_map[horizon],
                 snapshot=snapshot,
             )
-            for horizon in ("24h", "7d", "30d")
+            for horizon in PUBLIC_HORIZONS
         ]
         degradation_flags = _degradation_flags(
             snapshot=snapshot,
@@ -2088,6 +2163,9 @@ class AgentAnalysisService:
             forecast=selected_forecast,
             memory_lookup=memory_lookup,
         )
+        if risk_gate.get("prompt_safety_hits"):
+            degradation_flags.append("prompt_injection_detected")
+        degradation_flags = list(dict.fromkeys(degradation_flags))
 
         # Event-driven news reaction: classify the news text onto the event
         # taxonomy, fetch historical-analog statistics (real computed forward
@@ -2229,6 +2307,19 @@ class AgentAnalysisService:
                 narrative = draft
                 degradation_flags.append("narrative_critic_reverted")
 
+        policy_texts = [
+            *narrative.summary_card.reasons,
+            *narrative.summary_card.invalidators,
+            narrative.summary_card.disclaimer,
+            narrative.risk_banner.title,
+            narrative.risk_banner.message,
+            *narrative.follow_up_questions,
+        ]
+        if find_directive_language(policy_texts):
+            degradation_flags.append("directive_language_sanitized")
+        narrative = _sanitize_public_narrative(narrative)
+        degradation_flags = list(dict.fromkeys(degradation_flags))
+
         if not evidence_cards:
             raise HTTPException(
                 status_code=503,
@@ -2275,7 +2366,7 @@ class AgentAnalysisService:
             analysis_id=analysis_id,
             summary_card=narrative.summary_card,
             horizon_forecasts=horizon_forecasts,
-            recent_news=news.items[:6],
+            recent_news=classify_news_items(news.items[:6]),
             evidence_cards=evidence_cards,
             citations=citations,
             risk_banner=narrative.risk_banner,
@@ -2322,7 +2413,7 @@ class AgentAnalysisService:
             response=response_model,
             bundle=bundle,
             horizon_forecasts=horizon_forecasts,
-            recent_news=news.items[:6],
+            recent_news=classify_news_items(news.items[:6]),
             evidence_cards=evidence_cards,
             citations=citations,
         )
@@ -2336,7 +2427,7 @@ class AgentAnalysisService:
                 forecast=forecast_map[horizon],
                 snapshot=snapshot,
             )
-            for horizon in ("24h", "7d", "30d")
+            for horizon in PUBLIC_HORIZONS
         ]
         elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
         return AgentForecastsResponse(
@@ -2360,6 +2451,22 @@ class AgentAnalysisService:
         )
 
     async def current_dashboard(self) -> AgentDashboardResponse:
+        now = time.monotonic()
+        cached = self._dashboard_cache
+        if cached is not None and now - self._dashboard_cache_at < self._dashboard_cache_ttl:
+            return cached
+
+        async with self._dashboard_cache_lock:
+            now = time.monotonic()
+            cached = self._dashboard_cache
+            if cached is not None and now - self._dashboard_cache_at < self._dashboard_cache_ttl:
+                return cached
+            dashboard = await self._current_dashboard_uncached()
+            self._dashboard_cache = dashboard
+            self._dashboard_cache_at = time.monotonic()
+            return dashboard
+
+    async def _current_dashboard_uncached(self) -> AgentDashboardResponse:
         t0 = datetime.now(timezone.utc)
         snapshot, forecast_map, forecast_trace = await self._gather_forecast_baseline()
         horizon_forecasts = [
@@ -2368,7 +2475,7 @@ class AgentAnalysisService:
                 forecast=forecast_map[horizon],
                 snapshot=snapshot,
             )
-            for horizon in ("24h", "7d", "30d")
+            for horizon in PUBLIC_HORIZONS
         ]
         indicators_started = datetime.now(timezone.utc)
         try:
@@ -2480,7 +2587,7 @@ class AgentAnalysisService:
             horizon_forecasts=horizon_forecasts,
             indicator_groups=indicators.groups,
             gold_history=gold_history,
-            recent_news=news.items[:6],
+            recent_news=classify_news_items(news.items[:6]),
             citations=[item.model_dump(mode="json") for item in indicators.citations],
             source_health=source_health,
             data_quality={
@@ -2583,7 +2690,7 @@ class AgentAnalysisService:
         try:
             timed_snapshot, timed_forecasts, timed_news, timed_rag = await asyncio.gather(
                 self._timed_tool("get_market_snapshot", self._toolbox.get_market_snapshot()),
-                self._gather_quant_forecasts(("24h", "7d", "30d")),
+                self._gather_quant_forecasts(PUBLIC_HORIZONS),
                 self._timed_optional_tool(
                     "search_recent_news",
                     self._toolbox.search_recent_news(news_query, limit=6),
@@ -2622,7 +2729,7 @@ class AgentAnalysisService:
         try:
             timed_snapshot, timed_forecasts = await asyncio.gather(
                 self._timed_tool("get_market_snapshot", self._toolbox.get_market_snapshot()),
-                self._gather_quant_forecasts(("24h", "7d", "30d")),
+                self._gather_quant_forecasts(PUBLIC_HORIZONS),
             )
         except Exception as exc:
             raise HTTPException(
@@ -2725,9 +2832,9 @@ class AgentAnalysisService:
     def _memory_average(self, horizon: PublicHorizon, rag_events: List[RagEventItem]) -> float:
         values: List[Optional[float]] = []
         for event in rag_events:
-            if horizon == "24h":
+            if horizon == "short_term":
                 values.append(event.gold_t1_return)
-            elif horizon == "7d":
+            elif horizon == "mid_term":
                 values.append(event.gold_t7_return)
             else:
                 proxy = None
@@ -2804,7 +2911,11 @@ class AgentAnalysisService:
             or news.status != "ok"
         )
         basis = _forecast_basis(forecast)
-        low_confidence_threshold = {"24h": 0.56, "7d": 0.58, "30d": 0.6}[horizon]
+        low_confidence_threshold = {
+            "short_term": 0.56,
+            "mid_term": 0.58,
+            "long_term": 0.6,
+        }[horizon]
         is_low_confidence = probability < low_confidence_threshold
         is_high_risk = bool(
             snapshot.is_stale
@@ -2823,13 +2934,13 @@ class AgentAnalysisService:
         elif quant_direction > 0:
             stance = "偏多"
             confidence_band = "高" if probability >= 0.67 and basis == "ensemble_model" else "中"
-            action = "小仓试探" if risk_profile["profile"] == "conservative" else "分批布局"
+            action = "观察确认" if risk_profile["profile"] == "conservative" else "关注上行情景"
         elif quant_direction < 0:
             stance = "偏空"
             confidence_band = "高" if probability >= 0.67 and basis == "ensemble_model" else "中"
-            action = "降低暴露"
+            action = "关注下行情景"
 
-        horizon_label = {"24h": "短期", "7d": "中期", "30d": "长期"}[horizon]
+        horizon_label = HORIZON_LABELS[horizon]
         if basis == "degraded_fallback":
             basis_reason = f"{horizon_label} 量化暂不可用，当前已退回保守中性判断。"
         elif risk_profile.get("force_observation"):
@@ -2839,19 +2950,19 @@ class AgentAnalysisService:
         else:
             basis_reason = f"{horizon_label} 量化方向为 {'偏多' if quant_direction > 0 else '偏空' if quant_direction < 0 else '中性'}，概率约 {probability * 100:.1f}%。"
 
-        if horizon == "30d":
-            horizon_reason = "30 天更看中期趋势与宏观环境，因此结论会比短线更慢、更偏参考。"
-        elif horizon == "7d":
+        if horizon == "long_term":
+            horizon_reason = "长期研究更关注储备结构、制度变化、供需与估值锚，不把月度波动冒充长期结论。"
+        elif horizon == "mid_term":
             horizon_reason = (
-                f"历史相似事件在 7 天口径的均值表现约 {memory_avg * 100:+.2f}%，可帮助判断冲击是否延续。"
+                f"历史相似事件在中期代理口径的均值表现约 {memory_avg * 100:+.2f}%，只用于判断冲击延续性。"
                 if rag_events
-                else "7 天视角会同时参考新闻延续性和趋势结构。"
+                else "中期视角同时参考政策路径、状态切换、美元、实际利率和资金流。"
             )
         else:
             horizon_reason = (
-                f"历史相似事件在 1 天口径的均值表现约 {memory_avg * 100:+.2f}%，更适合短线参考。"
+                f"历史相似事件在短期代理口径的均值表现约 {memory_avg * 100:+.2f}%，只作为事件风险参考。"
                 if rag_events
-                else "24 小时视角更容易受新闻和美元短线波动影响。"
+                else "短期 1–21 天更容易受事件预期差、美元、实际利率、技术结构与流动性影响。"
             )
 
         return {
@@ -2893,7 +3004,11 @@ class AgentAnalysisService:
             or _forecast_is_degraded(forecast)
             or (vix_value is not None and vix_value >= self._cfg.vix_circuit_breaker_threshold)
         )
-        low_confidence_threshold = {"24h": 0.56, "7d": 0.58, "30d": 0.6}[horizon]
+        low_confidence_threshold = {
+            "short_term": 0.56,
+            "mid_term": 0.58,
+            "long_term": 0.6,
+        }[horizon]
 
         stance: SummaryStance = "中性"
         action: SummaryAction = "观望"
@@ -2904,14 +3019,14 @@ class AgentAnalysisService:
             confidence_band = "低"
         elif quant_direction > 0:
             stance = "偏多"
-            action = "小仓试探"
+            action = "关注上行情景"
             confidence_band = "高" if probability >= 0.67 and basis == "ensemble_model" else "中"
         elif quant_direction < 0:
             stance = "偏空"
-            action = "降低暴露"
+            action = "关注下行情景"
             confidence_band = "高" if probability >= 0.67 and basis == "ensemble_model" else "中"
 
-        horizon_label = {"24h": "短期", "7d": "中期", "30d": "长期"}[horizon]
+        horizon_label = HORIZON_LABELS[horizon]
         if basis == "degraded_fallback":
             basis_reason = f"{horizon_label} 量化预测暂不可用，当前只保留保守占位。"
         elif basis == "heuristic_proxy":
@@ -2928,9 +3043,9 @@ class AgentAnalysisService:
             else "该卡只使用行情快照和量化模型输出，不随聊天输入改写。"
         )
         horizon_reason = {
-            "24h": "短期用于数日方向基线，适合和即时新闻解释分开阅读。",
-            "7d": "中期用于一周方向基线，避免单条问题改变市场预测。",
-            "30d": "长期用于一月中期参考，不等同于独立长期交易建议。",
+            "short_term": "短期覆盖 1–21 天，方向无样本外优势时只发布区间与风险。",
+            "mid_term": "中期覆盖 1–6 月，重点参考政策周期、状态切换与资金流。",
+            "long_term": "长期覆盖 6 月以上，重点参考储备结构、供需与估值锚。",
         }[horizon]
 
         return HorizonForecastCard(
@@ -3144,7 +3259,7 @@ class AgentAnalysisService:
 
         memory_avg = _mean(
             [
-                event.gold_t1_return if bundle.horizon == "24h" else event.gold_t7_return
+                event.gold_t1_return if bundle.horizon == "short_term" else event.gold_t7_return
                 for event in bundle.rag_events
             ]
         )
@@ -3163,7 +3278,7 @@ class AgentAnalysisService:
                     if bundle.memory_status != "ok"
                     else (
                         "历史相似事件均值表现 "
-                        f"{memory_avg * 100:+.2f}%（按{'短期' if bundle.horizon == '24h' else '中期'}口径），"
+                        f"{memory_avg * 100:+.2f}%（按{'短期' if bundle.horizon == 'short_term' else '中长期代理'}口径），"
                         "可用于判断新闻冲击是否容易延续。"
                     )
                 ),
@@ -3191,6 +3306,7 @@ class AgentAnalysisService:
                 takeaway=(
                     f"{bundle.risk_profile['label']}：{bundle.risk_profile['description']} "
                     f"问卷门控等级 {bundle.risk_gate.get('level')}。"
+                    f"系统波动率风险阈值为 VIX {self._cfg.vix_circuit_breaker_threshold:.0f}。"
                 ),
                 direction="neutral",
                 citation_ids=["cit-risk"],
@@ -3217,17 +3333,23 @@ class AgentAnalysisService:
             # mapped to the user's risk profile -- not the negative-edge quant
             # direction or the uncalibrated probability.
             stance = regime["stance"]
-            action = regime["action"]
+            action = (
+                "关注上行情景"
+                if stance == "偏多"
+                else "关注下行情景"
+                if stance == "偏空"
+                else "观望"
+            )
             confidence_band = regime["confidence_band"]
         else:
             if bundle.quant_direction > 0:
                 stance = "偏多"
                 confidence_band = "中"
-                action = "小仓试探" if req.risk_profile == "conservative" else "分批布局"
+                action = "观察确认" if req.risk_profile == "conservative" else "关注上行情景"
             elif bundle.quant_direction < 0:
                 stance = "偏空"
                 confidence_band = "中"
-                action = "降低暴露"
+                action = "关注下行情景"
             else:
                 stance = "中性"
                 action = "观望"
@@ -3238,7 +3360,7 @@ class AgentAnalysisService:
         elif use_regime:
             primary_reason = (
                 f"多周期趋势判定为{regime['regime']}（综合得分 {regime['trend_score']:.2f}，波动状态 {regime['vol_state']}），"
-                f"{req.risk_profile} 画像建议黄金目标暴露约 {regime['target_exposure_pct']:.0f}%。"
+                f"{req.risk_profile} 画像只用于调整研究阈值，不生成目标仓位。"
                 "该结论来自带交易成本回测的趋势+波动率管理策略，不依赖未校准的涨跌概率。"
             )
         elif _forecast_is_degraded(bundle.forecast):
@@ -3301,12 +3423,12 @@ class AgentAnalysisService:
             )
 
         follow_up_questions = [
-            "如果你已经持有黄金仓位，我可以按你的风险偏好重写成持仓建议。",
+            "如果你已经持有黄金风险暴露，我可以解释它与教育型参考区间的风险差距。",
             "如果你想比较短期、中期、长期哪个周期分歧最大，我可以直接帮你解释。",
             "如果你想看这次判断最容易失效的情景，我可以单独展开风险清单。",
         ]
 
-        return NarrativeOutput(
+        return _sanitize_public_narrative(NarrativeOutput(
             summary_card=SummaryCard(
                 stance=stance,
                 horizon=req.horizon,
@@ -3318,21 +3440,21 @@ class AgentAnalysisService:
             ),
             risk_banner=risk_banner,
             follow_up_questions=follow_up_questions,
-        )
+        ))
 
 
 def _legacy_decision_from_analyze(resp: AgentAnalyzeResponse) -> AgentDecision:
     stance = resp.summary_card.stance
-    if stance == "偏多" and resp.summary_card.action in {"小仓试探", "分批布局"}:
+    if stance == "偏多" and resp.summary_card.action in {"观察确认", "关注上行情景"}:
         action = "BUY"
-    elif stance == "偏空" and resp.summary_card.action == "降低暴露":
+    elif stance == "偏空" and resp.summary_card.action == "关注下行情景":
         action = "SELL"
     else:
         action = "HOLD"
     return AgentDecision(
         action=action,
         confidence=_confidence_to_score(resp.summary_card.confidence_band),
-        horizon="T+1" if resp.summary_card.horizon == "24h" else "T+7",
+        horizon="T+1" if resp.summary_card.horizon == "short_term" else "T+7",
         reasoning_summary=resp.summary_card.reasons[0],
         risk_warning=resp.risk_banner.message,
     )
@@ -3423,6 +3545,10 @@ def create_app(
         raise RuntimeError("Default development API keys are not allowed outside development.")
     analyze_rate_limit_per_minute = int(_env("AGENT_ANALYZE_RATE_LIMIT_PER_MINUTE", "60"))
     analyze_rate_limit_window_seconds = int(_env("AGENT_ANALYZE_RATE_LIMIT_WINDOW_SECONDS", "60"))
+    read_rate_limit_per_minute = int(_env("AGENT_READ_RATE_LIMIT_PER_MINUTE", "300"))
+    research_rate_limit_per_minute = int(_env("AGENT_RESEARCH_RATE_LIMIT_PER_MINUTE", "20"))
+    personalize_rate_limit_per_minute = int(_env("AGENT_PERSONALIZE_RATE_LIMIT_PER_MINUTE", "30"))
+    write_rate_limit_per_minute = int(_env("AGENT_WRITE_RATE_LIMIT_PER_MINUTE", "30"))
     allow_trace_memory_fallback = (
         os.environ.get("AGENT_ALLOW_TRACE_MEMORY_FALLBACK", "1" if app_env == "development" else "0") != "0"
     )
@@ -3442,10 +3568,33 @@ def create_app(
         app.state.narrator = narrator or OpenAINarrator(cfg)
         app.state.sentiment_scorer = sentiment_scorer or KeywordSentimentScorer()
         app.state.authorizer = ApiKeyAuthorizer(public_keys=public_api_keys, internal_keys=internal_api_keys)
-        app.state.rate_limiter = SlidingWindowRateLimiter(
-            limit=analyze_rate_limit_per_minute,
-            window_seconds=analyze_rate_limit_window_seconds,
-        )
+        app.state.rate_limiters = {
+            "read": SlidingWindowRateLimiter(
+                bucket_name="read",
+                limit=read_rate_limit_per_minute,
+                window_seconds=analyze_rate_limit_window_seconds,
+            ),
+            "analyze": SlidingWindowRateLimiter(
+                bucket_name="analyze",
+                limit=analyze_rate_limit_per_minute,
+                window_seconds=analyze_rate_limit_window_seconds,
+            ),
+            "research": SlidingWindowRateLimiter(
+                bucket_name="research",
+                limit=research_rate_limit_per_minute,
+                window_seconds=analyze_rate_limit_window_seconds,
+            ),
+            "personalize": SlidingWindowRateLimiter(
+                bucket_name="personalize",
+                limit=personalize_rate_limit_per_minute,
+                window_seconds=analyze_rate_limit_window_seconds,
+            ),
+            "write": SlidingWindowRateLimiter(
+                bucket_name="write",
+                limit=write_rate_limit_per_minute,
+                window_seconds=analyze_rate_limit_window_seconds,
+            ),
+        }
         app.state.signal_ledger_store = signal_ledger_store or JsonlLedgerStore(
             _env("SIGNAL_LEDGER_PATH", "data_cache/signal_ledger.jsonl")
         )
@@ -3632,21 +3781,21 @@ def create_app(
     @app.post("/api/v1/agent/analyze", response_model=AgentAnalyzeResponse)
     async def analyze(req: AgentAnalyzeRequest, request: Request) -> AgentAnalyzeResponse:
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["analyze"].check(auth_ctx["client_id"])
         service: AgentAnalysisService = app.state.analysis_service
         return await service.analyze(req)
 
     @app.get("/api/v1/agent/forecasts/current", response_model=AgentForecastsResponse)
     async def current_forecasts(request: Request) -> AgentForecastsResponse:
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
         service: AgentAnalysisService = app.state.analysis_service
         return await service.current_forecasts()
 
     @app.get("/api/v1/agent/dashboard/current", response_model=AgentDashboardResponse)
     async def current_dashboard(request: Request) -> AgentDashboardResponse:
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
         service: AgentAnalysisService = app.state.analysis_service
         return await service.current_dashboard()
 
@@ -3657,7 +3806,7 @@ def create_app(
         allocation tilts -- computed from the repo-local long dataset with a
         TTL cache. Read-only; consumed by the research frontend."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
         try:
             ctx = await asyncio.to_thread(quant_research_context.get_context)
         except Exception as exc:
@@ -3677,7 +3826,7 @@ def create_app(
         research context. Every section carries evidence and invalidation
         conditions; sections degrade independently."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
         try:
             ctx = await asyncio.to_thread(quant_research_context.get_context)
         except Exception as exc:
@@ -3696,7 +3845,7 @@ def create_app(
         URL/PDF/image. External text is gated before expert orchestration; raw
         file bytes and investor data are never written to the case store."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["research"].check(auth_ctx["client_id"])
         owner_hash = _research_owner_hash(auth_ctx, request)
 
         media_type = request.headers.get("content-type", "").lower()
@@ -3878,7 +4027,7 @@ def create_app(
     async def score_due_research_cases(request: Request) -> JSONResponse:
         """Internal cron hook: append a scored revision using each due-date close."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=True)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["write"].check(auth_ctx["client_id"])
         now = datetime.now(timezone.utc)
 
         def _score() -> Dict[str, Any]:
@@ -3928,7 +4077,7 @@ def create_app(
     @app.get("/api/v1/agent/research-cases/{case_id}")
     async def get_research_case(case_id: str, request: Request) -> JSONResponse:
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
         owner_hash = _research_owner_hash(auth_ctx, request)
         case = app.state.research_case_store.get(case_id)
         if case is None or case.owner_hash != owner_hash:
@@ -3945,7 +4094,7 @@ def create_app(
         request: Request,
     ) -> JSONResponse:
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["personalize"].check(auth_ctx["client_id"])
         owner_hash = _research_owner_hash(auth_ctx, request)
         case = app.state.research_case_store.get(case_id)
         if case is None or case.owner_hash != owner_hash:
@@ -3976,7 +4125,7 @@ def create_app(
         directive-language check. The profile is request-scoped only -- it is
         never persisted server-side."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["personalize"].check(auth_ctx["client_id"])
         try:
             ctx = await asyncio.to_thread(quant_research_context.get_context)
         except Exception as exc:
@@ -4060,7 +4209,7 @@ def create_app(
         local gitignored store, keyed with an unsubscribe token; the token is
         never returned via the API (it travels inside the digest mail)."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["write"].check(auth_ctx["client_id"])
         try:
             result = await asyncio.to_thread(
                 app.state.subscription_store.subscribe, req.email
@@ -4095,7 +4244,7 @@ def create_app(
         Process-cached for 5 minutes so homepage traffic never hammers the
         news service. Failures degrade to inactive, never to an error page."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
 
         now = time.time()
         cached = getattr(app.state, "event_alert_cache", None)
@@ -4140,7 +4289,7 @@ def create_app(
         forward returns with event citations) + archived decision-relevant
         news, both sides degrading explicitly."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
         from knowledge_retriever import search_knowledge
 
         try:
@@ -4162,15 +4311,22 @@ def create_app(
     async def signals_current(request: Request) -> JSONResponse:
         """Latest immutable weekly signal publication."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
         records = await asyncio.to_thread(_ledger_records)
         if not records:
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "error_code": "no_publication",
-                    "message": "信号台账为空：追踪记录自首次发布起前向累积，不回填。",
-                },
+            # An append-only ledger legitimately begins empty.  Treat that as
+            # a first-class resource state so browser consoles and uptime
+            # monitoring do not misclassify honest "not published yet" copy as
+            # a broken endpoint.
+            return JSONResponse(
+                content={
+                    "status": "empty",
+                    "error_code": "first_publication_required",
+                    "message": "信号台账尚未产生第一期真实前向发布。",
+                    "guidance": "由内部发布任务冻结本周研究后，将从该时点开始累积，不回填历史。",
+                    "next_action": "publish_first_weekly_signal",
+                    "evidence_class": "live_forward",
+                }
             )
         latest = max(records, key=lambda r: r.get("published_at") or "")
         return JSONResponse(content=jsonable_encoder(latest))
@@ -4179,7 +4335,7 @@ def create_app(
     async def signals_history(request: Request, limit: int = 52) -> JSONResponse:
         """Full publication history, oldest first (append-only audit trail)."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
         records = await asyncio.to_thread(_ledger_records)
         records.sort(key=lambda r: r.get("published_at") or "")
         return JSONResponse(
@@ -4192,7 +4348,7 @@ def create_app(
         Starts empty by design: no backfilled history, backtests live under
         /research and are labeled as backtests."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
 
         def _score() -> Dict[str, Any]:
             from data_sources import load_market_data
@@ -4217,7 +4373,8 @@ def create_app(
     async def signals_publish(request: Request) -> JSONResponse:
         """Freeze this ISO week's publication (idempotent). Internal only:
         publication is an operational act, not a public mutation."""
-        app.state.authorizer.authorize(request, internal_only=True)
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=True)
+        await app.state.rate_limiters["write"].check(auth_ctx["client_id"])
         try:
             ctx = await asyncio.to_thread(quant_research_context.get_context)
             record, created = await asyncio.to_thread(
@@ -4239,7 +4396,7 @@ def create_app(
     async def signals_by_id(publication_id: str, request: Request) -> JSONResponse:
         """Permalink to one immutable publication (audit trail)."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
         records = await asyncio.to_thread(_ledger_records)
         for record in records:
             if record.get("publication_id") == publication_id:
@@ -4258,7 +4415,7 @@ def create_app(
         calls (hit rate, Brier score) plus the bounded committee-confidence
         adjustment derived from them."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
-        await app.state.rate_limiter.check(auth_ctx["client_id"])
+        await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
         service: AgentAnalysisService = app.state.analysis_service
         try:
             payload = await service.compute_calibration_summary()
@@ -4284,7 +4441,8 @@ def create_app(
 
     @app.post("/api/v1/agent/feedback", response_model=AgentFeedbackResponse)
     async def feedback(req: AgentFeedbackRequest, request: Request) -> AgentFeedbackResponse:
-        app.state.authorizer.authorize(request, internal_only=False)
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
+        await app.state.rate_limiters["write"].check(auth_ctx["client_id"])
         store: AgentTraceStore = app.state.trace_store
         try:
             updated = await store.save_feedback(req.analysis_id, req.rating, req.comment)
@@ -4308,7 +4466,8 @@ def create_app(
 
     @app.get("/api/v1/agent/traces/{analysis_id}", response_model=AgentTraceResponse)
     async def get_trace(analysis_id: str, request: Request) -> AgentTraceResponse:
-        app.state.authorizer.authorize(request, internal_only=True)
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=True)
+        await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
         store: AgentTraceStore = app.state.trace_store
         try:
             payload = await store.load_trace(analysis_id)
@@ -4332,14 +4491,15 @@ def create_app(
 
     @app.post("/api/v1/agent/trigger", response_model=AgentTriggerResponse)
     async def trigger(req: AgentTriggerRequest, request: Request, response: Response) -> AgentTriggerResponse:
-        app.state.authorizer.authorize(request, internal_only=True)
+        auth_ctx = app.state.authorizer.authorize(request, internal_only=True)
+        await app.state.rate_limiters["analyze"].check(auth_ctx["client_id"])
         service: AgentAnalysisService = app.state.analysis_service
         analysis_run = await service.analyze_internal(
             AgentAnalyzeRequest(
                 question="请分析这条新闻对黄金的影响，并给出适合散户理解的短线建议。",
                 optional_news_text=req.news_text,
                 risk_profile="balanced",
-                horizon="24h",
+                horizon="short_term",
                 locale="zh-CN",
             )
         )

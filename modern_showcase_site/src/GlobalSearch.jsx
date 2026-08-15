@@ -18,6 +18,8 @@ export default function GlobalSearch() {
   const [results, setResults] = useState(() => querySearch(''));
   const [activeIndex, setActiveIndex] = useState(0);
   const inputRef = useRef(null);
+  const triggerRef = useRef(null);
+  const panelRef = useRef(null);
   const navigate = useNavigate();
 
   const refresh = useCallback(
@@ -45,13 +47,36 @@ export default function GlobalSearch() {
 
   useEffect(() => {
     if (open) {
+      const previousOverflow = document.body.style.overflow;
+      document.body.style.overflow = 'hidden';
       setQuery('');
       refresh('');
       const timer = setTimeout(() => inputRef.current?.focus(), 30);
-      return () => clearTimeout(timer);
+      return () => {
+        clearTimeout(timer);
+        document.body.style.overflow = previousOverflow;
+        triggerRef.current?.focus();
+      };
     }
     return undefined;
   }, [open, refresh]);
+
+  function trapDialogFocus(event) {
+    if (event.key !== 'Tab') return;
+    const focusable = Array.from(
+      panelRef.current?.querySelectorAll('button:not([disabled]), input:not([disabled]), [href]') || [],
+    ).filter((element) => element.getClientRects().length > 0);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
 
   function go(entry) {
     setOpen(false);
@@ -83,7 +108,7 @@ export default function GlobalSearch() {
 
   return (
     <>
-      <button type="button" className="search-trigger" onClick={() => setOpen(true)}>
+      <button ref={triggerRef} type="button" className="search-trigger" onClick={() => setOpen(true)} aria-label="搜索研究内容">
         <Search size={15} />
         <span>搜索研究内容</span>
         <kbd>⌘K</kbd>
@@ -92,7 +117,7 @@ export default function GlobalSearch() {
       {open && (
         <div className="search-overlay" role="dialog" aria-modal="true" aria-label="全局搜索">
           <div className="search-backdrop" onClick={() => setOpen(false)} />
-          <div className="search-panel">
+          <div className="search-panel" ref={panelRef} onKeyDown={trapDialogFocus}>
             <div className="search-input-row">
               <Search size={17} />
               <input
@@ -114,7 +139,7 @@ export default function GlobalSearch() {
             <ul className="search-results" role="listbox">
               {results.length === 0 && <li className="search-empty">没有匹配结果，换个关键词试试。</li>}
               {results.map((entry, index) => (
-                <li key={entry.id || `${entry.source}-${index}`}>
+                <li key={entry.id || `${entry.source}-${index}`} role="option" aria-selected={index === activeIndex}>
                   <button
                     type="button"
                     className={index === activeIndex ? 'search-result active' : 'search-result'}

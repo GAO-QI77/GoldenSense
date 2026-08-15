@@ -42,7 +42,7 @@ def _draft(*, action: str = "观望") -> NarrativeOutput:
     return NarrativeOutput(
         summary_card=SummaryCard(
             stance="中性",
-            horizon="24h",
+            horizon="short_term",
             confidence_band="低",
             action=action,
             reasons=["规则原因一", "规则原因二"],
@@ -88,7 +88,7 @@ def _bundle(*, is_high_risk: bool = False) -> AnalysisBundle:
         question="今晚 CPI 超预期时，黄金短线如何控制风险？",
         optional_news_text=None,
         evidence_query="CPI 黄金 风险",
-        horizon="24h",
+        horizon="short_term",
         risk_profile={"label": "保守型", "description": "test"},
         investor_profile=None,
         risk_gate={"level": "low", "force_observation": False},
@@ -153,7 +153,7 @@ class _FakeOpenAIClient:
 
 
 def _enhanced_json() -> str:
-    data = _draft(action="小仓试探").model_dump()
+    data = _draft(action="关注上行情景").model_dump()
     data["summary_card"]["disclaimer"] = "DeepSeek 增强"
     return json.dumps(data, ensure_ascii=False)
 

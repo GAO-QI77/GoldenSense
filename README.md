@@ -17,6 +17,15 @@ GoldenSense 当前是一款可演示 MVP，面向需要快速理解黄金市场�
 | 当前状态 | 已完成可演示 MVP；尚未披露真实用户使用数据 |
 | 下一步验证 | 计划开展 5 - 10 位目标用户访谈与可用性测试，重点验证任务完成率、结果可理解性和风险提示识别率 |
 
+### 人本化前端流程
+
+- 首页固定按“市场快照 → 一手信息 → 今日研究摘要 → 创建统一研究案件”展示，先交代市场时点和原始信息，再进入 Agent 闭环。
+- 新闻只能根据解析后的官方域名标记为一手来源；媒体、转载和合成降级内容分层展示，不能冒充官方原文。
+- 前端统一使用 `loading / current / delayed / degraded / unavailable` 状态。当接口不可用时，错误状态优先，停止展示当前行情派生结论，并提供重试操作。
+- 个性化投研为三步流程：核心画像、适当性边界、生成研究。适当性字段不完整时不显示风险分数，也不用默认值伪造“中风险”。
+- 移动端使用固定底部主导航，只展示当前画像步骤；主导航触控高度不小于 44px。
+- 量化页对超过 3,650 天的半衰期、超过 50% 的公允价值偏离和重复校准记录做展示层拦截；简明模式使用用户语言，专业模式保留模型细节。
+
 ## 演示入口
 
 - GitHub 仓库：<https://github.com/GAO-QI77/GoldenSense>
@@ -32,6 +41,11 @@ GoldenSense 当前是一款可演示 MVP，面向需要快速理解黄金市场�
 - 安全报告与生产硬化建议：见 [`SECURITY.md`](SECURITY.md)。
 - 贡献流程与本地检查：见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 - CI：GitHub Actions 会在 `main` 和 PR 上运行 Python 测试、前端构建和 Playwright e2e。
+
+第三方与数据披露：Python 依赖及版本见 [`requirements.txt`](requirements.txt)，前端依赖及锁定版本见
+[`modern_showcase_site/package-lock.json`](modern_showcase_site/package-lock.json)。开发/Demo 行情使用 yfinance，宏观数据使用 FRED，
+新闻使用 RSS，可选叙事模型为 DeepSeek；这些均非交易所级数据或必需闭源依赖。商业服务费用、权限、替代方案与生产禁用的
+Demo fallback 详见 [`DEPLOYMENT_DOC.md`](DEPLOYMENT_DOC.md)。
 
 ## 设计目标
 
@@ -70,7 +84,7 @@ flowchart LR
 
 | 组件 | 端口 | 职责 | 关键入口 |
 | --- | --- | --- | --- |
-| `inference_service.py` | `8010` | 输出 `T+1 / T+7 / T+30` 预测、概率和解释特征 | `POST /api/v1/forecast` |
+| `inference_service.py` | `8010` | 内部量化适配器；网关统一映射为短期/中期/长期公开契约 | `POST /api/v1/forecast` |
 | `memory_service.py` | `8012` | 返回历史相似事件及其后验金价表现 | `POST /api/v1/memory/search` |
 | `market_snapshot_service.py` | `8014` | 统一市场快照、技术状态、波动率与新鲜度信息 | `GET /api/v1/market/snapshot/latest` |
 | `market_snapshot_service.py` | `8014` | 基本面、技术面、宏观政策、资金情绪四类指标契约 | `GET /api/v1/market/indicators/current` |
@@ -231,7 +245,12 @@ export AGENT_INTERNAL_API_KEYS=dev-internal-key
 | `AGENT_PUBLIC_API_KEYS` | `dev-public-key`（仅 dev） | 逗号分隔的对外 API key 列表 |
 | `AGENT_INTERNAL_API_KEYS` | `dev-internal-key`（仅 dev） | 逗号分隔的内部 API key 列表 |
 | `AGENT_ANALYZE_RATE_LIMIT_PER_MINUTE` | `60` | `analyze` 限流阈值 |
+| `AGENT_READ_RATE_LIMIT_PER_MINUTE` | `300` | 首页、预测、观点书等读接口独立限流阈值 |
+| `AGENT_RESEARCH_RATE_LIMIT_PER_MINUTE` | `20` | PDF/URL/图片研究案件限流阈值 |
+| `AGENT_PERSONALIZE_RATE_LIMIT_PER_MINUTE` | `30` | 个性化计算限流阈值 |
+| `AGENT_WRITE_RATE_LIMIT_PER_MINUTE` | `30` | 反馈、订阅等写接口限流阈值 |
 | `AGENT_ANALYZE_RATE_LIMIT_WINDOW_SECONDS` | `60` | `analyze` 限流窗口 |
+| `AGENT_DASHBOARD_CACHE_TTL_SECONDS` | `15` | 首页聚合的短时共享快照，并发请求不重复打下游 |
 | `AGENT_ALLOW_ORIGINS` | 本地前端域名列表 | CORS 白名单 |
 | `AGENT_TOOL_TIMEOUT_SECONDS` | `35.0` | 单工具总超时；需覆盖推理服务冷启动首次行情抓取 |
 | `AGENT_TOOL_CONNECT_TIMEOUT_SECONDS` | `1.5` | 单工具连接超时 |
@@ -256,7 +275,18 @@ URL、PDF、PNG/JPEG/WebP每次选一种主证据。PDF上限20 MB，图片上�
 
 研究案件端点还要求浏览器/客户端生成的 `X-Research-Session` 不透明令牌；服务端只保存它与API key指纹组合后的哈希，用于隔离不同会话的案件。前端 `localStorage` 只保存当前 `case_id`，完整案件状态只存在当前浏览器会话。
 
-`mode=draft` 只运行确定性门控、量化模型风险 Agent 和基础三期限策略；`mode=full` 再动态调用领域专家并尝试生成 LLM 叙事。LLM 只接收已通过门控的事实卡，输出还会经过数字落地与非指令化检查；模型不可用或审计失败时返回确定性叙事并附降级标记。
+`mode=draft` 只运行确定性门控、量化模型风险 Agent 和基础三期限策略；`mode=full` 再动态调用领域专家并尝试生成受控叙事。LLM 只接收已通过门控的事实卡，输出还会经过数字落地、抽取式证据约束与非指令化检查；模型不可用或审计失败时返回确定性叙事并附降级标记。
+
+#### 数字可信度与 Agent 证据纪律
+
+- 三期限的 `base/upside/downside.probability` 为兼容既有API保留的数值字段。只有 `probability_kind=calibrated_probability` 才可解释为统计概率；当前未完成概率校准的输出明确标为 `research_weight`，前端显示“研究权重 · 非校准概率”。
+- 每个场景携带 `method/sample_size/calibration_error`；每个 Agent 和策略置信度携带 `confidence_basis`。缺少样本与校准来源时不会伪装成历史胜率。
+- `FactClaim.domains` 把事实分类为宏观事件、技术资金流、长期基本面或一般信息。领域 Agent 只引用自己领域中已通过门控的事实；量化 Agent 只引用受治理模型状态。
+- `priced_in_basis` 明确区分真实事件窗口市场反应与方向一致性代理；没有金价、美元和实际利率反应数据时，不宣称已经完成“市场已定价”判断。
+
+#### 适当性闸门
+
+旧版四字段画像仍可生成一般教育型研究，但个人仓位差距默认为 `withheld`。只有回撤、流动性、杠杆、目标、损失承受力、组合上下文、应急资金、负债、黄金工具、法域和基础货币信息齐备，且工具属于无杠杆研究范围时，`SuitabilityGate` 才返回 `eligible`。期货、期权、CFD或中高杠杆输入返回 `restricted`，不输出个人仓位差距。
 
 本地三分钟演示：
 
@@ -273,7 +303,7 @@ curl -X POST http://localhost:8020/api/v1/agent/research-cases/score-due \
   -H 'X-API-Key: dev-internal-key'
 ```
 
-评分使用每个 checkpoint 到期日之后的首个可得黄金收盘价，不使用任务执行时的统一最新价。
+评分使用每个 checkpoint 到期日之后的首个可得黄金收盘价，不使用任务执行时的统一最新价。评分按短/中/长期不同中性带记录方向命中、实际情景、多分类 Brier/权重 Brier 和置信度误差；研究权重的分数不会标成已校准概率 Brier，安全弃权不参与任何预测评分。
 
 ### 下游服务地址
 
@@ -342,7 +372,7 @@ python3 memory_ingestion.py \
 
 | 期限 | 方法 | 模块 |
 | --- | --- | --- |
-| 短期 (T+1~T+5) | 不预测方向（已被走前验证证伪），改为 HAR-RV 波动率预测 + 经验分位收益带 | `vol_models.py` |
+| 短期 (1–21天) | 不在无样本外优势时预测方向，改为 HAR-RV 波动率预测 + 经验分位收益带 | `vol_models.py` |
 | 中期 (数周~数月) | 三状态 HMM 概率状态机 + 实际利率/美元/通胀预期/资金流四因子组合，概率加权暴露 | `regime_probabilistic.py`, `strategy_macro.py`, `regime_strategy.evaluate_regime_v2` |
 | 长期 (6 个月+) | 公允价值锚（误差修正）+ BL-lite 配置区间 + regime-switching 蒙特卡洛情景锥 | `fair_value.py`, `allocation.py` |
 
@@ -393,11 +423,8 @@ Agent 编排新增确定性机制（均无 LLM 参与）：
 
 `inference_service.py` 优先加载 checkpoint 进行真实预测；当模型不可用、输入准备失败或市场数据无法正常取得时，会退回启发式代理结果，并在响应中把 `forecast_basis` 标成 `heuristic_proxy`。响应还包含 `model_status`、`model_loaded` 和 `model_checkpoint_path`，用于区分真实模型输出与代理预测。
 
-这意味着：
-
-- `T+1 / T+7` 优先来自模型
-- `T+30` 当前用于中期参考，不应当被解读为独立训练的长期预测系统
-- 服务在不满足条件时倾向于“保守可用”，而不是“强行自信”
+底层 checkpoint 仍保留历史内部名称以保持文件兼容，但不作为公开产品期限。对外只返回
+`short_term / mid_term / long_term`，且长期层由公允价值、结构因素和情景锥负责，不用中期代理冒充。条件不足时保守降级，不强行自信。
 
 ### 市场与新闻
 
@@ -433,10 +460,10 @@ X-API-Key: <public-or-internal-key>
 
 ```json
 {
-  "question": "今晚 CPI 超预期的话，黄金 24 小时怎么看？",
+  "question": "今晚 CPI 超预期的话，黄金短期风险如何？",
   "optional_news_text": "美国 CPI 同比高于预期，美元与收益率同步走高。",
   "risk_profile": "conservative",
-  "horizon": "24h",
+  "horizon": "short_term",
   "locale": "zh-CN"
 }
 ```
@@ -446,7 +473,7 @@ X-API-Key: <public-or-internal-key>
 - `question`：用户表达层输入
 - `optional_news_text`：证据层优先输入；如提供，Agent 会优先用它驱动新闻和历史类比检索
 - `risk_profile`：`conservative | balanced | aggressive`
-- `horizon`：`24h | 7d | 30d`
+- `horizon`：`short_term | mid_term | long_term`；旧时间字段只作后端兼容输入，不在公开输出中出现
 - `locale`：当前固定 `zh-CN`
 - `investor_profile`：可选完整问卷；包含风险容量、周期、经验、资金占比、最大回撤、已有持仓、流动性需求、杠杆态度和投资目标。该字段只影响风险适配和建议强度，不改写三周期预测基线。
 
@@ -620,9 +647,9 @@ curl -X POST http://127.0.0.1:8020/api/v1/agent/analyze \
   -H 'Content-Type: application/json' \
   -H 'X-API-Key: dev-public-key' \
   -d '{
-    "question": "如果今晚 CPI 高于预期，黄金 24 小时怎么看？",
+    "question": "如果今晚 CPI 高于预期，黄金短期风险如何？",
     "risk_profile": "conservative",
-    "horizon": "24h",
+    "horizon": "short_term",
     "locale": "zh-CN"
   }'
 ```
@@ -672,6 +699,16 @@ CI 当前包含三层保障：
 - Python 3.12 下的正式测试集
 - Node.js 20 下的消费者前台生产构建
 - Playwright Chromium 下的桌面与移动端 e2e
+
+比赛验收器按 GOAI 手册六项官方权重计分，任一硬门失败最高 89 分：
+
+```bash
+python3 scripts/competition_acceptance.py \
+  --gateway-url http://127.0.0.1:8020 \
+  --frontend-url http://127.0.0.1:4173
+```
+
+评分器不把“计划开展用户测试”当作已验证价值；没有真实用户证据时，场景价值项会主动扣分。
 
 Docker Compose 主链路冒烟保留为本地/手动验证，避免公开 CI 过度依赖外部行情、新闻和容器冷启动时长。
 
@@ -724,7 +761,7 @@ Railway、Neon 初始化和 Vercel 环境变量详见 [`DEPLOYMENT_DOC.md`](DEPL
 ## 已知限制
 
 - 本项目是教育型辅助系统，不构成投资建议。
-- `T+30` 仍是中期代理参考，不应当被解释为独立长期模型。
+- 公开层已统一为短期/中期/长期；底层旧 checkpoint 命名仅为内部兼容实现。
 - 外部数据源主要用于研究与辅助判断，不是交易所级行情基础设施。
 - 量化研究层（`/quant`）刻意使用免费的 FRED + yfinance 数据，并以"非实时研究级"横幅、
   `is_realtime=false` 与显式降级标记诚实标注；它不承诺实时性或数据可用性 SLA。

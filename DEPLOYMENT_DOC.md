@@ -42,6 +42,10 @@ zsh scripts/dev_stack.sh stop
 - `news_ingest_service.py`
 - `agent_gateway.py`
 
+本地脚本默认不加载 embedding 模型，因此 `memory_service` 可以 HTTP-ready 但会在响应体中显示
+`status=unavailable / retriever_status=not_started`。这是开发环境显式降级，不是已加载的记忆服务。完整验收前应执行
+`memory_ingestion.py` 并设置 `MEMORY_START_BACKGROUND_LOAD=1`。
+
 ## 3. 鉴权配置
 
 正式 Agent 网关要求 API key：
@@ -199,6 +203,8 @@ ResearchCase 生产发布还需确认：
 - URL输入每次重定向重新执行公网HTTPS校验，拒绝私网、回环、链路本地和保留地址。
 - 前端为案件请求发送随机 `X-Research-Session`；服务端按会话哈希隔离案件，不能跨会话读取或个性化。
 - 通过内部 cron 调用 `POST /api/v1/agent/research-cases/score-due`，完成到期 checkpoint 前向评分。
+- 前端和下游消费者必须读取 `probability_kind`：`research_weight` 只能展示为研究权重，不能标注为预测概率或胜率。
+- 个性化消费者必须尊重 `rules.suitability.position_analysis_allowed`；为 `false` 时不得自行恢复仓位差距或目标比例。
 
 发布前检查：
 
@@ -245,3 +251,14 @@ python3 -m pytest -q \
 ```bash
 python3 scripts/smoke_agent.py
 ```
+
+比赛硬门验收（GOAI 官方六项权重，包含 100 并发、四页联通、三期限、攻击阻断和公开输出审计）：
+
+```bash
+python3 scripts/competition_acceptance.py \
+  --gateway-url http://127.0.0.1:8020 \
+  --frontend-url http://127.0.0.1:4173
+```
+
+首页聚合默认使用 15 秒共享快照合并并发下游请求。读、分析、研究、个性化和写入使用独立限流桶；429 响应包含
+`Retry-After`、中文原因和重试时间，前端不得将其呈现为研究结论。

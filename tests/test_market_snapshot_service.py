@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
+import httpx
 import numpy as np
 import pandas as pd
 from fastapi.testclient import TestClient
 
+from agent_gateway import AgentGatewayConfig, HttpResearchToolbox
 from data_loader import MarketDataLoader
-from market_snapshot_service import MarketSnapshotConfig, build_market_snapshot, create_app
+from market_snapshot_service import (
+    MarketSnapshotConfig,
+    _refresh_and_store,
+    build_market_snapshot,
+    create_app,
+)
 
 
 class _FakeMarketLoader:
@@ -65,9 +73,24 @@ class _JumpMarketLoader:
         )
 
 
+class _SequenceMarketLoader:
+    provider_name = "yfinance"
+
+    def __init__(self, prices):
+        self.prices = list(prices)
+        self.calls = 0
+
+    def fetch_data(self, period="6mo", interval="1d"):
+        price = self.prices[min(self.calls, len(self.prices) - 1)]
+        self.calls += 1
+        frame = _FakeMarketLoader().fetch_data(period, interval)
+        frame["Gold"] = np.linspace(price * 0.98, price, num=len(frame.index))
+        return frame
+
+
 def test_build_market_snapshot_contract():
     snapshot = build_market_snapshot(_FakeMarketLoader().fetch_data())
-    assert snapshot.asset == "XAUUSD"
+    assert snapshot.asset == "GC=F"
     assert snapshot.latest_price > 0
     assert snapshot.feature_summary.technical_state in {"bullish", "bearish", "mixed"}
     assert snapshot.feature_summary.volatility_regime in {"calm", "elevated", "stress"}
@@ -78,6 +101,9 @@ def test_build_market_snapshot_contract():
     assert snapshot.feature_summary.macd is not None
     assert snapshot.feature_summary.atr14_pct is not None
     assert any(item.symbol == "VIX" for item in snapshot.instruments)
+    gold = next(item for item in snapshot.instruments if item.symbol == "GC=F")
+    assert gold.instrument_type == "futures"
+    assert gold.unit == "USD/troy_oz"
 
 
 def test_market_snapshot_endpoint_contract():
@@ -89,7 +115,7 @@ def test_market_snapshot_endpoint_contract():
         resp = client.get("/api/v1/market/snapshot/latest")
         assert resp.status_code == 200
         data = resp.json()
-    assert data["asset"] == "XAUUSD"
+    assert data["asset"] == "GC=F"
     assert data["feature_summary"]["technical_state"] in {"bullish", "bearish", "mixed"}
     assert isinstance(data["instruments"], list)
     assert len(data["instruments"]) >= 3
@@ -105,7 +131,7 @@ def test_market_indicators_endpoint_groups_research_pillars():
         assert resp.status_code == 200
         data = resp.json()
 
-    assert data["asset"] == "XAUUSD"
+    assert data["asset"] == "GC=F"
     assert {group["id"] for group in data["groups"]} == {
         "fundamental",
         "technical",
@@ -133,7 +159,7 @@ def test_gold_history_endpoint_marks_two_percent_key_nodes_with_real_factor_cont
         assert resp.status_code == 200
         data = resp.json()
 
-    assert data["asset"] == "XAUUSD"
+    assert data["asset"] == "GC=F"
     assert data["source"] == "test_jump"
     assert len(data["points"]) == 8
     assert len(data["key_nodes"]) >= 3
@@ -173,3 +199,73 @@ def test_market_readiness_fails_without_snapshot_when_fallback_disabled():
 def test_yfinance_loader_uses_2y_yield_instead_of_13w_bill():
     loader = MarketDataLoader()
     assert loader.tickers["2Y_Bond"] == "2YY=F"
+
+
+def test_gateway_market_snapshot_read_never_forces_refresh():
+    snapshot = build_market_snapshot(_FakeMarketLoader().fetch_data())
+    methods = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(200, json=snapshot.model_dump(mode="json"))
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            cfg = AgentGatewayConfig(
+                forecast_url="http://forecast/api/v1/forecast",
+                memory_url="http://memory/api/v1/memory/search",
+                market_snapshot_url="http://market/api/v1/market/snapshot/latest",
+                market_indicators_url="http://market/api/v1/market/indicators/current",
+                market_history_url="http://market/api/v1/market/gold/history",
+                recent_news_url="http://news/api/v1/news/recent",
+                default_model="test",
+                complex_model="test",
+                vix_circuit_breaker_threshold=30.0,
+                stale_after_seconds=180,
+                news_stale_after_seconds=300,
+            )
+            return await HttpResearchToolbox(client, cfg).get_market_snapshot()
+
+    result = asyncio.run(run())
+    assert result.latest_price == snapshot.latest_price
+    assert methods == ["GET"]
+
+
+def test_extreme_gold_candidate_is_quarantined_without_overwriting_trusted_snapshot():
+    loader = _SequenceMarketLoader([4380.0, 99.67])
+    persistence = _MemoryPersistence()
+    app = create_app(
+        market_loader=loader,
+        persistence=persistence,
+        config=MarketSnapshotConfig(refresh_coalesce_seconds=0),
+        start_background_task=False,
+    )
+
+    with TestClient(app) as client:
+        first = client.post("/api/v1/market/snapshot/refresh")
+        second = client.post("/api/v1/market/snapshot/refresh")
+        latest = client.get("/api/v1/market/snapshot/latest")
+
+    assert first.status_code == 200
+    assert first.json()["latest_price"] == 4380.0
+    assert second.status_code == 200
+    assert second.json()["status"] == "degraded"
+    assert second.json()["degraded_reason"] == "instrument_identity_violation"
+    assert latest.json()["latest_price"] == 4380.0
+
+
+def test_concurrent_refreshes_coalesce_into_one_provider_fetch():
+    loader = _SequenceMarketLoader([4380.0])
+    app = create_app(
+        market_loader=loader,
+        persistence=_MemoryPersistence(),
+        start_background_task=False,
+    )
+
+    async def run():
+        async with app.router.lifespan_context(app):
+            return await asyncio.gather(*[_refresh_and_store(app) for _ in range(20)])
+
+    snapshots = asyncio.run(run())
+    assert loader.calls == 1
+    assert {snapshot.latest_price for snapshot in snapshots} == {4380.0}

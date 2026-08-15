@@ -164,6 +164,25 @@ def test_degraded_champion_cannot_influence_strategy():
     assert not hmm.can_influence_strategy and not har.can_influence_strategy
     assert case.horizon_strategy["mid_term"].stance == "abstain"
     assert "production_model_degraded" in case.horizon_strategy["mid_term"].degradation_flags
+    assert {
+        case.horizon_strategy["mid_term"].base.probability_kind,
+        case.horizon_strategy["mid_term"].upside.probability_kind,
+        case.horizon_strategy["mid_term"].downside.probability_kind,
+    } == {"abstention"}
+
+
+def test_unavailable_horizon_uses_abstention_not_research_weights():
+    ctx = _ctx()
+    ctx.pop("scenario_cone")
+    ctx.pop("fair_value")
+
+    case = build_research_case("gold outlook", _packet("Gold market update."), ctx)
+
+    strategy = case.horizon_strategy["long_term"]
+    assert strategy.stance == "abstain"
+    assert strategy.confidence == 0
+    assert {strategy.base.probability_kind, strategy.upside.probability_kind,
+            strategy.downside.probability_kind} == {"abstention"}
 
 
 def test_evidence_confidence_and_disagreement_discount_strategy_confidence():
@@ -196,3 +215,64 @@ def test_reviewed_intake_fact_never_reaches_an_agent():
     assert {view.agent for view in case.agent_views} == {"quant_model_risk", "strategy_arbitrator"}
     assert case.status == "degraded"
     assert case.audit_report.passed is False
+
+
+def test_domain_agents_receive_only_their_own_classified_evidence():
+    case = build_research_case(
+        "Fed, ETF and reserve demand",
+        _packet(
+            "Rate cuts and falling real yields support gold. "
+            "ETF outflows pressure gold. "
+            "Central bank demand and reserve diversification support gold."
+        ),
+        _ctx(),
+    )
+
+    facts = {fact.claim_id: fact for fact in case.fact_claims}
+    views = {view.agent: view for view in case.agent_views}
+    expected_domain = {
+        "macro_event": "macro_event",
+        "technical_flows": "technical_flows",
+        "long_term_fundamental": "long_term_fundamental",
+    }
+    for agent, domain in expected_domain.items():
+        refs = views[agent].supporting_fact_ids + views[agent].counter_fact_ids
+        assert refs, agent
+        assert all(domain in facts[claim_id].domains for claim_id in refs)
+        assert views[agent].confidence_basis.method == "deterministic_evidence_score"
+        assert views[agent].confidence_basis.calibrated is False
+
+
+def test_agent_separates_supporting_and_counter_evidence_within_its_domain():
+    case = build_research_case(
+        "Fed path",
+        _packet(
+            "Rate cuts and falling real yields support gold. "
+            "A rate hike and a stronger dollar pressure gold."
+        ),
+        _ctx(),
+    )
+
+    view = next(item for item in case.agent_views if item.agent == "macro_event")
+    assert view.stance == "bullish"
+    assert len(view.supporting_fact_ids) == 1
+    assert len(view.counter_fact_ids) == 1
+
+
+def test_scenario_numbers_are_dynamic_research_weights_with_provenance():
+    bullish_ctx = _ctx()
+    bearish_ctx = _ctx()
+    bearish_ctx["macro_factors"]["composite"] = 0.38
+
+    bullish = build_research_case("gold outlook", _packet("Gold market update."), bullish_ctx)
+    bearish = build_research_case("gold outlook", _packet("Gold market update."), bearish_ctx)
+    bull_mid = bullish.horizon_strategy["mid_term"]
+    bear_mid = bearish.horizon_strategy["mid_term"]
+
+    assert bull_mid.upside.probability > bull_mid.downside.probability
+    assert bear_mid.upside.probability < bear_mid.downside.probability
+    assert bull_mid.base.probability_kind == "research_weight"
+    assert bull_mid.base.method == "macro_composite_weight_v1"
+    assert bull_mid.confidence_basis.calibrated is False
+    assert bull_mid.confidence_basis.method == "model_governance_score"
+    assert bull_mid.priced_in_basis == "directional_alignment_proxy_not_market_reaction"

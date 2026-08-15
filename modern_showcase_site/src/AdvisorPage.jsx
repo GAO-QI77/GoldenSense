@@ -23,6 +23,7 @@ const gapLabels = {
   above: { text: '高于参考区间上沿', tone: 'risk' },
   below: { text: '低于参考区间下沿', tone: 'neutral' },
   unknown: { text: '区间不可用', tone: 'neutral' },
+  withheld: { text: '适当性闸门暂停对比', tone: 'neutral' },
 };
 
 const flagLabels = {
@@ -111,6 +112,7 @@ export default function AllocationResearchPanel({ profile }) {
   const range = facts?.reference_range;
   const gapMeta = gapLabels[gap?.status] || gapLabels.unknown;
   const horizonSection = facts?.horizon_evidence?.section;
+  const suitability = facts?.suitability;
   const polishing = phase === 'polishing';
   const loading = phase === 'draft-loading';
 
@@ -182,20 +184,25 @@ export default function AllocationResearchPanel({ profile }) {
               </div>
               {range?.available ? (
                 <>
+                  <div className={`suitability-verdict status-${suitability?.status || 'insufficient'}`}>
+                    <strong>{suitability?.status === 'eligible' ? '适当性通过' : suitability?.status === 'restricted' ? '工具或风险约束不匹配' : '适当性信息不足'}</strong>
+                    <span>{suitability?.position_analysis_allowed ? '允许显示个人仓位差距' : '个人仓位差距已暂停'}</span>
+                    {suitability?.missing_fields?.length ? <small>待补充：{suitability.missing_fields.join(' · ')}</small> : null}
+                  </div>
                   <div className="advisor-range-line">
                     <strong>
                       {range.range_pct[0].toFixed(1)}% – {range.range_pct[1].toFixed(1)}%
                     </strong>
                     <span>中点 {range.midpoint}%</span>
                   </div>
-                  <div className="advisor-gap-line">
+                  <div className={`advisor-gap-line ${gap?.status === 'withheld' ? 'withheld' : ''}`}>
                     <span className={`stance-badge tone-${gapMeta.tone === 'bull' ? 'bull' : gapMeta.tone === 'risk' ? 'risk' : 'neutral'}`}>
                       {gapMeta.text}
                     </span>
-                    <span>
+                    {gap?.status !== 'withheld' ? <span>
                       当前仓位 {gap?.current_gold_pct}%
                       {gap?.gap_pct ? ` · 差距 ${gap.gap_pct} 个百分点` : ''}
-                    </span>
+                    </span> : <span>仅保留一般教育型研究，不形成个人配置判断。</span>}
                   </div>
                 </>
               ) : (

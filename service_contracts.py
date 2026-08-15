@@ -15,6 +15,10 @@ class InstrumentSnapshot(BaseModel):
     change_pct_1d: Optional[float]
     source: str
     as_of: datetime
+    instrument_type: Literal["spot", "futures", "index", "yield", "equity", "commodity", "synthetic", "unknown"] = "unknown"
+    quote_currency: Optional[str] = None
+    unit: Optional[str] = None
+    provider_symbol: Optional[str] = None
 
 
 class MarketFeatureSummary(BaseModel):
@@ -35,10 +39,13 @@ class MarketFeatureSummary(BaseModel):
     is_stale: bool
 
 
+GoldAssetSymbol = Literal["XAUUSD", "GC=F", "GOLD_SYNTHETIC"]
+
+
 class MarketSnapshotResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    asset: Literal["XAUUSD"]
+    asset: GoldAssetSymbol
     as_of: datetime
     freshness_seconds: int = Field(ge=0)
     stale_after_seconds: int = Field(ge=1)
@@ -79,7 +86,7 @@ class GoldPriceKeyNode(BaseModel):
 class GoldPriceHistoryResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    asset: Literal["XAUUSD"]
+    asset: GoldAssetSymbol
     as_of: datetime
     source: str
     points: List[GoldPriceHistoryPoint] = Field(min_length=2)
@@ -128,7 +135,7 @@ class IndicatorGroup(BaseModel):
 class MarketIndicatorsResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    asset: Literal["XAUUSD"]
+    asset: GoldAssetSymbol
     as_of: datetime
     freshness_seconds: int = Field(ge=0)
     stale_after_seconds: int = Field(ge=1)
@@ -151,6 +158,9 @@ class NewsEventItem(BaseModel):
     importance: float = Field(ge=0.0)
     categories: List[str]
     url: Optional[str] = None
+    source_tier: Literal["primary", "secondary", "synthetic", "unknown"] = "unknown"
+    source_authority: Optional[str] = None
+    is_primary_source: bool = False
 
 
 class RecentNewsResponse(BaseModel):

@@ -31,7 +31,8 @@ MAX_REDIRECTS = 3
 
 _PRIMARY_DOMAINS = {
     "federalreserve.gov", "bls.gov", "bea.gov", "treasury.gov", "cftc.gov",
-    "imf.org", "worldbank.org", "gold.org",
+    "cmegroup.com", "imf.org", "worldbank.org", "gold.org", "bis.org",
+    "ecb.europa.eu", "bankofengland.co.uk", "pbc.gov.cn", "boj.or.jp",
 }
 _INJECTION_PATTERNS = [
     re.compile(pattern, re.I)
@@ -51,6 +52,34 @@ _UNIT_RE = re.compile(
     r"(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>tonnes?|tons?|ounces?|oz|percent|%|bps?)\b",
     re.I,
 )
+_DOMAIN_TERMS = {
+    "macro_event": (
+        "cpi", "inflation", "fed", "fomc", "rate", "yield", "usd", "dollar",
+        "美联储", "通胀", "利率", "美元", "实际收益率",
+    ),
+    "technical_flows": (
+        "etf", "cftc", "flow", "inflow", "outflow", "trend", "momentum",
+        "technical", "breakout", "price", "资金流", "流入", "流出", "趋势", "技术",
+    ),
+    "long_term_fundamental": (
+        "central bank", "reserve", "mine", "mining", "supply", "de-dollar",
+        "structural", "央行", "储备", "矿产", "供给", "去美元化", "结构性",
+    ),
+    "product_rules": (
+        "competition rules", "contest rules", "submission requirements",
+        "judging criteria", "demo requirement", "比赛规则", "参赛规则",
+        "评分标准", "复赛", "演示要求", "产品规则",
+    ),
+}
+
+
+def _claim_domains(text: str) -> List[str]:
+    lowered = text.lower()
+    domains = [
+        domain for domain, terms in _DOMAIN_TERMS.items()
+        if any(term in lowered for term in terms)
+    ]
+    return domains or ["general"]
 
 
 class EvidenceShieldError(ValueError):
@@ -203,6 +232,7 @@ def _split_claims(text: str, locations: List[str], document_id: str) -> List[Fac
                 status="accepted",
                 confidence=0.9,
                 published_at=published,
+                domains=_claim_domains(cleaned),
             ))
             if len(claims) >= 60:
                 return claims
@@ -324,10 +354,46 @@ def _detect_injection(text: str) -> bool:
     return any(pattern.search(text) for pattern in _INJECTION_PATTERNS)
 
 
-def _deduped(text: str) -> bool:
-    parts = [re.sub(r"\W+", " ", part.lower()).strip() for part in re.split(r"[.!?。！？]", text)]
-    meaningful = [part for part in parts if len(part) >= 12]
-    return len(meaningful) != len(set(meaningful))
+def _semantic_claim_key(text: str) -> str:
+    return re.sub(r"[^\w\u4e00-\u9fff]+", " ", text.casefold()).strip()
+
+
+def _locator_quality(locator: str) -> tuple[int, int]:
+    """Prefer precise page/region locators, then the shortest stable locator."""
+
+    lowered = locator.lower()
+    precision = 3 if re.fullmatch(r"page\s+\d+", lowered) else 2 if "page" in lowered else 1
+    return precision, -len(locator)
+
+
+def _deduplicate_claims(facts: List[FactClaim]) -> tuple[List[FactClaim], List[str]]:
+    clusters: dict[str, List[FactClaim]] = {}
+    order: List[str] = []
+    for fact in facts:
+        key = _semantic_claim_key(fact.text)
+        if key not in clusters:
+            clusters[key] = []
+            order.append(key)
+        clusters[key].append(fact)
+
+    deduplicated: List[FactClaim] = []
+    duplicate_ids: List[str] = []
+    for key in order:
+        cluster = clusters[key]
+        if len(cluster) == 1:
+            deduplicated.append(cluster[0])
+            continue
+        representative = max(cluster, key=lambda fact: _locator_quality(fact.locator))
+        representative = representative.model_copy(
+            update={
+                "status": "review",
+                "confidence": min(representative.confidence, 0.72),
+                "tags": list(dict.fromkeys([*representative.tags, "duplicate_cluster"])),
+            }
+        )
+        deduplicated.append(representative)
+        duplicate_ids.append(representative.claim_id)
+    return deduplicated, duplicate_ids
 
 
 def _unit_conflict(text: str) -> bool:
@@ -430,13 +496,24 @@ async def ingest_evidence(
 
         sha = hashlib.sha256(raw).hexdigest()
         document_id = "doc_" + sha[:16]
-        facts = _split_claims(text, locations, document_id) if text and locations else []
-        fact_ids = [fact.claim_id for fact in facts]
+        raw_facts = _split_claims(text, locations, document_id) if text and locations else []
+        facts, duplicate_ids = _deduplicate_claims(raw_facts)
         published = _published_at(text)
         attack = _detect_injection(text)
-        duplicate = _deduped(text)
+        duplicate = bool(duplicate_ids)
         unit_conflict = _unit_conflict(text)
         stale = bool(published and (now - published).days > 180)
+
+        if attack:
+            facts = [fact.model_copy(update={"status": "blocked", "confidence": 0.0}) for fact in facts]
+        elif stale or unit_conflict:
+            facts = [
+                fact.model_copy(update={"status": "review"})
+                if fact.status == "accepted" else fact
+                for fact in facts
+            ]
+        fact_ids = [fact.claim_id for fact in facts]
+        accepted_fact_ids = [fact.claim_id for fact in facts if fact.status == "accepted"]
 
         gates = [
             _gate("access", "pass", "bounded input and signature checks passed", 1.0),
@@ -458,7 +535,7 @@ async def ingest_evidence(
             _gate(
                 "dedup_replay", "review" if duplicate else "pass",
                 "repeated claims require replay review" if duplicate else "no repeated claim cluster detected",
-                0.8 if duplicate else 1.0, fact_ids,
+                0.8 if duplicate else 1.0, duplicate_ids,
             ),
             _gate(
                 "consistency", "review" if unit_conflict else "pass",
@@ -466,23 +543,18 @@ async def ingest_evidence(
                 0.6 if unit_conflict else 1.0, fact_ids,
             ),
             _gate(
-                "market_coherence", "review" if facts else "abstain",
-                "downstream orchestrator must compare evidence with market response" if facts else "no facts to compare",
-                0.9 if facts else 0.0, fact_ids,
+                "market_coherence", "review" if accepted_fact_ids else "abstain",
+                "downstream orchestrator must compare accepted evidence with market response" if accepted_fact_ids else "no accepted facts to compare",
+                0.9 if accepted_fact_ids else 0.0, accepted_fact_ids,
             ),
             _gate(
-                "output_audit", "block" if attack else ("pass" if facts else "abstain"),
+                "output_audit", "block" if attack else ("pass" if accepted_fact_ids else "abstain"),
                 "unsafe carrier blocks downstream output" if attack else (
-                    "accepted claims are traceable" if facts else "no evidence-backed output available"
+                    "accepted claims are traceable" if accepted_fact_ids else "no accepted evidence-backed output is available"
                 ),
-                0.0 if attack or not facts else 1.0, fact_ids,
+                0.0 if attack or not accepted_fact_ids else 1.0, accepted_fact_ids,
             ),
         ]
-        review = stale or duplicate or unit_conflict
-        if attack:
-            facts = [fact.model_copy(update={"status": "blocked", "confidence": 0.0}) for fact in facts]
-        elif review:
-            facts = [fact.model_copy(update={"status": "review"}) for fact in facts]
         multiplier = 1.0
         for gate in gates:
             multiplier *= gate.confidence_multiplier

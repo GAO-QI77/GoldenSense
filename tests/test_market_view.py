@@ -128,3 +128,18 @@ def test_long_term_structural_deviation_flagged():
     assert "结构性" in long_term["core_view"]
     # Invalidation conditions must mention the z-score threshold.
     assert any("z" in inv or "±2" in inv for inv in long_term["invalidation"])
+
+
+def test_long_term_extreme_percentage_deviation_abstains_even_when_z_score_is_muted():
+    ctx = _full_context()
+    ctx["fair_value"].update(
+        deviation_z=1.6,
+        deviation_pct=69.8,
+        regime_break=False,
+    )
+
+    long_term = build_market_view(ctx)["long_term"]
+
+    assert long_term["confidence"] == "低"
+    assert "结构性偏离" in long_term["core_view"]
+    assert "正常估值波动" not in long_term["core_view"]

@@ -23,6 +23,12 @@ STRESS_PROB_FLAG = 0.35
 FAR_ABOVE_RANGE_PCT = 5.0
 SHORT_HORIZON_BAND_WIDTH = 0.08
 STRUCTURAL_Z = 2.0
+_SUITABILITY_REQUIRED = (
+    "max_drawdown_pct", "liquidity_need", "leverage_attitude", "investment_goal",
+    "loss_capacity", "portfolio_context_known", "emergency_fund_months",
+    "liabilities_level", "gold_instrument", "jurisdiction", "base_currency",
+)
+_OUT_OF_SCOPE_INSTRUMENTS = {"futures", "options", "cfd"}
 
 _HORIZON_TO_SECTION = {"short": "short_term", "mid": "mid_term", "long": "long_term"}
 
@@ -61,6 +67,44 @@ def check_no_directive_language(texts: List[str]) -> Tuple[bool, List[str]]:
     return (not violations), violations
 
 
+def assess_suitability(profile: InvestorProfile) -> Dict[str, Any]:
+    """Gate position-specific output without rejecting legacy research requests."""
+    missing = [name for name in _SUITABILITY_REQUIRED if getattr(profile, name) is None]
+    reasons: List[str] = []
+    if profile.portfolio_context_known is False:
+        reasons.append("portfolio_context_not_confirmed")
+    if profile.gold_instrument in _OUT_OF_SCOPE_INSTRUMENTS:
+        reasons.append("instrument_out_of_scope")
+    if profile.leverage_attitude in {"medium", "high"}:
+        reasons.append("leverage_out_of_scope")
+    if profile.emergency_fund_months is not None and profile.emergency_fund_months < 3:
+        reasons.append("emergency_liquidity_below_three_months")
+    if profile.loss_capacity == "low" and profile.risk_tolerance == "aggressive":
+        reasons.append("risk_willingness_exceeds_loss_capacity")
+    if profile.liabilities_level == "high" and profile.loss_capacity != "high":
+        reasons.append("liability_capacity_mismatch")
+    restricted_reasons = {
+        "instrument_out_of_scope", "leverage_out_of_scope",
+        "emergency_liquidity_below_three_months",
+        "risk_willingness_exceeds_loss_capacity", "liability_capacity_mismatch",
+    }
+    if reasons and restricted_reasons.intersection(reasons):
+        status = "restricted"
+    elif missing or reasons:
+        status = "insufficient"
+    else:
+        status = "eligible"
+    return {
+        "status": status,
+        "position_analysis_allowed": status == "eligible",
+        "missing_fields": missing,
+        "reasons": reasons,
+        "scope": "education_only_unlevered_gold_research",
+        "jurisdiction": profile.jurisdiction,
+        "instrument": profile.gold_instrument,
+    }
+
+
 def build_three_dimensional_brief(
     profile: InvestorProfile,
     ctx: Dict[str, Any],
@@ -72,6 +116,7 @@ def build_three_dimensional_brief(
     be attached to a case without persisting personal inputs server-side.
     """
     facts = build_personal_facts(profile, ctx)
+    suitability = facts["suitability"]
     horizon_key = _HORIZON_TO_SECTION[profile.horizon]
     strategy = research_case.horizon_strategy.get(horizon_key)
     if strategy is None:
@@ -93,6 +138,8 @@ def build_three_dimensional_brief(
         "输出仅是研究行动清单，不构成直接买卖或目标仓位指令。",
         "任何模型都不能覆盖证据门控、数据陈旧标记或个人风险约束。",
     ]
+    if not suitability["position_analysis_allowed"]:
+        hard_constraints.append("适当性信息不足或工具超出范围，已暂停个人仓位差距判断。")
     if profile.leverage_attitude in {"medium", "high"}:
         hard_constraints.append("本系统不对杠杆黄金暴露给出配置结论。")
 
@@ -115,6 +162,7 @@ def build_three_dimensional_brief(
             "experience_mode": profile.experience,
         },
         "rules": {
+            "suitability": suitability,
             "risk_flags": facts.get("risk_flags", []),
             "hard_constraints": hard_constraints,
             "reference_range": facts.get("reference_range"),
@@ -154,6 +202,7 @@ def build_personal_facts(profile: InvestorProfile, ctx: Dict[str, Any]) -> Dict[
     """All personalized numbers, from validated blocks only."""
     degraded: Dict[str, str] = {}
     book = build_market_view(ctx)
+    suitability = assess_suitability(profile)
 
     # Reference range for this risk profile (allocation.py already computed it).
     adv = (ctx.get("allocation") or {}).get(profile.risk_tolerance) or {}
@@ -173,7 +222,15 @@ def build_personal_facts(profile: InvestorProfile, ctx: Dict[str, Any]) -> Dict[
 
     # Position gap vs the range.
     position_gap: Dict[str, Any]
-    if lo is not None:
+    if not suitability["position_analysis_allowed"]:
+        position_gap = {
+            "status": "withheld",
+            "gap_pct": None,
+            "current_gold_pct": float(profile.current_gold_pct),
+            "evidence_ref": "suitability.position_analysis_allowed",
+            "reason": "suitability_gate_not_eligible",
+        }
+    elif lo is not None:
         current = float(profile.current_gold_pct)
         if current < lo:
             position_gap = {"status": "below", "gap_pct": round(lo - current, 2)}
@@ -289,6 +346,7 @@ def build_personal_facts(profile: InvestorProfile, ctx: Dict[str, Any]) -> Dict[
 
     return {
         "profile": profile.model_dump(),
+        "suitability": suitability,
         "reference_range": reference_range,
         "position_gap": position_gap,
         "risk_flags": risk_flags,
@@ -329,6 +387,8 @@ def draft_personal_narrative(
             gap_txt = f"您的当前仓位高于该参考区间上沿约 {gap['gap_pct']:.1f} 个百分点。"
         elif status == "below":
             gap_txt = f"您的当前仓位低于该参考区间下沿约 {gap['gap_pct']:.1f} 个百分点。"
+        elif status == "withheld":
+            gap_txt = "适当性信息不足或工具超出研究范围，本次暂停个人仓位差距判断。"
         else:
             gap_txt = "仓位差距无法计算。"
         position_analysis = (

@@ -18,6 +18,19 @@ def _pdf(text: str) -> bytes:
     return output.getvalue()
 
 
+def _multipage_pdf(lines_by_page: list[list[str]]) -> bytes:
+    output = BytesIO()
+    doc = canvas.Canvas(output)
+    for lines in lines_by_page:
+        y = 760
+        for line in lines:
+            doc.drawString(30, y, line)
+            y -= 26
+        doc.showPage()
+    doc.save()
+    return output.getvalue()
+
+
 def _ctx():
     return {
         "data_asof": "2026-08-12", "data_age_days": 1, "data_stale": False,
@@ -60,3 +73,75 @@ def test_clean_attacked_pairs_preserve_clean_path_and_gate_attacks():
             assert attacked.confidence < clean.confidence
             assert attacked_case.horizon_strategy["short_term"].stance in {"risk", "abstain"}
         assert clean_case.status in {"complete", "degraded"}
+
+
+def test_repeated_heading_downgrades_only_its_claim_cluster():
+    packet = asyncio.run(
+        ingest_evidence(
+            question="gold research",
+            filename="benign.pdf",
+            content_type="application/pdf",
+            payload=_multipage_pdf(
+                [
+                    [
+                        "Market Research Summary.",
+                        "Federal Reserve rate cuts lowered real yields and supported gold demand.",
+                    ],
+                    [
+                        "Market Research Summary.",
+                        "Central bank reserve diversification increased structural gold demand.",
+                    ],
+                ]
+            ),
+            now=datetime(2026, 8, 13, tzinfo=timezone.utc),
+        )
+    )
+
+    accepted = [fact for fact in packet.facts if fact.status == "accepted"]
+    reviewed = [fact for fact in packet.facts if fact.status == "review"]
+    assert len(accepted) == 2
+    assert len(reviewed) == 1
+    assert reviewed[0].text == "Market Research Summary."
+    assert next(g for g in packet.gates if g.gate == "dedup_replay").decision == "review"
+    assert next(g for g in packet.gates if g.gate == "output_audit").decision == "pass"
+
+
+def test_output_audit_abstains_when_every_claim_is_a_duplicate_cluster():
+    packet = asyncio.run(
+        ingest_evidence(
+            question="gold research",
+            filename="duplicates.pdf",
+            content_type="application/pdf",
+            payload=_multipage_pdf(
+                [["Repeated market statement has no unique supporting detail."],
+                 ["Repeated market statement has no unique supporting detail."]]
+            ),
+            now=datetime(2026, 8, 13, tzinfo=timezone.utc),
+        )
+    )
+
+    assert packet.accepted_facts == []
+    output_gate = next(g for g in packet.gates if g.gate == "output_audit")
+    assert output_gate.decision == "abstain"
+    assert "accepted claims are traceable" not in output_gate.reason
+
+
+def test_competition_rules_route_to_non_directional_product_review_agent():
+    packet = asyncio.run(
+        ingest_evidence(
+            question="Review the competition rules",
+            filename="rules.pdf",
+            content_type="application/pdf",
+            payload=_pdf(
+                "Competition rules require a three-minute demo, evidence citations, and security compliance."
+            ),
+            now=datetime(2026, 8, 13, tzinfo=timezone.utc),
+        )
+    )
+    case = build_research_case("Review the competition rules", packet, _ctx())
+
+    rule_view = next(view for view in case.agent_views if view.agent == "product_rules_review")
+    assert rule_view.stance == "abstain"
+    assert rule_view.supporting_fact_ids
+    arbitrator = next(view for view in case.agent_views if view.agent == "strategy_arbitrator")
+    assert not set(rule_view.supporting_fact_ids) & set(arbitrator.supporting_fact_ids)

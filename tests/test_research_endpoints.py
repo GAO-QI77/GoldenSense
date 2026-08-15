@@ -122,7 +122,7 @@ def _assert_committee_in_trace(client):
         json={
             "question": "现在黄金的中期趋势怎么看？",
             "risk_profile": "balanced",
-            "horizon": "7d",
+            "horizon": "mid_term",
             "locale": "zh-CN",
         },
     )

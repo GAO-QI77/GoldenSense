@@ -19,6 +19,13 @@ LeverageAttitude = Literal["none", "low", "medium", "high"]
 InvestmentGoal = Literal[
     "capital_preservation", "income", "event_trade", "trend_following", "speculation"
 ]
+LossCapacity = Literal["low", "medium", "high"]
+LiabilitiesLevel = Literal["low", "medium", "high"]
+GoldInstrument = Literal[
+    "physical", "unlevered_etf", "unallocated_spot", "futures", "options", "cfd", "other"
+]
+Jurisdiction = Literal["CN", "SG", "HK", "US", "OTHER"]
+BaseCurrency = Literal["CNY", "USD", "SGD", "HKD", "OTHER"]
 
 
 class InvestorProfile(BaseModel):
@@ -41,6 +48,16 @@ class InvestorProfile(BaseModel):
     liquidity_need: Optional[LiquidityNeed] = None
     leverage_attitude: Optional[LeverageAttitude] = None
     investment_goal: Optional[InvestmentGoal] = None
+
+    # Suitability layer. These remain optional for backward-compatible general
+    # research, but personal position-gap analysis is withheld until complete.
+    loss_capacity: Optional[LossCapacity] = None
+    portfolio_context_known: Optional[bool] = None
+    emergency_fund_months: Optional[float] = Field(default=None, ge=0.0, le=120.0)
+    liabilities_level: Optional[LiabilitiesLevel] = None
+    gold_instrument: Optional[GoldInstrument] = None
+    jurisdiction: Optional[Jurisdiction] = None
+    base_currency: Optional[BaseCurrency] = None
 
 
 class PersonalNarrative(BaseModel):

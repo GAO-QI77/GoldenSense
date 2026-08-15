@@ -1,0 +1,107 @@
+{
+  "measured_at": "2026-08-15T22:45:00+08:00",
+  "backend_tests": {
+    "exit_code": 0,
+    "passed": 410,
+    "execution": "52 test files in exhaustive mutually-exclusive batches",
+    "batch_passed": [122, 82, 66, 4, 3, 133]
+  },
+  "frontend_unit": {
+    "exit_code": 0,
+    "passed": 7
+  },
+  "frontend_build": {
+    "exit_code": 0,
+    "passed": 1,
+    "output_tail": "1338 modules transformed; production build completed"
+  },
+  "playwright": {
+    "exit_code": 0,
+    "passed": 32,
+    "projects": ["chromium", "mobile-chrome"]
+  },
+  "market_concurrency": {
+    "requests": 100,
+    "successes": 100,
+    "unique_instrument_price_pairs": 1,
+    "identity_violations": 0,
+    "observed_pairs": [["XAUUSD", 4380.39990234375]]
+  },
+  "public_horizons": {
+    "observed": ["short_term", "mid_term", "long_term"],
+    "legacy_public_matches": 0
+  },
+  "security": {
+    "clean_document_accepted": 3,
+    "prompt_injection_visible": true,
+    "unit_attack_contained": true,
+    "instrument_attack_quarantined": true,
+    "live_clean_case_id": "rc_ac675cc12b51af647a",
+    "live_attack_case_id": "rc_b8ad10e7e50790a5dc",
+    "live_attack_status": "blocked"
+  },
+  "public_language": {
+    "samples": 1,
+    "directive_violations": 0
+  },
+  "connected_pages": {
+    "expected": 4,
+    "successful": 4,
+    "rate_limit_errors": 0,
+    "statuses": [200, 200, 200, 200],
+    "browser_console_errors": 0,
+    "browser_failed_responses": 0
+  },
+  "ledger": {
+    "evidence_classes": ["backtest", "simulated_forward", "live_forward"],
+    "append_only_verified": true,
+    "empty_state_guidance": true,
+    "matured_live_periods": 0
+  },
+  "evidence_chain": {
+    "eight_gates": true,
+    "primary_source_integrity": true,
+    "product_rules_isolated": true
+  },
+  "agent_model_governance": {
+    "challengers_locked": true,
+    "disagreements_preserved": true,
+    "three_horizon_strategy": true,
+    "three_dimensional_personalization": true
+  },
+  "mobile": {
+    "min_touch_target_px": 44,
+    "horizontal_overflow": false
+  },
+  "operations": {
+    "health_ready": true,
+    "retry_after_verified": true,
+    "dashboard_shared_cache_verified": true
+  },
+  "industry_scene": {
+    "target_users_defined": true,
+    "problem_defined": true,
+    "value_validated": false,
+    "replication_potential": true,
+    "gold_specialization": true
+  },
+  "openness": {
+    "readme_complete": true,
+    "deployment_documented": true,
+    "tests_reproducible": true,
+    "license_and_dependencies_disclosed": true
+  },
+  "provider_risks": [
+    "开发环境记忆检索器未加载，当前按 unavailable 显式降级。",
+    "本地 PostgreSQL 角色未配置，trace 使用有界内存 fallback。",
+    "实测行情快照超过新鲜度阈值，页面已显示 stale/degraded 告警。",
+    "Demo 数据源仍为 yfinance + RSS，不是交易所级或授权商用行情 SLA。"
+  ],
+  "evidence_sources": {
+    "backend": "python3 -m pytest -q, exhaustive mutually-exclusive file batches",
+    "frontend": "npm run test:unit; npm run build; npx playwright test",
+    "live": "scripts.competition_acceptance._live_probes against 127.0.0.1:8020 and 4176",
+    "document_attack": "python3 scripts/demo_research_case.py --base-url http://127.0.0.1:8020",
+    "browser": "Playwright Chromium, real gateway, no request mocks"
+  }
+}

@@ -16,7 +16,46 @@ export const defaultProfile = {
   liquidity_need: null,
   leverage_attitude: null,
   investment_goal: null,
+  loss_capacity: null,
+  portfolio_context_known: null,
+  emergency_fund_months: null,
+  liabilities_level: null,
+  gold_instrument: null,
+  jurisdiction: null,
+  base_currency: null,
 };
+
+const CORE_FIELDS = ['risk_tolerance', 'horizon', 'current_gold_pct', 'experience'];
+const SUITABILITY_FIELDS = [
+  'max_drawdown_pct',
+  'liquidity_need',
+  'leverage_attitude',
+  'investment_goal',
+  'loss_capacity',
+  'portfolio_context_known',
+  'emergency_fund_months',
+  'liabilities_level',
+  'gold_instrument',
+  'jurisdiction',
+  'base_currency',
+];
+
+function isProvided(value) {
+  return value !== null && value !== undefined && value !== '';
+}
+
+export function getProfileCompletion(profile = {}) {
+  const coreMissing = CORE_FIELDS.filter((field) => !isProvided(profile[field]));
+  const suitabilityMissing = SUITABILITY_FIELDS.filter((field) => !isProvided(profile[field]));
+  return {
+    coreMissing,
+    suitabilityMissing,
+    coreComplete: coreMissing.length === 0,
+    suitabilityComplete: suitabilityMissing.length === 0,
+    completedCount: CORE_FIELDS.length + SUITABILITY_FIELDS.length - coreMissing.length - suitabilityMissing.length,
+    totalCount: CORE_FIELDS.length + SUITABILITY_FIELDS.length,
+  };
+}
 
 export function loadProfile() {
   try {
@@ -54,7 +93,16 @@ export function toPersonalResearchBody(profile) {
   if (profile.max_drawdown_pct !== null && profile.max_drawdown_pct !== '') {
     body.max_drawdown_pct = Number(profile.max_drawdown_pct);
   }
-  for (const key of ['liquidity_need', 'leverage_attitude', 'investment_goal']) {
+  if (profile.emergency_fund_months !== null && profile.emergency_fund_months !== '') {
+    body.emergency_fund_months = Number(profile.emergency_fund_months);
+  }
+  if (profile.portfolio_context_known !== null && profile.portfolio_context_known !== '') {
+    body.portfolio_context_known = Boolean(profile.portfolio_context_known);
+  }
+  for (const key of [
+    'liquidity_need', 'leverage_attitude', 'investment_goal', 'loss_capacity',
+    'liabilities_level', 'gold_instrument', 'jurisdiction', 'base_currency',
+  ]) {
     if (profile[key]) body[key] = profile[key];
   }
   return body;
