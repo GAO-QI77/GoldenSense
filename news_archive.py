@@ -129,7 +129,8 @@ class NewsArchive:
             kept = dropped = deduped = 0
             for item in items:
                 key = _normalize_title(item.get("title", ""))
-                if not key:
+                published = _parse_ts(item.get("published_at"))
+                if not key or published is None:
                     dropped += 1
                     continue
                 if key in seen:
@@ -144,7 +145,7 @@ class NewsArchive:
                     "title": item.get("title"),
                     "summary": item.get("summary"),
                     "source": item.get("source"),
-                    "published_at": item.get("published_at") or now.isoformat(),
+                    "published_at": published.isoformat(),
                     "relevance": score,
                     "classification": classify_news(text),
                     "archived_at": now.isoformat(),
@@ -171,15 +172,22 @@ class NewsArchive:
             return []
         results: List[Dict[str, Any]] = []
         for record in self._load():
-            if self._is_expired(record, now):
+            published = _parse_ts(record.get("published_at"))
+            archived = _parse_ts(record.get("archived_at"))
+            if (
+                published is None
+                or published > now
+                or archived is None
+                or archived > now
+                or self._is_expired(record, now)
+            ):
                 continue
             text = f"{record.get('title', '')} {record.get('summary', '')}".lower()
             # Normalized by term count so long queries don't inflate scores.
             match_strength = sum(1.0 for t in terms if t in text) / len(terms)
             if match_strength == 0:
                 continue
-            ts = _parse_ts(record.get("published_at")) or now
-            age_days = max(0.0, (now - ts).total_seconds() / 86400.0)
+            age_days = (now - published).total_seconds() / 86400.0
             decay = math.exp(-math.log(2) * age_days / DECAY_HALF_LIFE_DAYS)
             hit = dict(record)
             hit["score"] = round(match_strength * decay * float(record.get("relevance", 0.5)), 6)

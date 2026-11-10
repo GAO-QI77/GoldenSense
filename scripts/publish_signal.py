@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -32,7 +32,7 @@ LOGGER = logging.getLogger("publish_signal")
 def _load_ctx() -> Dict[str, Any]:
     from research_context import shared_context
 
-    return shared_context.get_context()
+    return shared_context.get_context_at(datetime.now(timezone.utc))
 
 
 def publish_once(
@@ -55,15 +55,14 @@ def publish_once(
     # reported, never raised -- the ledger write is the critical path.
     if created and send_digest_on_create:
         try:
-            from signal_ledger import score_track_record
+            from signal_ledger import score_configured_track_record
             from subscriptions import send_digest
 
             track = None
             try:
-                from data_sources import load_market_data
-
-                raw, _source = load_market_data()
-                track = score_track_record(store.load_all(), raw["Gold"])
+                track = score_configured_track_record(
+                    store.load_all(), decision_at=now or datetime.now(timezone.utc),
+                )
             except Exception:
                 track = None
             result["digest"] = send_digest(record, track)

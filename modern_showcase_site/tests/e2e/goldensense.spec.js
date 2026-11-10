@@ -339,10 +339,6 @@ test.beforeEach(async ({ page }) => {
   await page.route('**/api/v1/agent/event-alert', async (route) => {
     await route.fulfill({ status: 404, json: { detail: 'no active event in fixture' } });
   });
-  await page.route('**/api/v1/agent/market-view', async (route) => {
-    const section = { available: true, core_view: 'Fixture view', confidence: '中', evidence: [], invalidation: ['Fixture invalidation'] };
-    await route.fulfill({ json: { meta: { data_asof: '2026-08-12', data_age_days: 1, data_stale: false }, short_term: section, mid_term: section, long_term: section } });
-  });
   await page.route('**/api/v1/agent/research/current', async (route) => {
     await route.fulfill({ status: 503, json: { detail: 'fixture uses active ResearchCase panels' } });
   });
@@ -361,13 +357,28 @@ test.beforeEach(async ({ page }) => {
   await page.route('**/api/v1/agent/dashboard/current', async (route) => {
     await route.fulfill({ json: dashboardPayload });
   });
+  await page.route('**/api/v1/agent/market-view', async (route) => {
+    await route.fulfill({ json: {
+      meta: { data_asof: '2026-08-12', data_age_days: 1, data_stale: false },
+      short_term: { available: true, confidence: '中', core_view: '短期关注风险分布。' },
+      mid_term: { available: true, confidence: '中', core_view: '中期关注宏观驱动。' },
+      long_term: { available: true, confidence: '中', core_view: '长期关注估值与配置。' },
+    } });
+  });
   await page.route('**/api/v1/agent/analyze', async (route) => {
     const body = route.request().postDataJSON();
     expect(body.investor_profile).toBeTruthy();
     expect(body.investor_profile.capital_allocation_pct).toBeGreaterThanOrEqual(0);
-    await route.fulfill({ json: analysisPayload });
+    await route.fulfill({
+      json: analysisPayload,
+      headers: {
+        'X-Analysis-Feedback-Token': 'test-analysis-feedback-token',
+        'Access-Control-Expose-Headers': 'X-Analysis-Feedback-Token',
+      },
+    });
   });
   await page.route('**/api/v1/agent/feedback', async (route) => {
+    expect(route.request().headers()['x-analysis-feedback-token']).toBe('test-analysis-feedback-token');
     await route.fulfill({ json: { analysis_id: 'analysis-playwright', status: 'recorded' } });
   });
   await page.route('**/api/v1/agent/research-cases', async (route) => {
@@ -559,6 +570,11 @@ test('dashboard presents forecasts and four indicator pillars', async ({ page })
 
   await expect(page.getByRole('heading', { name: '黄金价格预测与指标总览' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '今日核心结论' })).toBeVisible();
+  await expect(page.getByLabel('今日研究摘要').getByText('短期 偏多，执行倾向：观察确认')).toBeVisible();
+  await expect(page.getByText('长期关注估值与配置。')).toBeVisible();
+  await expect(page.getByLabel('量化模型参考').getByText('长期', { exact: true })).toBeVisible();
+  await expect(page.getByText(/undefined/)).toHaveCount(0);
+  await expect(page.getByText('SHORT_TERM', { exact: true })).toHaveCount(0);
   await expect(page.getByRole('heading', { name: '驱动贡献矩阵' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '风险催化日历' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '三情景推演' })).toBeVisible();
@@ -620,6 +636,8 @@ test('unified workbench: shared profile + Q&A analysis renders risk briefing', a
   await expect(page.getByRole('heading', { name: '用户风险画像' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '三情景执行框架' })).toBeVisible();
   await expect(page.getByText(/(?:加仓|减仓|仓试探|立即买入|立即卖出)/)).toHaveCount(0);
+  await page.getByRole('button', { name: '有帮助', exact: true }).click();
+  await expect(page.getByText('已记录：这条分析有帮助。')).toBeVisible();
 });
 
 test('unified workbench: allocation research tab is the default capability', async ({ page }) => {
@@ -631,6 +649,31 @@ test('unified workbench: allocation research tab is the default capability', asy
   // Both capability tabs are present.
   await expect(page.getByRole('tab', { name: /配置研究/ })).toBeVisible();
   await expect(page.getByRole('tab', { name: /提问分析/ })).toBeVisible();
+});
+
+test('the long-term research category displays its valuation evidence', async ({ page }) => {
+  await page.route('**/api/v1/agent/analyze', async (route) => {
+    const body = route.request().postDataJSON();
+    expect(body.horizon).toBe('long_term');
+    await route.fulfill({ json: {
+      ...analysisPayload,
+      summary_card: { ...analysisPayload.summary_card, horizon: 'long_term' },
+      research_focus: {
+        horizon: 'long_term',
+        section: { available: true, core_view: '长期估值以宏观锚为参考。', evidence: ['控制美元后的利率敏感度发生变化。'], invalidation: [] },
+      },
+    } });
+  });
+  await page.goto('/advisor');
+  await advanceAdvisorMobile(page, 2);
+  await page.getByRole('tab', { name: /提问分析/ }).click();
+  await page.getByRole('button', { name: '长期', exact: true }).click();
+  await page.getByRole('button', { name: '生成风险适配分析' }).click();
+
+  await expect(page.getByRole('heading', { name: '长期研究观点' })).toBeVisible();
+  await expect(page.getByText('长期估值以宏观锚为参考。')).toBeVisible();
+  await expect(page.getByText('控制美元后的利率敏感度发生变化。')).toBeVisible();
+  await expect(page.getByText('长期 · 风险适配参考')).toBeVisible();
 });
 
 test('simple mode hides methodology internals until toggled', async ({ page }) => {
@@ -723,4 +766,154 @@ test('complete suitability profile unlocks position comparison without trade dir
   await expect(page.getByText('适当性通过')).toBeVisible();
   await expect(page.getByText('允许显示个人仓位差距')).toBeVisible();
   await expect(page.getByText('立即买入')).toHaveCount(0);
+});
+
+test('signals page derives production ledger endpoints from the agent origin', async ({ page }) => {
+  const marketView = {
+    meta: {
+      data_asof: '2026-08-13',
+      data_age_days: 21,
+      data_stale: true,
+    },
+    short_term: {
+      available: true,
+      confidence: '中',
+      core_view: '短期保持观察，等待数据与价格共同确认。',
+      evidence: ['波动状态偏高'],
+      invalidation: ['数据质量进一步下降'],
+    },
+    mid_term: {
+      available: true,
+      confidence: '中',
+      core_view: '中期由宏观因子与资金流共同决定。',
+      evidence: ['美元趋势'],
+      invalidation: ['实际利率快速上行'],
+    },
+    long_term: {
+      available: true,
+      confidence: '低',
+      core_view: '长期估值关系处于结构性偏离期。',
+      evidence: ['估值锚偏离'],
+      invalidation: ['结构性需求逆转'],
+    },
+  };
+
+  await page.route('https://api.goldensense.test/api/v1/agent/market-view', (route) =>
+    route.fulfill({ json: marketView }),
+  );
+  await page.route('https://api.goldensense.test/api/v1/signals/current', (route) =>
+    route.fulfill({ status: 404, json: { detail: { message: '台账为空' } } }),
+  );
+  await page.route('https://api.goldensense.test/api/v1/signals/history?limit=26', (route) =>
+    route.fulfill({ json: { publications: [] } }),
+  );
+  await page.route('https://api.goldensense.test/api/v1/signals/track-record', (route) =>
+    route.fulfill({ status: 503, json: { detail: { message: '暂无成熟周' } } }),
+  );
+  await page.route('https://api.goldensense.test/api/v1/agent/research/current', (route) =>
+    route.fulfill({ json: { cross_asset: null } }),
+  );
+
+  // Reproduce the SPA fallback when ledger requests use the web app's origin.
+  await page.route('http://127.0.0.1:4173/api/v1/signals/**', (route) =>
+    route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title>GoldenSense</title>' }),
+  );
+
+  await page.goto('/signals');
+
+  await expect(page.getByText('短期保持观察，等待数据与价格共同确认。')).toBeVisible();
+  await expect(page.getByText("Unexpected token '<'")).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: '本周发布' })).toBeVisible();
+  await expect(page.getByText('台账为空', { exact: true })).toBeVisible();
+});
+
+test('quant page explains a slow first-load model warm-up', async ({ page }) => {
+  await page.route('https://api.goldensense.test/api/v1/agent/research/current', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 7_000));
+    await route.fulfill({ json: { data_span: ['2004-01-05', '2026-08-13'], data_rows: 5706 } });
+  });
+  await page.route('https://api.goldensense.test/api/v1/agent/calibration', (route) =>
+    route.fulfill({ status: 503, json: { detail: { message: '样本不足' } } }),
+  );
+
+  await page.goto('/quant');
+
+  await expect(page.getByRole('status').filter({ hasText: '首次打开正在唤醒研究服务' })).toBeVisible({
+    timeout: 6_500,
+  });
+});
+
+test('quant page displays driver attribution and matured valuation evidence', async ({ page }) => {
+  await page.route('**/api/v1/agent/research/current', (route) => route.fulfill({
+    json: {
+      macro_factors: {
+        latest: { usd_downtrend: 1 },
+        factors_used: ['usd_downtrend'],
+        composite: 1,
+      },
+      degraded: { macro_vintages: 'unavailable:2Y_CMT' },
+      gold_drivers: {
+        data_asof: '2026-07-14',
+        flows: { etf_net_tonnes: { label: '黄金 ETF 净流入', status: 'unavailable' } },
+      },
+      driver_attribution: { data_asof: '2026-07-14', latest: { actual: 0.01, dollar: 0.004, residual: 0.006 } },
+      vol_bands: { h1: { p10: -0.01, p50: 0, p90: 0.01, ann_vol_forecast: 0.2 } },
+      risk_review: {
+        price_end: '2026-07-14',
+        windows: {
+          '1': { log_har: { n: 82, coverage: 0.817, status: 'hold', blockers: ['session_timestamps_missing'] } },
+        },
+      },
+      fair_value: {
+        deviation_pct: 1.0,
+        anchor_status: 'conditional',
+        half_life_days: 40,
+        quartile_forward_returns: { q1_cheapest: 0.08 },
+        quartile_sample_counts: { q1_cheapest: 72 },
+        stress_scenarios_pct: { real_yield_up_100bp: -2.2, dollar_up_5pct: -1.1, joint_up: -3.25 },
+      },
+    },
+  }));
+  await page.route('**/api/v1/agent/calibration', (route) => route.fulfill({ json: {} }));
+  await usePro(page);
+  await page.goto('/quant');
+  await expect(page.getByText('部分宏观历史版本缺失', { exact: false })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '当期驱动归因' })).toBeVisible();
+  await expect(page.getByText('72 个成熟样本')).toBeVisible();
+  await expect(page.getByRole('heading', { name: '利率与美元条件锚' })).toBeVisible();
+  await expect(page.getByText('未观察到有效均值回归')).toBeVisible();
+  await expect(page.getByText('40 日', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: '长期估值压力情景' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '黄金驱动证据' })).toBeVisible();
+  await expect(page.getByText('缺少已发布数据')).toBeVisible();
+  await expect(page.getByRole('heading', { name: '短期风险候选复验' })).toBeVisible();
+  await expect(page.getByText('82 个成熟样本 · 暂缓晋级')).toBeVisible();
+  await expect(page.getByText('缺少核验会话')).toBeVisible();
+});
+
+test('signals page labels date-only proxy scoring and same-cost benchmarks', async ({ page }) => {
+  await page.route('**/api/v1/agent/market-view', (route) =>
+    route.fulfill({ json: { meta: {} } }),
+  );
+  await page.route('**/api/v1/signals/current', (route) =>
+    route.fulfill({ status: 404, json: { detail: 'missing' } }),
+  );
+  await page.route('**/api/v1/signals/history?*', (route) =>
+    route.fulfill({ json: { publications: [] } }),
+  );
+  await page.route('**/api/v1/signals/track-record', (route) =>
+    route.fulfill({
+      json: {
+        price_evidence: 'date_only_proxy',
+        per_profile: { balanced: { weeks_scored: 2, cum_return: 0.04, max_drawdown: -0.01 } },
+        benchmarks: { balanced_fixed_net: { cum_return: 0.03 } },
+      },
+    }),
+  );
+  await page.route('**/api/v1/agent/research/current', (route) =>
+    route.fulfill({ json: {} }),
+  );
+  await page.goto('/signals');
+  await expect(page.getByText('行情按日期估算可用时间，记分供研究参考。')).toBeVisible();
+  await expect(page.getByText('同成本固定仓位 3.00%')).toBeVisible();
 });

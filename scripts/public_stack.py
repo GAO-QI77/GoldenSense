@@ -64,7 +64,7 @@ def build_service_specs(source_env: Mapping[str, str]) -> list[ServiceSpec]:
             env,
             {
                 "INFERENCE_MODEL_CHECKPOINTS_DIR_T1": "model_checkpoints",
-                "INFERENCE_MODEL_CHECKPOINTS_DIR_T7": "model_checkpoints",
+                "INFERENCE_MODEL_CHECKPOINTS_DIR_T7": "model_checkpoints_t7",
                 "INFERENCE_ALLOW_SYNTHETIC_FALLBACK": "1",
             },
         ),

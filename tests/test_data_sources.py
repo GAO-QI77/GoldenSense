@@ -73,3 +73,49 @@ def test_load_market_data_prefers_extended_when_present(tmp_path):
     )
     assert source == "extended"
     assert "Real_10Y" in frame.columns
+
+
+def test_research_market_data_uses_only_released_macro_vintages(tmp_path):
+    dates = pd.date_range("2024-01-01", periods=5)
+    extended = tmp_path / "extended.csv"
+    pd.DataFrame(
+        {"Gold": [100, 101, 102, 103, 104], "Real_10Y": [99] * 5, "2Y_Bond": [99] * 5},
+        index=dates,
+    ).to_csv(extended)
+    vintages = tmp_path / "macro.csv"
+    vintages.write_text(
+        "series_id,observation_date,available_at,value\n"
+        "DFII10,2024-01-01,2024-01-02T15:00:00Z,1\n"
+        "DFII10,2024-01-01,2024-01-03T15:00:00Z,2\n"
+        "DFII10,2024-01-02,2024-01-04T00:00:00-05:00,3\n"
+        "DFII10,2024-01-01,2024-01-05T15:00:00Z,4\n"
+        "T10YIE,2024-01-01,2024-01-02,8\n"
+    )
+
+    frame, _ = load_market_data(
+        extended_path=str(extended), require_macro_vintages=True, macro_vintage_path=vintages
+    )
+
+    assert "2Y_Bond" not in frame
+    assert "Breakeven_10Y" not in frame
+    assert pd.isna(frame["Real_10Y"].iloc[0])
+    assert frame["Real_10Y"].iloc[1:].tolist() == [1, 2, 3, 3]
+
+    frame, _ = load_market_data(
+        extended_path=str(extended), require_macro_vintages=True,
+        macro_vintage_path=tmp_path / "missing.csv",
+    )
+    assert list(frame.columns) == ["Gold"]
+
+
+def test_merge_market_frames_never_creates_a_gold_close_on_another_market_day():
+    dates = pd.date_range("2024-01-01", periods=3)
+    combined = merge_market_frames(
+        {
+            "Gold": pd.Series([100.0, 101.0], index=dates[[0, 2]]),
+            "USD_Index": pd.Series([103.0, 104.0], index=dates[[0, 1]]),
+        },
+        {},
+    )
+    assert combined.index.tolist() == dates[[0, 2]].tolist()
+    assert combined["USD_Index"].tolist() == [103.0, 104.0]

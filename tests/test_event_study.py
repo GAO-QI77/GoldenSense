@@ -1,5 +1,5 @@
 """Tests for the curated event catalog and the event-study library."""
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pandas as pd
 import pytest
@@ -87,3 +87,33 @@ def test_library_analogs_with_citations():
     assert refs and all({"event_id", "date", "title"} <= set(r) for r in refs)
     # Unknown category degrades to None, never invents.
     assert lib.analogs_for("nonexistent") is None
+
+
+def test_analogs_hide_future_catalog_entries_and_unmatured_windows():
+    lib = EventStudyLibrary(catalog=_mini_catalog(), prices=_prices())
+    assert lib.analogs_for("geopolitics")["n_30d"] == 2
+    as_of = datetime(2020, 2, 13, tzinfo=timezone.utc)
+
+    result = lib.analogs_for("geopolitics", decision_at=as_of)
+
+    assert result["n_events"] == 1
+    assert result["n_5d"] == 1
+    assert result["n_30d"] == 0
+    assert result["recent_events"][0]["event_id"] == "e1"
+
+
+def test_matched_event_excess_requires_mature_unique_events():
+    prices = _prices()
+    when = prices.index[180]
+    event = dict(_mini_catalog()[0], date=when.date().isoformat())
+    early = (when + pd.Timedelta(days=1)).to_pydatetime().replace(tzinfo=timezone.utc)
+    mature = (prices.index[185] + pd.Timedelta(days=1)).to_pydatetime().replace(tzinfo=timezone.utc)
+
+    def matched(catalog, cutoff):
+        return compute_event_study(catalog, prices, decision_at=cutoff)["by_category"]["geopolitics"]
+
+    assert matched([event], early)["matched_n_5d"] == 0
+    eligible = matched([event], mature)
+    assert eligible["matched_n_5d"] == 1
+    assert eligible["matched_mean_excess_5d"] == pytest.approx(0)
+    assert matched([event, dict(event, event_id="second")], mature)["matched_n_5d"] == 0

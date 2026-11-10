@@ -100,3 +100,17 @@ def test_evaluate_regime_v2_stress_posterior_lowers_confidence():
     )
     assert decision.confidence_band == "低"
     assert decision.vol_state == "stress"
+
+
+def test_public_walk_forward_regime_is_unchanged_by_future_suffix():
+    from regime_probabilistic import walk_forward_regime
+
+    rng = np.random.default_rng(15)
+    dates = pd.bdate_range("2024-01-01", periods=145)
+    features = pd.DataFrame(rng.normal(size=(145, 2)), index=dates)
+    changed = features.copy()
+    changed.iloc[110:] *= 10
+    before, _ = walk_forward_regime(features, min_train=60, refit_every=30)
+    after, _ = walk_forward_regime(changed, min_train=60, refit_every=30)
+    pd.testing.assert_frame_equal(before.loc[:dates[109]], after.loc[:dates[109]])
+    np.testing.assert_allclose(before.sum(axis=1), 1.0)

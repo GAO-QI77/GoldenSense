@@ -413,6 +413,7 @@ def test_agent_analyze_contract_ok():
         "degradation_flags",
         "follow_up_questions",
         "timing_ms",
+        "research_focus",
     }
     assert isinstance(data["analysis_id"], str) and data["analysis_id"]
     assert data["summary_card"]["action"] in {"观望", "观察确认", "关注上行情景", "关注下行情景"}
@@ -577,12 +578,22 @@ def test_agent_feedback_records_trace():
         )
         assert analyze.status_code == 200
         analysis_id = analyze.json()["analysis_id"]
+        token = analyze.headers.get("X-Analysis-Feedback-Token")
+
+        rejected = client.post(
+            "/api/v1/agent/feedback",
+            json={"analysis_id": analysis_id, "rating": "not_helpful"},
+            headers={**_headers(), "X-Analysis-Feedback-Token": "unrelated-token"},
+        )
+        assert rejected.status_code == 403
+        assert token
 
         trace_before = client.get(f"/api/v1/agent/traces/{analysis_id}", headers=_headers("internal"))
         assert trace_before.status_code == 200
         trace_data = trace_before.json()
         assert trace_data["analysis_id"] == analysis_id
         assert len(trace_data["tool_trace"]) >= 6
+        assert "feedback_token_hash" not in trace_data["request_payload"]
 
         feedback = client.post(
             "/api/v1/agent/feedback",
@@ -591,13 +602,14 @@ def test_agent_feedback_records_trace():
                 "rating": "helpful",
                 "comment": "这条建议够清楚",
             },
-            headers=_headers(),
+            headers={**_headers(), "X-Analysis-Feedback-Token": token},
         )
         assert feedback.status_code == 200
         data = feedback.json()
         trace_after = client.get(f"/api/v1/agent/traces/{analysis_id}", headers=_headers("internal"))
         assert trace_after.status_code == 200
         assert trace_after.json()["feedback_rating"] == "helpful"
+        assert trace_after.json()["feedback_comment"] is None
     assert data == {"analysis_id": analysis_id, "status": "recorded"}
 
 
@@ -813,7 +825,7 @@ def test_agent_analyze_horizon_forecasts_do_not_change_with_question_wording():
     assert data_1["recent_news"][0]["title"] != data_2["recent_news"][0]["title"]
 
 
-def test_agent_analyze_accepts_full_investor_profile_and_records_trace():
+def test_agent_analyze_uses_full_profile_without_storing_it_or_user_text():
     profile = {
         "risk_capacity": "high",
         "trading_horizon": "short",
@@ -831,6 +843,7 @@ def test_agent_analyze_accepts_full_investor_profile_and_records_trace():
             json={
                 "question": "完整问卷后黄金短线怎么看？",
                 "risk_profile": "aggressive",
+                "optional_news_text": "private-news-sentinel@example.invalid",
                 "horizon": "24h",
                 "locale": "zh-CN",
                 "investor_profile": profile,
@@ -844,8 +857,10 @@ def test_agent_analyze_accepts_full_investor_profile_and_records_trace():
         trace_data = trace.json()
 
     assert data["summary_card"]["action"] in {"观察确认", "关注上行情景", "观望"}
-    assert "investor_profile" in trace_data["request_payload"]
-    assert trace_data["evidence_payload"]["risk_gate"]["investor_profile"]["capital_allocation_pct"] == 12.0
+    assert "investor_profile" not in trace_data["request_payload"]
+    assert "investor_profile" not in trace_data["evidence_payload"]["risk_gate"]
+    assert "private-news-sentinel" not in str(trace_data)
+    assert "decision_at" in trace_data["request_payload"]
 
 
 def test_high_risk_investor_profile_forces_observation_even_when_market_is_bullish():
@@ -1039,3 +1054,48 @@ def test_regime_drives_bearish_stance_on_downtrend_history_despite_bullish_quant
         data = resp.json()
     assert data["summary_card"]["stance"] == "偏空"
     assert data["summary_card"]["action"] == "关注下行情景"
+
+
+def test_internal_trace_hides_legacy_free_text():
+    with _make_client(_ScenarioToolbox()) as client:
+        store = client.app.state.trace_store
+        stamp = datetime.now(timezone.utc)
+        store._store_memory({
+            "analysis_id": "legacy-private",
+            "request_payload": {"horizon": "7d", "question": "Private original question"},
+            "tool_trace": [{"error": "Private diagnostic payload"}],
+            "evidence_payload": {"investor_profile": {"notes": "Private profile"}},
+            "response_payload": {"summary_card": {"thesis": "Private response text"}},
+            "feedback_rating": "helpful",
+            "feedback_comment": "Private feedback note",
+            "created_at": stamp.isoformat(),
+            "created_at_epoch": stamp.timestamp(),
+        })
+        response = client.get("/api/v1/agent/traces/legacy-private", headers=_headers("internal"))
+    assert response.status_code == 200
+    assert "Private" not in response.text
+    assert response.json()["request_payload"] == {"horizon": "7d"}
+    assert response.json()["feedback_rating"] == "helpful"
+
+
+def test_agent_research_focus_exposes_descriptive_gold_driver_evidence(monkeypatch):
+    import agent_gateway
+
+    monkeypatch.setattr(agent_gateway.quant_research_context, "get_context_at", lambda _: {
+        "data_asof": "2026-07-14",
+        "gold_drivers": {
+            "rate_sensitivity": {"prior_log_pct_per_100bp": -10.0, "recent_log_pct_per_100bp": -3.0},
+        },
+        "fair_value": {"deviation_pct": 5.0, "deviation_z": 0.4},
+    })
+    with _make_client(_ScenarioToolbox()) as client:
+        response = client.post(
+            "/api/v1/agent/analyze",
+            json={"question": "黄金对实际利率的敏感度有什么变化？", "horizon": "long_term"},
+            headers=_headers(),
+        )
+    assert response.status_code == 200
+    focus = response.json()["research_focus"]
+    assert focus["horizon"] == "long_term"
+    assert focus["data_asof"] == "2026-07-14"
+    assert "从 -10.00 变为 -3.00" in focus["section"]["evidence"][0]

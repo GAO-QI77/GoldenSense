@@ -22,7 +22,7 @@ services:
       MARKET_DATA_PROVIDER: yfinance
       NEWS_DATA_PROVIDER: rss
       INFERENCE_MODEL_CHECKPOINTS_DIR_T1: model_checkpoints
-      INFERENCE_MODEL_CHECKPOINTS_DIR_T7: model_checkpoints
+      INFERENCE_MODEL_CHECKPOINTS_DIR_T7: model_checkpoints_t7
     ports:
       - "8010:8010"
     depends_on:

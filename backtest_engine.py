@@ -98,6 +98,10 @@ def run_backtest(
             f"forward_returns ({len(forward_returns)}) and positions "
             f"({len(positions)}) must have the same length"
         )
+    if not positions.index.equals(forward_returns.index):
+        raise ValueError("positions and forward_returns must have the same index in chronological order")
+    if not positions.index.is_unique or not positions.index.is_monotonic_increasing:
+        raise ValueError("backtest index must be unique and increasing")
 
     positions = positions.astype(float)
     forward_returns = forward_returns.astype(float)

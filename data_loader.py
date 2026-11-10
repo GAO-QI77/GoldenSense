@@ -1,8 +1,9 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import time
 import re
-from typing import Protocol
+from typing import Any, Mapping, Protocol
 
 from bs4 import BeautifulSoup
 import feedparser
@@ -10,6 +11,58 @@ import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
+
+
+def parse_news_timestamp(value: Any) -> datetime | None:
+    """Parse an ISO or RSS publication timestamp. A bare date has no cutoff."""
+    if value is pd.NaT:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and len(value.strip()) > 10:
+        try:
+            parsed = datetime.fromisoformat(value.strip())
+        except ValueError:
+            try:
+                parsed = parsedate_to_datetime(value)
+            except (ValueError, TypeError, OverflowError):
+                return None
+    else:
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+
+def news_available_at(item: Mapping[str, Any]) -> datetime | None:
+    """Combine the source timestamps supplied for this text version."""
+    published = parse_news_timestamp(item.get("published"))
+    if published is None:
+        return None
+    for field in ("updated", "first_seen_at", "available_at"):
+        value = item.get(field)
+        if value is not None:
+            timestamp = parse_news_timestamp(value)
+            if timestamp is None:
+                return None
+            published = max(published, timestamp)
+    return published
+
+
+def market_availability_times(source_dates: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    dates = pd.to_datetime(source_dates, utc=True)
+    if source_dates.equals(source_dates.normalize()):
+        return dates + pd.Timedelta(days=1)
+    return dates
+
+
+def market_data_as_of(frame: pd.DataFrame, decision_at: datetime) -> pd.DataFrame:
+    """Limit market rows to the cutoff, conservatively delaying date-only bars."""
+    source_dates = pd.DatetimeIndex(frame.index)
+    cutoff = pd.Timestamp(decision_at)
+    cutoff = cutoff.tz_localize("UTC") if cutoff.tzinfo is None else cutoff.tz_convert("UTC")
+    visible = market_availability_times(source_dates) <= cutoff
+    result = frame.loc[visible].copy()
+    result.index = pd.to_datetime(source_dates[visible], utc=True).tz_localize(None)
+    return result.sort_index()
 
 
 class MarketDataProvider(Protocol):
@@ -176,12 +229,15 @@ class NewsDataLoader:
         )
         response.raise_for_status()
         feed = feedparser.parse(response.content)
+        captured_at = datetime.now(timezone.utc)
         items = []
         for entry in feed.entries:
             items.append({
                 'title': entry.title,
                 'summary': getattr(entry, 'summary', ''),
-                'published': getattr(entry, 'published', datetime.now().strftime('%Y-%m-%d')),
+                'published': getattr(entry, 'published', None),
+                'updated': getattr(entry, 'updated', None),
+                'first_seen_at': captured_at,
                 'source': url.split('/')[2],
                 'url': getattr(entry, 'link', None),
             })
@@ -250,7 +306,7 @@ class NewsDataLoader:
         df = pd.DataFrame(scored_items)
         if df.empty: return pd.DataFrame()
         
-        df['date'] = pd.to_datetime(df['published'], errors='coerce').dt.date
+        df['date'] = pd.to_datetime([news_available_at(item) for item in scored_items], utc=True).date
         df = df.dropna(subset=['date'])
         
         # 聚合多维度信号

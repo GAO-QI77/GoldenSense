@@ -165,7 +165,7 @@ def monte_carlo_cone(
         model = GaussianHMM(n_states=n_states, max_iter=40).fit(feats.values)
     fit = model.fit_
 
-    posterior = model.posterior(feats.values)[-1]
+    posterior = model.filter_posterior(feats.values)[-1]
     ret_means = fit.means[:, 0]
     ret_stds = np.sqrt(fit.variances[:, 0])
     transition = fit.transition

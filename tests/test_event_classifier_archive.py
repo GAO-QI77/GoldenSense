@@ -103,3 +103,16 @@ def test_archive_search_ranks_recent_first(tmp_path):
     # Same keyword strength -> time decay must rank the recent item first.
     assert "降息预期" in hits[0]["title"]
     assert hits[0]["score"] > hits[1]["score"]
+
+
+def test_archive_search_excludes_future_and_late_ingested_news(tmp_path):
+    archive = NewsArchive(tmp_path / "archive.jsonl")
+    archive.ingest([
+        _item("美联储加息影响黄金", ts=NOW - timedelta(hours=2)),
+        _item("美联储降息影响黄金", ts=NOW + timedelta(hours=1)),
+    ], now=NOW)
+    archive.ingest([
+        _item("美联储利率声明影响黄金", ts=NOW - timedelta(hours=1)),
+    ], now=NOW + timedelta(minutes=10))
+
+    assert [item["title"] for item in archive.search("黄金", now=NOW)] == ["美联储加息影响黄金"]

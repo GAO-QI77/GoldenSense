@@ -2062,6 +2062,40 @@ select {
   color: #e8b3a5;
 }
 
+.quant-loading-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin: 18px 0;
+  padding: 16px 18px;
+  border: 1px solid rgba(196, 159, 82, 0.2);
+  background: rgba(196, 159, 82, 0.055);
+  color: var(--muted);
+}
+
+.quant-loading-note.is-slow {
+  border-color: rgba(196, 159, 82, 0.42);
+  background: linear-gradient(90deg, rgba(196, 159, 82, 0.12), rgba(196, 159, 82, 0.035));
+}
+
+.quant-loading-note svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--gold);
+}
+
+.quant-loading-note strong {
+  display: block;
+  color: var(--ink);
+  font-size: 0.88rem;
+}
+
+.quant-loading-note p {
+  margin: 4px 0 0;
+  font-size: 0.78rem;
+  line-height: 1.6;
+}
+
 .quant-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3213,6 +3247,7 @@ select {
   border-radius: 8px;
   color: var(--text-main, #cfc8b4);
 }
+.track-row-benchmark { grid-column: 2 / -1; }
 .track-row strong { color: var(--gold-bright, #e8c979); }
 .track-benchmarks { font-size: 0.76rem; color: var(--text-dim, #97917f); padding: 4px 2px; }
 

@@ -59,6 +59,20 @@ def test_normalize_news_items_dedupes_and_scores():
     assert "rates" in payload.items[0].categories
 
 
+def test_normalize_uses_rss_timestamp_and_excludes_unknown_or_future_versions():
+    now = datetime(2026, 7, 13, 12, tzinfo=timezone.utc)
+    payload = normalize_news_items([
+        {"title": "invalid"},
+        {"title": "future", "published": "2026-07-13T13:00:00Z"},
+        {"title": "edited", "published": "2026-07-13T09:00:00Z", "updated": "2026-07-13T13:00:00Z"},
+        {"title": "rss", "published": "Mon, 13 Jul 2026 11:30:00 GMT"},
+    ], now=now)
+
+    assert [(item.title, item.published_at.hour, item.published_at.minute) for item in payload.items] == [
+        ("rss", 11, 30),
+    ]
+
+
 def test_recent_news_endpoint_contract():
     app = create_app(news_loader=_FakeNewsLoader(), start_background_task=False)
     with TestClient(app) as client:
@@ -72,6 +86,22 @@ def test_recent_news_endpoint_contract():
     assert data["status"] == "ok"
     assert len(data["items"]) == 1
     assert data["items"][0]["source"] == "reuters.com"
+
+
+def test_recent_news_cutoff_excludes_a_version_collected_after_the_decision():
+    captured = datetime(2026, 7, 13, 12, tzinfo=timezone.utc)
+    payload = normalize_news_items([
+        {"title": "Fed bulletin", "published": "2026-07-13T09:00:00Z"},
+    ], now=captured)
+    app = create_app(persistence=_MemoryPersistence(payload), start_background_task=False)
+    with TestClient(app) as client:
+        early = client.get("/api/v1/news/recent", params={"decision_at": "2026-07-13T11:00:00Z"})
+        late = client.get("/api/v1/news/recent", params={"decision_at": "2026-07-13T13:00:00Z"})
+
+    assert early.status_code == late.status_code == 200
+    assert early.json()["items"] == []
+    assert early.json()["status"] == "degraded"
+    assert [item["title"] for item in late.json()["items"]] == ["Fed bulletin"]
 
 
 def test_recent_news_query_matches_chinese_macro_aliases():
@@ -167,3 +197,23 @@ def test_news_readiness_fails_without_payload_when_fallback_disabled():
     assert resp.status_code == 503
     assert data["status"] == "unavailable"
     assert "recent_news_unavailable" in data["errors"]
+
+
+def test_recent_news_replays_the_prior_snapshot_when_newer_text_exists():
+    earlier = datetime(2026, 7, 13, 12, tzinfo=timezone.utc)
+    later = datetime(2026, 7, 13, 14, tzinfo=timezone.utc)
+    article = {"title": "Fed bulletin", "published": "2026-07-13T09:00:00Z"}
+    original = normalize_news_items([{**article, "summary": "Initial text"}], now=earlier)
+    revision = normalize_news_items([{**article, "summary": "Revised text"}], now=later)
+
+    class Archive(_MemoryPersistence):
+        def load_at(self, decision_at):
+            assert earlier <= decision_at < later
+            return original
+
+    app = create_app(persistence=Archive(revision), start_background_task=False)
+    with TestClient(app) as client:
+        historical = client.get("/api/v1/news/recent", params={"decision_at": "2026-07-13T13:00:00Z"})
+        current = client.get("/api/v1/news/recent", params={"decision_at": "2026-07-13T15:00:00Z"})
+    assert historical.json()["items"][0]["summary"] == "Initial text"
+    assert current.json()["items"][0]["summary"] == "Revised text"

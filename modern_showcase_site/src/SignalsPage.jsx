@@ -14,27 +14,29 @@ import {
   Target,
 } from 'lucide-react';
 
+import { deriveApiEndpoint } from './apiUrls';
+import { horizonLabel, RESEARCH_HORIZON_WINDOWS } from './horizons';
+import { ActiveCaseRibbon, CaseStrategyPanel } from './ResearchCasePanel';
+import { useViewMode } from './viewMode';
+
 const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
 const MARKET_VIEW_URL =
   import.meta.env.VITE_AGENT_MARKET_VIEW_URL || API_URL.replace('/analyze', '/market-view');
-const SIGNALS_BASE = import.meta.env.VITE_SIGNALS_BASE_URL || '/api/v1/signals';
+const SIGNALS_BASE =
+  import.meta.env.VITE_SIGNALS_BASE_URL || deriveApiEndpoint(API_URL, '/api/v1/signals');
 const SUBSCRIBE_URL =
-  import.meta.env.VITE_SUBSCRIBE_URL || '/api/v1/subscriptions';
+  import.meta.env.VITE_SUBSCRIBE_URL || deriveApiEndpoint(API_URL, '/api/v1/subscriptions');
 const RESEARCH_URL =
   import.meta.env.VITE_AGENT_RESEARCH_URL || API_URL.replace('/analyze', '/research/current');
 const API_KEY = import.meta.env.VITE_AGENT_API_KEY || 'dev-public-key';
 
-const horizonMeta = {
-  short_term: { label: '短期 · 1-21 天', icon: Radar },
-  mid_term: { label: '中期 · 1-6 月', icon: Target },
-  long_term: { label: '长期 · 6 月+', icon: BookOpenCheck },
+const horizonIcons = {
+  short_term: Radar,
+  mid_term: Target,
+  long_term: BookOpenCheck,
 };
 
 const confidenceTone = { 高: 'bull', 中: 'neutral', 低: 'risk' };
-
-// eslint-disable-next-line import/order
-import { useViewMode } from './viewMode';
-import { ActiveCaseRibbon, CaseStrategyPanel } from './ResearchCasePanel';
 
 function headers() {
   return { 'X-API-Key': API_KEY };
@@ -43,7 +45,14 @@ function headers() {
 async function fetchJson(url, { allow404 = false } = {}) {
   const response = await fetch(url, { headers: headers() });
   const text = await response.text();
-  const json = text ? JSON.parse(text) : null;
+  let json = null;
+  if (text.trim()) {
+    try {
+      json = JSON.parse(text);
+    } catch {
+      throw new Error('研究服务暂时返回了无法识别的内容，请稍后重试。');
+    }
+  }
   if (allow404 && response.status === 404) {
     const detail = json?.detail;
     return {
@@ -76,9 +85,10 @@ export default function SignalsPage() {
     async function load() {
       try {
         setLoading(true);
+        setError('');
         const [bookJson, currentJson, historyJson, trackJson] = await Promise.all([
           fetchJson(MARKET_VIEW_URL),
-          fetchJson(`${SIGNALS_BASE}/current`, { allow404: true }),
+          fetchJson(`${SIGNALS_BASE}/current`, { allow404: true }).catch(() => null),
           fetchJson(`${SIGNALS_BASE}/history?limit=26`).catch(() => ({ publications: [] })),
           fetchJson(`${SIGNALS_BASE}/track-record`).catch(() => null),
         ]);
@@ -101,6 +111,7 @@ export default function SignalsPage() {
 
   const meta = book?.meta;
   const hasCurrentPublication = Boolean(current?.publication_id);
+  const ledgerIsEmpty = current?.status === 'empty';
 
   return (
     <main className="page-surface signals-page">
@@ -168,15 +179,13 @@ export default function SignalsPage() {
 
       {book ? (
         <section className="view-book-grid">
-          {['short_term', 'mid_term', 'long_term'].map((key) => {
+          {Object.entries(horizonIcons).map(([key, Icon]) => {
             const section = book[key];
-            const metaInfo = horizonMeta[key];
-            const Icon = metaInfo.icon;
             return (
               <article key={key} className={`view-book-card ${section?.available ? '' : 'degraded'}`}>
                 <div className="view-book-head">
                   <span>
-                    <Icon size={15} /> {metaInfo.label}
+                    <Icon size={15} /> {horizonLabel(key)} · {RESEARCH_HORIZON_WINDOWS[key]}
                   </span>
                   {section?.available ? (
                     <span className={`stance-badge tone-${confidenceTone[section.confidence] || 'neutral'}`}>
@@ -220,7 +229,9 @@ export default function SignalsPage() {
             <ScrollText size={16} />
             <div>
               <h2>本周发布</h2>
-              <span>{hasCurrentPublication ? current.publication_id : '台账为空'}</span>
+              <span>
+                {current?.publication_id || (loading ? '正在读取' : ledgerIsEmpty ? '台账为空' : '台账暂不可用')}
+              </span>
             </div>
           </div>
           {hasCurrentPublication ? (
@@ -245,13 +256,13 @@ export default function SignalsPage() {
               ) : null}
               <p className="disclaimer">{current.disclaimer}</p>
             </>
-          ) : (
+          ) : ledgerIsEmpty ? (
             <div className="ledger-empty-guidance">
               <strong>需要第一期真实前向发布</strong>
               <p>{current?.guidance || '追踪记录自首次发布起前向累积，不回填历史。'}</p>
               <small>运维动作：冻结本周研究后执行内部发布任务。</small>
             </div>
-          )}
+          ) : null}
         </section>
 
         <section className="panel-block ledger-track">
@@ -268,6 +279,12 @@ export default function SignalsPage() {
           </div>
           {trackRecord ? (
             <div className="track-grid">
+              {trackRecord.price_evidence === 'session_timestamps' && (
+                <p className="muted-copy">行情按交易会话和报价可用时间评分。</p>
+              )}
+              {trackRecord.price_evidence === 'date_only_proxy' && (
+                <p className="muted-copy">行情按日期估算可用时间，记分供研究参考。</p>
+              )}
               {Object.entries(trackRecord.per_profile || {}).map(([profile, stats]) => (
                 <div key={profile} className="track-row">
                   <strong>{{ conservative: '保守', balanced: '稳健', aggressive: '进取' }[profile]}</strong>
@@ -278,6 +295,9 @@ export default function SignalsPage() {
                   <span>
                     回撤 {stats.max_drawdown != null ? `${(stats.max_drawdown * 100).toFixed(2)}%` : '—'}
                   </span>
+                  {trackRecord.benchmarks?.[`${profile}_fixed_net`]?.cum_return != null && (
+                    <span className="track-row-benchmark">同成本固定仓位 {(trackRecord.benchmarks[`${profile}_fixed_net`].cum_return * 100).toFixed(2)}%</span>
+                  )}
                 </div>
               ))}
               <div className="track-benchmarks">
@@ -429,7 +449,13 @@ function DigestSubscribeCard() {
         headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
         body: JSON.stringify({ email: email.trim() }),
       });
-      const json = await response.json();
+      const text = await response.text();
+      let json = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        throw new Error('订阅服务暂时返回异常，请稍后重试。');
+      }
       if (!response.ok) {
         throw new Error(json?.detail?.message || `订阅失败：HTTP ${response.status}`);
       }

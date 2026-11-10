@@ -20,9 +20,12 @@ publication's rebalance price must exist).
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import math
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple
@@ -47,6 +50,7 @@ WEEKS_PER_YEAR = 52
 class LedgerStore(Protocol):
     def append(self, record: Dict[str, Any]) -> None: ...
     def load_all(self) -> List[Dict[str, Any]]: ...
+    def append_if_absent(self, record: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]: ...
 
 
 class MemoryLedgerStore:
@@ -60,6 +64,14 @@ class MemoryLedgerStore:
         with self._lock:
             self._records.append(json.loads(json.dumps(record, ensure_ascii=False)))
 
+    def append_if_absent(self, record: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+        with self._lock:
+            for existing in self._records:
+                if existing["publication_id"] == record["publication_id"]:
+                    return json.loads(json.dumps(existing)), False
+            self._records.append(json.loads(json.dumps(record)))
+            return record, True
+
     def load_all(self) -> List[Dict[str, Any]]:
         with self._lock:
             return [dict(r) for r in self._records]
@@ -70,24 +82,42 @@ class JsonlLedgerStore:
 
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
-        self._lock = threading.Lock()
+
+    @contextmanager
+    def _open_locked(self, *, writing: bool):
+        with self._path.open("a+" if writing else "r", encoding="utf-8") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX if writing else fcntl.LOCK_SH)
+            stream.seek(0)
+            yield stream
+            # Closing the stream releases the lock after any buffered write.
+
+    @staticmethod
+    def _write(stream, record: Dict[str, Any]) -> None:
+        stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        stream.flush()
 
     def append(self, record: Dict[str, Any]) -> None:
-        with self._lock:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with self._path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._open_locked(writing=True) as stream:
+            self._write(stream, record)
+
+    def append_if_absent(self, record: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._open_locked(writing=True) as stream:
+            for line in stream:
+                if line.strip():
+                    existing = json.loads(line)
+                    if existing["publication_id"] == record["publication_id"]:
+                        return existing, False
+            self._write(stream, record)
+            return record, True
 
     def load_all(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            if not self._path.exists():
-                return []
-            records = []
-            for line in self._path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line:
-                    records.append(json.loads(line))
-            return records
+        try:
+            with self._open_locked(writing=False) as stream:
+                return [json.loads(line) for line in stream if line.strip()]
+        except FileNotFoundError:
+            return []
 
 
 # --------------------------------------------------------------------------- #
@@ -148,7 +178,7 @@ def build_publication(ctx: Dict[str, Any], *, now: datetime) -> Dict[str, Any]:
             "fair_value_deviation_z": fair.get("deviation_z"),
             "macro_composite": factors.get("composite"),
         },
-        "degraded": dict(ctx.get("degraded", {})),
+        "degraded": dict(ctx.get("degraded") or {}),
         "disclaimer": ALLOCATION_DISCLAIMER,
     }
     record["content_hash"] = _canonical_hash(record)
@@ -163,28 +193,30 @@ def publish_weekly(
 ) -> Tuple[Dict[str, Any], bool]:
     """Publish this ISO week's record once; republishing returns the original."""
     now = now or datetime.now(timezone.utc)
-    pub_id = publication_id_for(now)
-    for existing in store.load_all():
-        if existing.get("publication_id") == pub_id:
-            return existing, False
+    if ctx.get("data_stale") or (ctx.get("degraded") or {}).get("market_data"):
+        for existing in store.load_all():
+            if existing.get("publication_id") == publication_id_for(now):
+                return existing, False
+        raise ValueError("stale or unavailable research data")
     record = build_publication(ctx, now=now)
-    store.append(record)
-    return record, True
+    return store.append_if_absent(record)
 
 
 # --------------------------------------------------------------------------- #
 # Track record scoring
 # --------------------------------------------------------------------------- #
 def _rebalance_price(prices: pd.Series, published_at: str) -> Optional[Tuple[pd.Timestamp, float]]:
-    """First close at/after the publication date; None if not yet available."""
+    """First price strictly after publication. Date-only bars start at UTC midnight."""
     try:
         when = pd.Timestamp(published_at)
     except (ValueError, TypeError):
         return None
-    if when.tzinfo is not None:
-        when = when.tz_convert("UTC").tz_localize(None)
-    when = when.normalize()
-    pos = prices.index.searchsorted(when)
+    if pd.isna(when):
+        return None
+    when = when.tz_localize("UTC") if when.tzinfo is None else when.tz_convert("UTC")
+    # Midnight labels carry no intraday close time. For those inputs, use a
+    # later session rather than crediting the publication with same-day prices.
+    pos = pd.to_datetime(prices.index, utc=True).searchsorted(when, side="right")
     if pos >= len(prices):
         return None
     return prices.index[pos], float(prices.iloc[pos])
@@ -222,22 +254,42 @@ def _profile_stats(weekly_returns: List[float]) -> Dict[str, Any]:
     }
 
 
+def _shadow_step(weight: float, drift: float, gold_return: float, rate: float) -> Tuple[float, float]:
+    # Trade sizing and fee are both fractions of pre-trade NAV. The target
+    # weight is a fraction of the smaller, post-fee NAV.
+    side = 1 if weight >= drift else -1
+    fee = rate * abs(weight - drift) / (1.0 + side * rate * weight)
+    growth = 1.0 + weight * gold_return
+    next_drift = weight * (1.0 + gold_return) / growth
+    return (1.0 - fee) * growth - 1.0, next_drift
+
+
 def score_track_record(
     publications: List[Dict[str, Any]],
     prices: pd.Series,
     *,
     cost_bps: float = 5.0,
+    decision_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Score matured weeks of the shadow portfolios against fixed benchmarks."""
     prices = prices.astype(float).dropna().sort_index()
+    if not prices.index.is_unique or not prices.map(lambda p: math.isfinite(p) and p > 0).all():
+        raise ValueError("shadow prices must be positive and uniquely timestamped")
+    if not 0 <= cost_bps < 10000:
+        raise ValueError("invalid shadow transaction cost")
+    if decision_at is not None:
+        from data_loader import market_data_as_of
+
+        prices = market_data_as_of(prices.to_frame("Gold"), decision_at)["Gold"]
     ordered = sorted(publications, key=lambda r: r.get("published_at") or "")
 
     # Resolve each publication's rebalance point; drop those without prices.
-    points: List[Tuple[Dict[str, Any], float]] = []
+    executions: Dict[pd.Timestamp, Tuple[Dict[str, Any], float]] = {}
     for record in ordered:
         resolved = _rebalance_price(prices, record.get("published_at", ""))
         if resolved is not None:
-            points.append((record, resolved[1]))
+            executions[resolved[0]] = (record, resolved[1])
+    points = [executions[date] for date in sorted(executions)]
 
     result: Dict[str, Any] = {
         "evidence_class": "simulated_forward",
@@ -245,6 +297,9 @@ def score_track_record(
         "benchmarks": {},
         "matured_through": None,
         "cost_bps": cost_bps,
+        "execution_policy": "first_close_after_publication",
+        "cash_yield": 0.0,
+        "turnover_method": "drift_adjusted_self_financing",
         "disclaimer": TRACK_RECORD_DISCLAIMER,
     }
 
@@ -255,22 +310,38 @@ def score_track_record(
 
     for profile in PROFILES:
         weekly_returns: List[float] = []
-        prev_weight = 0.0
+        fixed_returns: List[float] = []
+        fixed_weight = None
+        drift = fixed_drift = 0.0
         for (rec, p0), (_next_rec, p1) in matured_pairs:
             midpoint = ((rec.get("allocations") or {}).get(profile) or {}).get("midpoint")
-            if midpoint is None or p0 <= 0:
+            if midpoint is None and not weekly_returns:
                 continue
-            weight = float(midpoint) / 100.0
-            gold_ret = p1 / p0 - 1.0
-            turnover_cost = abs(weight - prev_weight) * cost_bps / 10000.0
-            weekly_returns.append((1.0 + weight * gold_ret) * (1.0 - turnover_cost) - 1.0)
-            prev_weight = weight
+            weight = drift if midpoint is None else float(midpoint) / 100.0
+            if not 0 <= weight <= 1:
+                raise ValueError("shadow allocations must lie between 0% and 100%")
+            gold_return = p1 / p0 - 1.0
+            rate = cost_bps / 10000.0
+            period_return, drift = _shadow_step(weight, drift, gold_return, rate)
+            weekly_returns.append(period_return)
+            if fixed_weight is None:
+                fixed_weight = weight
+            fixed_return, fixed_drift = _shadow_step(fixed_weight, fixed_drift, gold_return, rate)
+            fixed_returns.append(fixed_return)
         result["per_profile"][profile] = {
             **_profile_stats(weekly_returns),
             "evidence_class": "simulated_forward",
         }
+        if fixed_weight is not None:
+            result["benchmarks"][f"{profile}_fixed_net"] = {
+                **_profile_stats(fixed_returns),
+                "evidence_class": "simulated_forward",
+                "cost_bps": cost_bps,
+                "weight_pct": round(fixed_weight * 100, 4),
+                "description": "首期仓位固定权重，同期再平衡，计入同口径成本",
+            }
 
-    # Benchmarks over the same matured span, cost-free by construction.
+    # Gross reference benchmarks over the full matured span.
     if matured_pairs:
         p_first = matured_pairs[0][0][1]
         p_last = matured_pairs[-1][1][1]
@@ -305,4 +376,15 @@ def score_track_record(
             "evidence_class": "simulated_forward", "cum_return": None
         }
 
+    return result
+
+
+def score_configured_track_record(
+    publications: List[Dict[str, Any]], *, decision_at: datetime,
+) -> Dict[str, Any]:
+    from gold_sessions import load_gold_outcome_prices
+
+    prices, source = load_gold_outcome_prices(decision_at)
+    result = score_track_record(publications, prices)
+    result["price_evidence"] = "session_timestamps" if source == "session_timestamps" else "date_only_proxy"
     return result

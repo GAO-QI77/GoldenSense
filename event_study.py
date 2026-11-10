@@ -10,9 +10,12 @@ every statistic is recomputed from price data, never hand-written.
 """
 from __future__ import annotations
 
+from bisect import bisect_left
+from collections import Counter
 import json
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -53,9 +56,35 @@ def _forward_return(prices: pd.Series, anchor_pos: int, bdays: int) -> Optional[
     return float(prices.iloc[end_pos]) / p0 - 1.0
 
 
+def _matched_excess(
+    prices: pd.Series, pos: int, window: int, event_return: float, event_positions: list[int],
+) -> float | None:
+    """Match up to three prior same-weekday controls with disjoint, event-free windows."""
+    controls = []
+    weekday = prices.index[pos].weekday()
+    right_edge = pos - 1
+    first = max(0, pos - max(252, 4 * window))
+    for candidate in range(pos - window - 1, first - 1, -1):
+        if candidate + window > right_edge or prices.index[candidate].weekday() != weekday:
+            continue
+        event_index = bisect_left(event_positions, candidate)
+        if event_index < len(event_positions) and event_positions[event_index] <= candidate + window:
+            continue
+        control = _forward_return(prices, candidate, window)
+        if control is None:
+            continue
+        controls.append(control)
+        right_edge = candidate - 1
+        if len(controls) == 3:
+            break
+    return float(event_return - np.median(controls)) if len(controls) == 3 else None
+
+
 def compute_event_study(
     catalog: List[Dict[str, Any]],
     prices: pd.Series,
+    *,
+    decision_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Per-event forward returns + per-category aggregates.
 
@@ -64,21 +93,36 @@ def compute_event_study(
     are excluded from aggregates (honest sample accounting, no padding).
     """
     prices = prices.astype(float).dropna().sort_index()
-    scored: List[Dict[str, Any]] = []
+    if decision_at is not None:
+        from data_loader import market_data_as_of
+
+        prices = market_data_as_of(prices.to_frame("Gold"), decision_at)["Gold"]
+        cutoff = pd.to_datetime(decision_at, utc=True).tz_localize(None).normalize()
+    anchors = []
     for event in catalog:
         when = pd.Timestamp(event["date"])
+        if decision_at is not None and when >= cutoff:
+            continue
         pos = int(prices.index.searchsorted(when))
+        in_span = pos < len(prices) and when >= prices.index[0]
+        anchors.append((event, pos if in_span else None))
+    event_counts = Counter(pos for _, pos in anchors if pos is not None)
+    event_positions = sorted(event_counts)
+    scored: List[Dict[str, Any]] = []
+    for event, pos in anchors:
         row: Dict[str, Any] = {
             "event_id": event["event_id"],
             "date": event["date"],
             "category": event["category"],
             "title": event["title"],
         }
-        # searchsorted returns 0 both for "before data" and "first day";
-        # only anchor if the event date is actually inside the data span.
-        in_span = pos < len(prices) and when >= prices.index[0]
         for key, bdays in HORIZONS_BDAYS.items():
-            row[key] = _forward_return(prices, pos, bdays) if in_span else None
+            value = _forward_return(prices, pos, bdays) if pos is not None else None
+            row[key] = value
+            row[key.replace("fwd_", "matched_excess_")] = (
+                _matched_excess(prices, pos, bdays, value, event_positions)
+                if value is not None and event_counts[pos] == 1 else None
+            )
         scored.append(row)
 
     by_category: Dict[str, Dict[str, Any]] = {}
@@ -89,6 +133,9 @@ def compute_event_study(
             values = [r[key] for r in rows if r[key] is not None]
             suffix = key.replace("fwd_", "")
             agg[f"n_{suffix}"] = len(values)
+            excess = [r[f"matched_excess_{suffix}"] for r in rows if r[f"matched_excess_{suffix}"] is not None]
+            agg[f"matched_n_{suffix}"] = len(excess)
+            agg[f"matched_mean_excess_{suffix}"] = round(float(np.mean(excess)), 6) if excess else None
             if values:
                 arr = np.array(values)
                 agg[f"mean_{suffix}"] = round(float(arr.mean()), 6)
@@ -120,9 +167,9 @@ class EventStudyLibrary:
         self._study: Optional[Dict[str, Any]] = None
         self._computed_at = 0.0
 
-    def _get_study(self) -> Optional[Dict[str, Any]]:
+    def _get_study(self, decision_at: Optional[datetime]) -> Optional[Dict[str, Any]]:
         with self._lock:
-            if self._study is not None and (time.time() - self._computed_at) < self._ttl:
+            if decision_at is None and self._study is not None and (time.time() - self._computed_at) < self._ttl:
                 return self._study
             try:
                 catalog = self._catalog if self._catalog is not None else load_catalog()
@@ -132,17 +179,21 @@ class EventStudyLibrary:
 
                     raw, _source = load_market_data()
                     prices = raw["Gold"]
-                self._study = compute_event_study(catalog, prices)
-                self._computed_at = time.time()
+                study = compute_event_study(catalog, prices, decision_at=decision_at)
             except Exception:
-                self._study = None
-            return self._study
+                return None
+            if decision_at is None:
+                self._study = study
+                self._computed_at = time.time()
+            return study
 
-    def analogs_for(self, category: Optional[str]) -> Optional[Dict[str, Any]]:
+    def analogs_for(
+        self, category: Optional[str], *, decision_at: Optional[datetime] = None
+    ) -> Optional[Dict[str, Any]]:
         """Aggregate stats + recent event citations for one category."""
         if category not in CATEGORIES:
             return None
-        study = self._get_study()
+        study = self._get_study(decision_at)
         if study is None:
             return None
         agg = dict(study["by_category"].get(category) or {})

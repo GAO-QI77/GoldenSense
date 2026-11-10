@@ -243,6 +243,26 @@ def fit_gold_regime_posterior(
     return pd.DataFrame(gamma, index=feats.index, columns=labels)
 
 
+def walk_forward_regime(
+    features: pd.DataFrame, *, n_states: int = 3, min_train: int = 756, refit_every: int = 126,
+) -> tuple[pd.DataFrame, Optional[GaussianHMM]]:
+    """Refit before each block and filter forward through the visible block."""
+    values = features.to_numpy(dtype=float)
+    labels = [STATE_LABELS.get(k, f"state_{k}") for k in range(n_states)]
+    out = pd.DataFrame(index=features.index, columns=labels, dtype=float)
+    model = None
+    for start in range(min_train, len(features), refit_every):
+        end = min(start + refit_every, len(features))
+        try:
+            model = GaussianHMM(n_states=n_states, max_iter=40).fit(values[:start])
+        except (ValueError, np.linalg.LinAlgError):
+            if model is None:
+                continue
+        filtered = model.filter_posterior(values[:end])
+        out.iloc[start:end] = filtered[start:end]
+    return out.dropna(), model
+
+
 def causal_regime_stress(
     prices: pd.Series,
     *,
@@ -250,41 +270,12 @@ def causal_regime_stress(
     min_train: int = 756,
     refit_every: int = 126,
 ) -> Optional[pd.Series]:
-    """Causal P(stress) series for backtests: no look-ahead anywhere.
-
-    Walk forward: refit the HMM on data up to time t (expanding window, every
-    ``refit_every`` days), then take the *filtered* stress probability at t.
-    Both the parameter estimation and the inference use only past data, so the
-    resulting series can drive a position without leakage.
-
-    Returns None when history is shorter than ``min_train``.
-    """
-    feats = regime_features(prices)
-    if len(feats) < min_train + refit_every:
+    """Return the forward-filtered probability of the highest-volatility state."""
+    features = regime_features(prices)
+    if len(features) < min_train + refit_every:
         return None
-
-    values = feats.values
-    idx = feats.index
-    stress_col = n_states - 1  # states relabelled by ascending vol -> last = stress
-    out = pd.Series(index=idx, dtype=float)
-
-    start = min_train
-    model = None
-    while start < len(feats):
-        end = min(start + refit_every, len(feats))
-        # Refit on everything strictly before this block.
-        try:
-            model = GaussianHMM(n_states=n_states, max_iter=40).fit(values[:start])
-        except Exception:
-            if model is None:
-                start = end
-                continue
-        # Filter over history+block, read only this block's filtered stress prob.
-        filt = model.filter_posterior(values[:end])
-        out.iloc[start:end] = filt[start:end, stress_col]
-        start = end
-
-    return out.dropna()
+    states, _ = walk_forward_regime(features, n_states=n_states, min_train=min_train, refit_every=refit_every)
+    return states.iloc[:, -1].rename(None)
 
 
 def blended_exposure(

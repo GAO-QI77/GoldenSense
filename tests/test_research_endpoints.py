@@ -115,6 +115,28 @@ def test_analyze_response_trace_contains_committee():
         _assert_committee_in_trace(client)
 
 
+def test_long_term_research_uses_valuation_view_independently_of_forecast_window(monkeypatch):
+    from test_agent_analyze import _DraftNarrator, _ScenarioToolbox
+
+    monkeypatch.setattr(
+        agent_gateway.quant_research_context, "get_context",
+        lambda: {"fair_value": {"deviation_pct": 8.0, "deviation_z": 0.5}},
+    )
+    app = agent_gateway.create_app(toolbox=_ScenarioToolbox(), narrator=_DraftNarrator())
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/agent/analyze", headers=PUBLIC_HEADERS,
+            json={"question": "黄金长期估值怎么看？", "horizon": "long_term"},
+        )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["research_focus"]["horizon"] == "long_term"
+    assert "估值" in result["research_focus"]["section"]["core_view"]
+    assert result["summary_card"]["horizon"] == "long_term"
+    assert result["horizon_forecasts"][-1]["horizon"] == "long_term"
+
+
 def _assert_committee_in_trace(client):
     resp = client.post(
         "/api/v1/agent/analyze",

@@ -161,6 +161,7 @@ class NewsEventItem(BaseModel):
     source_tier: Literal["primary", "secondary", "synthetic", "unknown"] = "unknown"
     source_authority: Optional[str] = None
     is_primary_source: bool = False
+    available_at: Optional[datetime] = None
 
 
 class RecentNewsResponse(BaseModel):
@@ -172,3 +173,18 @@ class RecentNewsResponse(BaseModel):
     degraded_reason: Optional[str] = None
     source_freshness_seconds: Optional[int] = Field(default=None, ge=0)
     items: List[NewsEventItem]
+
+    def visible_at(self, decision_at: datetime) -> RecentNewsResponse:
+        """Use the capture time when a legacy record lacks version metadata."""
+        items = [
+            item for item in self.items
+            if max(item.published_at, item.available_at or self.as_of) <= decision_at
+        ]
+        if self.as_of <= decision_at and len(items) == len(self.items):
+            return self
+        return self.model_copy(update={
+            "as_of": min(self.as_of, decision_at),
+            "items": items,
+            "status": "degraded",
+            "degraded_reason": "news_version_after_decision",
+        })

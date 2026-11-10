@@ -15,10 +15,13 @@ CSV, logs the reason) instead of crashing the deploy or fabricating data.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 import os
+from pathlib import Path
 import sys
 import threading
+from tempfile import NamedTemporaryFile
 import time
 from typing import Optional
 
@@ -34,16 +37,41 @@ def refresh_once(*, cache_dir: Optional[str] = None) -> dict:
     started = time.time()
     summary: dict = {"ok": False, "step": "start"}
     try:
-        from data_sources import DEFAULT_CACHE_DIR, build_extended_market_data
+        from data_sources import DEFAULT_CACHE_DIR, RESEARCH_MARKET_CACHE_PATH, YF_TICKERS, build_extended_market_data
 
-        _frame, meta = build_extended_market_data(
-            cache_dir=cache_dir or DEFAULT_CACHE_DIR
-        )
+        target = Path(os.environ.get("GOLD_RESEARCH_MARKET_PATH") or RESEARCH_MARKET_CACHE_PATH)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile(dir=target.parent, suffix=".csv", delete=False) as candidate:
+            path = Path(candidate.name)
+        try:
+            frame, meta = build_extended_market_data(cache_dir=cache_dir or DEFAULT_CACHE_DIR, out_path=str(path))
+            required = set(YF_TICKERS)
+            if not required <= set(frame) or any(key in meta.sources_degraded for key in required):
+                raise ValueError("required market sources missing")
+            fresh_after = (datetime.now(timezone.utc).date() - timedelta(days=4)).isoformat()
+            stale = sorted(key for key in required if meta.price_end_by_column.get(key, "") < fresh_after)
+            if frame.empty or stale:
+                raise ValueError(f"market refresh is stale: {', '.join(stale)}")
+            path.replace(target)
+        finally:
+            path.unlink(missing_ok=True)
         summary["dataset"] = meta.as_dict()
         summary["step"] = "dataset_built"
     except Exception as exc:  # network / provider failure -> keep last good CSV
         summary["dataset_error"] = f"{type(exc).__name__}: {exc}"
         summary["step"] = "dataset_failed_kept_last_good"
+
+    if os.environ.get("GOLD_DRIVER_COT_REFRESH_ENABLED") == "1":
+        try:
+            from scripts.refresh_gold_driver_flows import cot_observations, fetch_cot, merge_observations
+
+            payload = fetch_cot()
+            path = Path(os.environ.get("GOLD_DRIVER_FLOWS_PATH") or "data_cache/gold_driver_flows.csv")
+            summary["cot_versions_added"] = merge_observations(
+                path, cot_observations(payload), captured_at=datetime.fromisoformat(payload["captured_at"]),
+            )
+        except Exception as exc:
+            summary["cot_refresh_error"] = type(exc).__name__
 
     # Warm (force-refresh) the shared research context off whatever CSV we now
     # have, so the first user request after a refresh is already hot.

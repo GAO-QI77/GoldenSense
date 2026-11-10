@@ -79,3 +79,44 @@ def test_build_factor_signals_degrades_to_trend_fallback():
     frame, used = build_factor_signals(df)
     assert used == ["price_trend_fallback"]
     assert frame["price_trend_fallback"].isin([0.0, 1.0]).all()
+
+
+def test_driver_attribution_reconciles_and_cannot_see_future():
+    from strategy_macro import driver_attribution
+
+    rng = np.random.default_rng(27)
+    dates = pd.bdate_range("2022-01-01", periods=340)
+    usd = rng.normal(0, 0.005, len(dates))
+    gold = -0.8 * usd + rng.normal(0, 0.002, len(dates))
+    frame = pd.DataFrame({
+        "Gold": np.exp(7 + np.cumsum(gold)),
+        "USD_Index": np.exp(5 + np.cumsum(usd)),
+    }, index=dates)
+    before = driver_attribution(frame)
+    assert before is not None
+    cols = ["intercept", "dollar", "residual"]
+    np.testing.assert_allclose(before[cols].sum(axis=1), before["actual"])
+    modified = frame.copy()
+    modified.loc[dates[315]:, "Gold"] *= 1.2
+    after = driver_attribution(modified)
+    pd.testing.assert_frame_equal(before.loc[:dates[314]], after.loc[:dates[314]])
+
+
+def test_middle_term_forecasts_purge_unmatured_labels():
+    from strategy_macro import walk_forward_drivers
+
+    rng = np.random.default_rng(7)
+    dates = pd.bdate_range("2022-01-01", periods=800)
+    frame = pd.DataFrame(
+        np.exp(5 + rng.normal(0, 0.01, (len(dates), 2)).cumsum(axis=0)),
+        columns=["Gold", "USD_Index"], index=dates,
+    )
+    before = walk_forward_drivers(frame, horizon=63, training_rows=252)
+    changed = frame.copy()
+    changed.loc[dates[650]:, "Gold"] *= 1.5
+    after = walk_forward_drivers(changed, horizon=63, training_rows=252)
+    cols = ["trend_forecast", "driver_forecast"]
+    pd.testing.assert_frame_equal(before.loc[:dates[649], cols], after.loc[:dates[649], cols])
+    assert before.index[-1] == dates[-64]
+    assert before["matures_on"].iloc[-1] == dates[-1]
+    assert not before.loc[:dates[649], "realized_return"].equals(after.loc[:dates[649], "realized_return"])

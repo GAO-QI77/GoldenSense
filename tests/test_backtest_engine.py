@@ -102,3 +102,12 @@ def test_misaligned_lengths_raise():
 
     with pytest.raises(ValueError):
         run_backtest(forward_returns=fwd, positions=positions, cost_bps=0.0)
+
+
+def test_same_length_returns_with_reversed_dates_raise():
+    dates = _idx(2)
+    positions = pd.Series([1.0, 0.0], index=dates)
+    returns = pd.Series([-0.20, 0.10], index=dates[::-1])
+
+    with pytest.raises(ValueError, match="same index"):
+        run_backtest(forward_returns=returns, positions=positions)

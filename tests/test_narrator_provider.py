@@ -137,6 +137,55 @@ class _FakeDeepSeekClient:
         self.chat = SimpleNamespace(completions=self.completions)
 
 
+def test_external_narration_payload_excludes_free_text_and_full_profile():
+    bundle = _bundle()
+    bundle.question = "private-question-sentinel"
+    bundle.optional_news_text = "private-news-sentinel"
+    bundle.risk_profile["investor_profile"] = {"capital_allocation_pct": 72.5}
+    bundle.risk_gate["investor_profile"] = bundle.risk_profile["investor_profile"]
+    narrator = OpenAINarrator(_config(), provider="deepseek", client=_FakeDeepSeekClient([]))
+
+    payload = narrator._prompt_payload(bundle, _draft())
+    assert "private-" not in str(payload)
+    assert "capital_allocation_pct" not in str(payload)
+
+
+
+def test_research_case_narration_sends_only_deterministic_draft():
+    from research_case import ResearchNarrative
+
+    draft = ResearchNarrative(overview="Public research overview", horizon_notes={}, watchlist=[],
+                              generated_by="deterministic_draft")
+    case = SimpleNamespace(status="complete", conflicts=[], question="private-case-sentinel",
+                           fact_claims=["private-document-sentinel"])
+    client = _FakeDeepSeekClient([draft.model_dump_json()])
+    narrator = OpenAINarrator(_config(), provider="deepseek", client=client)
+
+    result = asyncio.run(narrator.narrate_research_case(case, draft))
+
+    assert result.generated_by == "llm"
+    sent = json.loads(client.completions.calls[0]["messages"][1]["content"])
+    assert sent == {"draft": draft.model_dump(mode="json")}
+
+def test_forecast_batch_fallback_preserves_a_single_decision_cutoff():
+    import httpx
+    from agent_gateway import HttpResearchToolbox
+
+    timestamps = []
+
+    def handle(request):
+        timestamps.append(json.loads(request.content)["current_timestamp"])
+        return httpx.Response(404 if request.url.path.endswith("/batch") else 200, json={})
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            await HttpResearchToolbox(client, _config()).get_quant_forecasts(["short_term", "mid_term", "long_term"])
+
+    asyncio.run(run())
+    assert len(timestamps) == 4
+    assert len(set(timestamps)) == 1
+
+
 class _FakeOpenAIResponses:
     def __init__(self, outputs):
         self.outputs = list(outputs)

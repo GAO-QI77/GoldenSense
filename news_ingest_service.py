@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 from contextlib import asynccontextmanager
@@ -14,11 +15,13 @@ import psycopg
 import redis
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
+from pydantic import AwareDatetime
 
-from data_loader import NewsDataProvider, create_news_data_provider
+from data_loader import NewsDataProvider, create_news_data_provider, news_available_at, parse_news_timestamp
 from service_contracts import NewsEventItem, RecentNewsResponse
 
 
+LOGGER = logging.getLogger(__name__)
 RECENT_NEWS_KEY = "golden_sense:recent_news"
 
 
@@ -31,6 +34,17 @@ class NewsIngestConfig:
     stale_cache_grace_seconds: int = 1800
     allow_sample_fallback: bool = True
     provider_name: str = "rss"
+
+
+def ensure_news_capture_schema(cursor: psycopg.Cursor) -> None:
+    cursor.execute(
+        """
+        create table if not exists news_captures (
+            captured_at timestamptz primary key,
+            payload jsonb not null
+        )
+        """
+    )
 
 
 class NewsPersistence:
@@ -65,9 +79,28 @@ class NewsPersistence:
         except Exception:
             return None
 
+    def load_at(self, decision_at: datetime) -> Optional[RecentNewsResponse]:
+        """Replay the newest persisted capture that was visible at the cutoff."""
+        try:
+            with psycopg.connect(self._database_url, connect_timeout=3) as conn:
+                row = conn.execute(
+                    """
+                    select payload from news_captures
+                    where captured_at <= %s
+                    order by captured_at desc limit 1
+                    """,
+                    (decision_at,),
+                ).fetchone()
+            return RecentNewsResponse.model_validate(row[0]) if row else None
+        except psycopg.errors.UndefinedTable:
+            return None
+        except (psycopg.Error, ValueError) as exc:
+            LOGGER.warning("news_capture_read_failed error=%s", type(exc).__name__)
+            return None
+
     def _save_db(self, payload: Dict[str, Any]) -> None:
         try:
-            with psycopg.connect(self._database_url) as conn:
+            with psycopg.connect(self._database_url, connect_timeout=3) as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
@@ -85,6 +118,15 @@ class NewsPersistence:
                         )
                         """
                     )
+                    if payload["status"] == "ok":
+                        ensure_news_capture_schema(cur)
+                        cur.execute(
+                            """
+                            insert into news_captures (captured_at, payload)
+                            values (%s, %s::jsonb) on conflict do nothing
+                            """,
+                            (payload["as_of"], json.dumps(payload, ensure_ascii=False)),
+                        )
                     for item in payload["items"]:
                         cur.execute(
                             """
@@ -118,24 +160,14 @@ class NewsPersistence:
                             ),
                         )
                 conn.commit()
-        except Exception:
-            return
+        except psycopg.Error as exc:
+            LOGGER.warning("news_capture_write_failed error=%s", type(exc).__name__)
 
 
 def _normalize_text(value: str) -> str:
     no_tags = re.sub(r"<[^>]+>", " ", value or "")
     collapsed = re.sub(r"\s+", " ", no_tags).strip()
     return collapsed
-
-
-def _parse_datetime(value: str) -> datetime:
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return datetime.now(timezone.utc)
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -173,11 +205,14 @@ def normalize_news_items(news_items: List[Dict[str, Any]], *, now: Optional[date
         summary = _normalize_text(str(raw.get("summary", "")))
         if not title:
             continue
+        available = news_available_at(raw)
+        if available is None or available > as_of:
+            continue
         key = title.lower()
         if key in seen:
             continue
         seen.add(key)
-        published = _parse_datetime(str(raw.get("published", "")))
+        published = parse_news_timestamp(raw.get("published"))
         source = str(raw.get("source", "unknown"))
         normalized_event = title[:120]
         total_score = float(raw.get("total", 0.0))
@@ -187,6 +222,7 @@ def normalize_news_items(news_items: List[Dict[str, Any]], *, now: Optional[date
             NewsEventItem(
                 event_id=f"news-{digest}",
                 published_at=published,
+                available_at=as_of,
                 title=title,
                 summary=summary[:400],
                 source=source,
@@ -460,9 +496,16 @@ def create_app(
     async def get_recent_news(
         limit: int = Query(default=8, ge=1, le=30),
         q: Optional[str] = Query(default=None, max_length=120),
+        decision_at: Optional[AwareDatetime] = None,
     ) -> RecentNewsResponse:
         payload = getattr(app.state, "latest_news", None) or persistence.load()
-        if payload is None and cfg.allow_sample_fallback:
+        if decision_at is not None and (payload is None or payload.as_of > decision_at):
+            replay = getattr(persistence, "load_at", None)
+            if replay is not None:
+                archived = await asyncio.to_thread(replay, decision_at)
+                if archived is not None:
+                    payload = archived
+        if payload is None and cfg.allow_sample_fallback and decision_at is None:
             app.state.last_error = "synthetic_fallback:cache_miss"
             payload = _mark_recent_news(
                 build_sample_recent_news(),
@@ -472,6 +515,8 @@ def create_app(
             persistence.save(payload)
         if payload is None:
             raise HTTPException(status_code=503, detail="recent_news_unavailable")
+        if decision_at is not None:
+            payload = payload.visible_at(decision_at)
         query = (q or "").strip().lower()
         items = payload.items
         if query:
@@ -480,7 +525,7 @@ def create_app(
             items = filtered
         data = payload.model_dump()
         data["items"] = [item.model_dump() for item in items[:limit]]
-        return _with_freshness(RecentNewsResponse(**data))
+        return _with_freshness(RecentNewsResponse(**data), now=decision_at)
 
     return app
 

@@ -11,13 +11,14 @@ Everything degrades explicitly: each block is either present or listed in
 """
 from __future__ import annotations
 
+import os
+from pathlib import Path
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 DEFAULT_TTL_SECONDS = 6 * 3600
-_FIT_WINDOW_OBS = 1500  # fit the HMM on the recent window; EM stays sub-second
 # Daily EOD data is "fresh" if the last close is within a few days (a long
 # weekend + a settlement lag). Beyond this the /quant page must say so.
 DATA_STALE_AFTER_DAYS = 4
@@ -43,6 +44,31 @@ class LocalQuantContext:
             self._cache = self._compute()
             self._computed_at = time.time()
             return self._cache
+
+    def get_context_at(self, decision_at: datetime) -> Dict[str, Any]:
+        """Expose the cached research only after its date-only data is visible."""
+        context = self.get_context()
+        data_asof = context.get("data_asof")
+        if data_asof and datetime.fromisoformat(data_asof).replace(tzinfo=timezone.utc) + timedelta(days=1) > decision_at:
+            return {"degraded": {"market_data": "research_snapshot_after_decision"}}
+        context = dict(context)
+        if data_asof:
+            from risk_review import read_risk_review
+
+            review_path = Path(os.environ.get("GOLD_RISK_REVIEW_PATH") or "data_cache/gold_risk_review.json")
+            review = read_risk_review(review_path, decision_at=decision_at, data_asof=data_asof)
+            if review:
+                context["risk_review"] = review
+        if context.get("gold_drivers"):
+            from gold_drivers import flow_snapshot_at
+
+            flow_path = Path(os.environ.get("GOLD_DRIVER_FLOWS_PATH") or "data_cache/gold_driver_flows.csv")
+            context["gold_drivers"] = {
+                **context["gold_drivers"],
+                "flows": flow_snapshot_at(flow_path, decision_at),
+                "flow_cutoff": decision_at.isoformat(),
+            }
+        return context
 
     def invalidate(self, *, min_age_seconds: float = 0.0) -> bool:
         """Drop the cache so the next request recomputes (event-driven
@@ -72,9 +98,16 @@ class LocalQuantContext:
         context: Dict[str, Any] = {"degraded": {}, "computed_at": time.time()}
 
         try:
-            from data_sources import EXTENDED_DATA_PATH, load_market_data
+            from data_loader import market_data_as_of
+            from data_sources import EXTENDED_DATA_PATH, FRED_SERIES, load_market_data
 
-            raw, source = load_market_data()
+            raw, source = load_market_data(require_macro_vintages=True)
+            raw = market_data_as_of(raw, datetime.now(timezone.utc))
+            if raw.empty:
+                raise ValueError("no completed research bars")
+            missing_macro = sorted(set(FRED_SERIES) - set(raw.columns))
+            if missing_macro:
+                context["degraded"]["macro_vintages"] = "unavailable:" + ",".join(missing_macro)
             context["data_source"] = source
             asof = pd.Timestamp(raw.index.max())
             context["data_span"] = [
@@ -125,26 +158,20 @@ class LocalQuantContext:
 
         gold = raw["Gold"].astype(float).dropna()
 
-        # --- HMM regime posterior (fitted on the recent window) ----------
+        # --- HMM regime posterior -----------------------------------------
         model = None
+        regime_prices = gold.iloc[-700:]
         try:
-            from regime_probabilistic import GaussianHMM, STATE_LABELS, regime_features
+            from regime_probabilistic import regime_features, walk_forward_regime
 
-            feats = regime_features(gold.iloc[-_FIT_WINDOW_OBS:])
-            if len(feats) >= 400:
-                model = GaussianHMM(n_states=3, max_iter=40).fit(feats.values)
-                gamma = model.posterior(feats.values)
-                labels = [STATE_LABELS[k] for k in range(3)]
-                tail = gamma[-260:]
+            states, model = walk_forward_regime(regime_features(regime_prices), min_train=400, refit_every=126)
+            if not states.empty:
+                tail = states.iloc[-260:]
                 context["regime_posterior"] = {
-                    "latest": {
-                        labels[k]: round(float(gamma[-1, k]), 4) for k in range(3)
-                    },
-                    "dates_tail": [str(d.date()) for d in feats.index[-260:]],
-                    "series_tail": {
-                        labels[k]: [round(float(x), 4) for x in tail[:, k]]
-                        for k in range(3)
-                    },
+                    "method": "walk_forward_filtered",
+                    "latest": {name: round(float(value), 4) for name, value in tail.iloc[-1].items()},
+                    "dates_tail": [str(d.date()) for d in tail.index],
+                    "series_tail": {name: tail[name].round(4).tolist() for name in tail},
                 }
             else:
                 context["degraded"]["regime_posterior"] = "insufficient_history"
@@ -152,7 +179,6 @@ class LocalQuantContext:
             context["degraded"]["regime_posterior"] = f"{type(exc).__name__}: {exc}"
 
         # --- Fair-value anchor -------------------------------------------
-        deviation_pct = None
         try:
             from fair_value import fit_fair_value
 
@@ -160,7 +186,7 @@ class LocalQuantContext:
             if fv is not None:
                 context["fair_value"] = fv.as_dict()
                 context["fair_value"]["deviation_series_tail"] = fv.deviation_series_tail
-                deviation_pct = fv.deviation_pct
+                context["degraded"]["valuation_allocation_tilt"] = "awaiting_independent_validation"
             else:
                 context["degraded"]["fair_value"] = "macro_columns_or_history_missing"
         except Exception as exc:
@@ -180,24 +206,47 @@ class LocalQuantContext:
 
         # --- Macro factor snapshot ----------------------------------------
         try:
-            from strategy_macro import build_factor_signals
+            from strategy_macro import FACTOR_CARDS, build_factor_signals, driver_attribution
 
             signals, used = build_factor_signals(raw)
             latest = signals.iloc[-1]
             context["macro_factors"] = {
                 "factors_used": used,
+                "cards": {name: FACTOR_CARDS[name] for name in used},
                 "latest": {k: round(float(latest[k]), 4) for k in used},
                 "composite": round(float(latest[used].mean()), 4),
             }
         except Exception as exc:
             context["degraded"]["macro_factors"] = f"{type(exc).__name__}: {exc}"
 
+        try:
+            attribution = driver_attribution(raw)
+            if attribution is not None and attribution.index[-1] == raw.index[-1]:
+                context["driver_attribution"] = {
+                    "data_asof": str(attribution.index[-1].date()),
+                    "method": "contemporaneous_log_return",
+                    "training_observations": 252,
+                    "latest": {name: round(float(value), 8) for name, value in attribution.iloc[-1].items()},
+                }
+            else:
+                context["degraded"]["driver_attribution"] = "insufficient_current_driver_history"
+        except Exception as exc:
+            context["degraded"]["driver_attribution"] = type(exc).__name__
+
+        try:
+            from gold_drivers import build_gold_drivers
+
+            flow_file = Path(os.environ.get("GOLD_DRIVER_FLOWS_PATH") or "data_cache/gold_driver_flows.csv")
+            context["gold_drivers"] = build_gold_drivers(raw, flow_path=flow_file)
+        except Exception as exc:
+            context["degraded"]["gold_drivers"] = type(exc).__name__
+
         # --- Monte Carlo scenario cone -------------------------------------
         try:
             from allocation import monte_carlo_cone
 
             cone = monte_carlo_cone(
-                gold.iloc[-_FIT_WINDOW_OBS:],
+                regime_prices,
                 horizon_days=90,
                 n_paths=1500,
                 checkpoints=(30, 90),
@@ -247,7 +296,6 @@ class LocalQuantContext:
                 profile: allocation_range(
                     profile,
                     regime_posterior=posterior,
-                    valuation_deviation_pct=deviation_pct,
                 ).as_dict()
                 for profile in ("conservative", "balanced", "aggressive")
             }

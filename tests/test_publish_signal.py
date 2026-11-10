@@ -56,3 +56,10 @@ def test_cli_main_returns_zero(tmp_path, monkeypatch):
     # Second run: idempotent, still exit 0, still one line.
     assert cli_main(["--no-digest"]) == 0
     assert len(ledger_path.read_text().strip().splitlines()) == 1
+
+
+def test_stale_context_cannot_create_a_shadow_publication():
+    store = MemoryLedgerStore()
+    with pytest.raises(ValueError, match="stale"):
+        publish_once(store=store, ctx={**_ctx(), "data_stale": True}, now=MON)
+    assert store.load_all() == []

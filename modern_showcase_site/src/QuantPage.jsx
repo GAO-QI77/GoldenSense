@@ -23,6 +23,7 @@ import { addSearchEntries } from './searchIndex';
 import { ActiveCaseRibbon, ModelGovernancePanel } from './ResearchCasePanel';
 import { dedupeOutcomes, presentHalfLife } from './presentationPolicy';
 import { useViewMode } from './viewMode';
+import { forecastWindowLabel } from './horizons';
 
 const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
 const RESEARCH_URL =
@@ -87,10 +88,12 @@ export default function QuantPage() {
   const [research, setResearch] = useState(null);
   const [calibration, setCalibration] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [slowLoading, setSlowLoading] = useState(false);
   const [error, setError] = useState('');
 
   useEffect(() => {
     const controller = new AbortController();
+    const slowTimer = window.setTimeout(() => setSlowLoading(true), 5_000);
     async function load() {
       setLoading(true);
       setError('');
@@ -106,11 +109,18 @@ export default function QuantPage() {
           setError(loadError.message || '量化研究数据读取失败');
         }
       } finally {
-        if (!controller.signal.aborted) setLoading(false);
+        window.clearTimeout(slowTimer);
+        if (!controller.signal.aborted) {
+          setLoading(false);
+          setSlowLoading(false);
+        }
       }
     }
     load();
-    return () => controller.abort();
+    return () => {
+      window.clearTimeout(slowTimer);
+      controller.abort();
+    };
   }, []);
 
   useEffect(() => {
@@ -161,6 +171,22 @@ export default function QuantPage() {
         </div>
       )}
 
+      {loading && (
+        <div className={`quant-loading-note ${slowLoading ? 'is-slow' : ''}`} role="status">
+          <Loader2 size={18} className="spin" />
+          <div>
+            <strong>
+              {slowLoading ? '首次打开正在唤醒研究服务' : '正在读取量化研究数据'}
+            </strong>
+            <p>
+              {slowLoading
+                ? '长历史模型需要完成冷启动计算，通常约 30-60 秒；页面会自动更新，无需重复刷新。'
+                : '正在连接长历史数据、状态模型与校准服务。'}
+            </p>
+          </div>
+        </div>
+      )}
+
       {!error && research?.flagship && <FlagshipHero flagship={research.flagship} isPro={isPro} />}
 
       {!error && research && <DataFreshnessBanner research={research} />}
@@ -170,8 +196,14 @@ export default function QuantPage() {
           <RegimePanel regime={research?.regime_posterior} degraded={degraded.regime_posterior} isPro={isPro} />
           <ConePanel cone={research?.scenario_cone} degraded={degraded.scenario_cone} isPro={isPro} />
           <FairValuePanel fairValue={research?.fair_value} degraded={degraded.fair_value} isPro={isPro} />
-          <FactorPanel factors={research?.macro_factors} degraded={degraded.macro_factors} />
-          <VolPanel volBands={research?.vol_bands} degraded={degraded.vol_bands} isPro={isPro} />
+          <FactorPanel
+            factors={research?.macro_factors}
+            attribution={research?.driver_attribution}
+            degraded={degraded.macro_factors}
+            macroDegraded={Boolean(degraded.macro_vintages)}
+          />
+          <VolPanel volBands={research?.vol_bands} degraded={degraded.vol_bands} riskReview={research?.risk_review} isPro={isPro} />
+          {research?.gold_drivers && <GoldDriverEvidencePanel drivers={research.gold_drivers} />}
           <AllocationPanel allocation={research?.allocation} degraded={degraded.allocation} isPro={isPro} />
           <CalibrationPanel calibration={calibration} isPro={isPro} />
         </div>
@@ -562,6 +594,9 @@ function ConePanel({ cone, degraded, isPro }) {
 function FairValuePanel({ fairValue, degraded, isPro }) {
   const deviation = fairValue?.deviation_pct;
   const structuralBreak = Boolean(fairValue?.regime_break) || Math.abs(Number(deviation)) > 50;
+  const conditionalAnchor = fairValue?.anchor_status === 'conditional';
+  const anchorLabel = conditionalAnchor ? '利率与美元条件锚' : '宏观公允价值锚';
+  const halfLife = presentHalfLife(conditionalAnchor ? null : fairValue?.half_life_days);
   const tail = fairValue?.deviation_series_tail || [];
   const spark = useMemo(() => {
     if (tail.length < 2) return null;
@@ -580,12 +615,14 @@ function FairValuePanel({ fairValue, degraded, isPro }) {
   }, [tail]);
 
   const quartiles = fairValue?.quartile_forward_returns || {};
+  const quartileCounts = fairValue?.quartile_sample_counts || {};
+  const stress = fairValue?.stress_scenarios_pct;
 
   return (
     <PanelShell
       id="panel-fair-value"
       icon={Gauge}
-      title="宏观公允价值锚"
+      title={anchorLabel}
       subtitle={isPro ? 'log(金价) ~ 实际利率 + 美元指数，滚动十年窗口误差修正框架' : '对比金价与实际利率、美元长期关系，用于识别结构性偏离。'}
       degraded={degraded}
     >
@@ -594,7 +631,7 @@ function FairValuePanel({ fairValue, degraded, isPro }) {
         const tone = regimeBreak ? 'break' : deviation >= 0 ? 'rich' : 'cheap';
         const label = regimeBreak
           ? '结构性偏离期'
-          : `相对宏观公允值（${deviation >= 0 ? '偏贵' : '偏便宜'}）`;
+          : `相对${anchorLabel}（${deviation >= 0 ? '偏贵' : '偏便宜'}）`;
         return (
           <div className="fair-value-hero">
             <div>
@@ -610,7 +647,7 @@ function FairValuePanel({ fairValue, degraded, isPro }) {
             </div>
             <dl className="fair-value-meta">
               <div>
-                <dt>模型公允值</dt>
+                <dt>{conditionalAnchor ? '条件锚估值' : '模型公允值'}</dt>
                 <dd>{fmt.price(fairValue?.fair_value)}</dd>
               </div>
               <div>
@@ -623,7 +660,7 @@ function FairValuePanel({ fairValue, degraded, isPro }) {
               </div>
               <div>
                 <dt>误差修正半衰期</dt>
-                <dd>{presentHalfLife(fairValue?.half_life_days).label}</dd>
+                <dd>{halfLife.label}</dd>
               </div>
             </dl>
           </div>
@@ -633,7 +670,9 @@ function FairValuePanel({ fairValue, degraded, isPro }) {
       {fairValue && (
         <p className={`fair-value-interpretation${structuralBreak ? ' is-break' : ''}`}>
           {structuralBreak && <AlertTriangle size={14} />}
-          {structuralBreak ? '估值关系显著偏离，暂停均值回归解释，先检查结构变化与数据口径。' : fairValue.interpretation}
+          {structuralBreak
+            ? '估值关系显著偏离，暂停均值回归解释，先检查结构变化与数据口径。'
+            : fairValue.interpretation}
         </p>
       )}
       {spark && (
@@ -646,23 +685,45 @@ function FairValuePanel({ fairValue, degraded, isPro }) {
         </figure>
       )}
       <div className="quartile-card">
-        <h3>历史证据：按偏离四分位的 12 个月远期回报均值</h3>
+        <h3>走前估值分组的后续回报</h3>
+        <p className="quant-note">
+          {fairValue?.forward_horizon_days ?? 252} 个观测窗口。每月沿用此前样本拟合的估值模型和分组阈值。
+        </p>
         <div className="quartile-row">
           {['q1_cheapest', 'q2', 'q3', 'q4_richest'].map((key) => (
             <div key={key} className="quartile-cell">
               <small>{{ q1_cheapest: '最便宜', q2: 'Q2', q3: 'Q3', q4_richest: '最贵' }[key]}</small>
               <strong>{quartiles[key] != null ? fmt.pct(quartiles[key], 1) : '—'}</strong>
+              {quartileCounts[key] != null && <small>{quartileCounts[key]} 个成熟样本</small>}
             </div>
           ))}
         </div>
-        <p className="quant-note">注意：2022 年后央行购金抬升了结构性需求，估值锚采用滚动窗口以适应机制变化。</p>
+        {stress && (
+          <div>
+            <h3>长期估值压力情景</h3>
+            <p className="quant-note">
+              实际利率上行 100 个基点 {fmt.pctRaw(stress.real_yield_up_100bp)} ·
+              美元上涨 5% {fmt.pctRaw(stress.dollar_up_5pct)} ·
+              两项同时发生 {fmt.pctRaw(stress.joint_up)}
+            </p>
+          </div>
+        )}
       </div>
     </PanelShell>
   );
 }
 
 /* ------------------------------ factors ---------------------------------- */
-function FactorPanel({ factors, degraded }) {
+const DRIVER_LABELS = {
+  actual: '黄金实现变动',
+  intercept: '基准项',
+  dollar: '美元',
+  real_rate: '实际利率',
+  breakeven: '通胀预期',
+  residual: '未解释项',
+};
+
+function FactorPanel({ factors, attribution, degraded, macroDegraded }) {
   const latest = factors?.latest || {};
   const used = factors?.factors_used || [];
   return (
@@ -670,9 +731,10 @@ function FactorPanel({ factors, degraded }) {
       id="panel-factors"
       icon={Layers}
       title="宏观因子面板"
-      subtitle={`中期组合的四个先验因子；当前组合得分 ${factors ? fmt.num(factors.composite, 2) : '—'} / 1.00`}
+      subtitle={`中期固定规则因子 · 当前可用因子组合得分 ${factors ? fmt.num(factors.composite, 2) : '—'} / 1.00`}
       degraded={degraded}
     >
+      {macroDegraded && <p className="quant-note">部分宏观历史版本缺失。当前展示已有来源的因子和归因。</p>}
       <ul className="factor-list">
         {used.map((key) => {
           const meta = FACTOR_LABELS[key] || { label: key, hint: '' };
@@ -682,22 +744,118 @@ function FactorPanel({ factors, degraded }) {
               <span className="factor-light" aria-hidden="true" />
               <div>
                 <strong>{meta.label}</strong>
-                <small>{meta.hint}</small>
+                <small>{meta.hint}{factors?.cards?.[key]?.source ? ` · ${factors.cards[key].source}` : ''}</small>
               </div>
               <span className="factor-state">{on ? '利多' : '未触发'}</span>
             </li>
           );
         })}
       </ul>
-      <p className="quant-note">
-        因子参数全部先验设定（未对本数据拟合），并经 2004 年以来含成本回测评估；资金流为成交额代理。
-      </p>
+      {attribution?.latest && (
+        <div className="quartile-card">
+          <h3>当期驱动归因</h3>
+          <p className="quant-note">{attribution.data_asof} · 当期对数收益分解，系数由此前样本估计。</p>
+          <div className="quartile-row">
+            {Object.entries(DRIVER_LABELS).filter(([key]) => attribution.latest[key] != null).map(([key, label]) => (
+              <div key={key} className="quartile-cell">
+                <small>{label}</small>
+                <strong>{fmt.pct(attribution.latest[key], 2)}</strong>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </PanelShell>
+  );
+}
+
+function GoldDriverEvidencePanel({ drivers }) {
+  const groups = drivers.oil_rate_conditions?.groups || [];
+  const sensitivity = drivers.rate_sensitivity;
+  const flowLabels = { unavailable: '缺少已发布数据', stale: '最近数据已过期', invalid_archive: '档案校验失败' };
+  return (
+    <PanelShell
+      id="panel-gold-driver-evidence"
+      icon={Layers}
+      title="黄金驱动证据"
+      subtitle={`研究数据截至 ${drivers.data_asof || '—'}`}
+      wide
+    >
+      <div className="quartile-card">
+        <h3>短期 · 油价与实际利率组合</h3>
+        <p className="quant-note">使用项目原油日线口径。第 10 百分位描述黄金同期历史下尾。</p>
+        {groups.length > 0 ? (
+          <div className="quartile-row">
+            {groups.map((group) => (
+              <div key={`${group.oil}-${group.real_rate}`} className="quartile-cell">
+                <small>油价{group.oil === 'up' ? '涨' : '跌'} · 实际利率{group.real_rate === 'up' ? '升' : '降'}</small>
+                <strong>{fmt.pct(group.p10, 2)}</strong>
+                <small>{group.n} 个观测 · 均值 {fmt.pct(group.mean, 2)}</small>
+              </div>
+            ))}
+          </div>
+        ) : <p className="quant-note">缺少可比较的实际利率或联合样本。</p>}
+      </div>
+      <div className="quartile-card">
+        <h3>中期 · 资金与持仓</h3>
+        <div className="quartile-row">
+          {Object.entries(drivers.flows || {}).map(([key, item]) => (
+            <div key={key} className="quartile-cell">
+              <small>{item.label}</small>
+              <strong>{item.status === 'ok' ? `${fmt.num(item.value, 1)} ${item.unit}` : flowLabels[item.status]}</strong>
+              {item.status === 'ok' && <small>观察期 {item.observation_date}</small>}
+              {item.source_url && <a href={item.source_url} target="_blank" rel="noopener noreferrer">数据来源</a>}
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="quartile-card">
+        <h3>长期 · 实际利率敏感度</h3>
+        <p className="quant-note">
+          {sensitivity
+            ? `控制美元后，每上升 100 基点对应的黄金同期对数收益变化，前窗 ${fmt.num(sensitivity.prior_log_pct_per_100bp)}、近窗 ${fmt.num(sensitivity.recent_log_pct_per_100bp)} 个百分点。每窗 ${sensitivity.window_observations} 个观测。`
+            : '缺少可比较的实际利率与美元样本。'}
+        </p>
+      </div>
     </PanelShell>
   );
 }
 
 /* -------------------------------- vol ------------------------------------ */
-function VolPanel({ volBands, degraded, isPro }) {
+const riskBlockerLabels = {
+  session_timestamps_missing: '缺少核验会话',
+  evaluation_start_missing: '缺少留出起点',
+  insufficient_mature_bands: '成熟样本不足',
+  coverage_or_tail_failed: '覆盖率或尾部未达标',
+  incremental_error_not_demonstrated: '误差改善尚待验证',
+};
+
+function RiskCandidateReview({ review }) {
+  if (!review?.windows) return null;
+  return (
+    <div className="quartile-card">
+      <h3>短期风险候选复验</h3>
+      <p className="quant-note">GC=F · 样本截至 {review.price_end}。覆盖率按成熟收益评分。</p>
+      <div className="quartile-row">
+        {Object.entries(review.windows).map(([window, candidates]) => (
+          <div key={window} className="quartile-cell">
+            <small>{window} 个观测窗口</small>
+            {Object.entries(candidates).map(([name, candidate]) => (
+              <div key={name}>
+                <strong>{fmt.pct(candidate.coverage, 1)}</strong>
+                <small>{name === 'log_har' ? 'log-HAR' : 'log-HAR 加成熟误差校准'}</small>
+                <small>{candidate.n} 个成熟样本 · {candidate.status === 'hold' ? '暂缓晋级' : '待独立评审'}</small>
+                <small>{(candidate.blockers || []).map((flag) => riskBlockerLabels[flag] || flag).join('、')}</small>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function VolPanel({ volBands, degraded, riskReview, isPro }) {
   const rows = [
     ['h1', '1 日'],
     ['h5', '5 日'],
@@ -741,8 +899,9 @@ function VolPanel({ volBands, degraded, isPro }) {
         })}
       </div>
       <p className="quant-note">
-        短期层不预测方向（已被走前验证证伪），改为输出可校验的收益分布：P10 / P50 / P90。
+        短期层不预测方向（走前验证的方向证据不足），改为输出可校验的收益分布：P10 / P50 / P90。
       </p>
+      {isPro && <RiskCandidateReview review={riskReview} />}
     </PanelShell>
   );
 }
@@ -855,7 +1014,7 @@ function CalibrationPanel({ calibration, isPro }) {
                   <span className={`calib-hit ${o.hit === true ? 'hit' : o.hit === false ? 'miss' : ''}`}>
                     {o.hit === true ? '命中' : o.hit === false ? '未中' : '观望'}
                   </span>
-                  <span className="calib-stance">{o.stance} · {o.horizon}</span>
+                  <span className="calib-stance">{o.stance} · {forecastWindowLabel(o.horizon)}</span>
                   <span className="calib-return">{fmt.pct(o.realized_return, 2)}</span>
                   <span className="calib-date">{String(o.created_at).slice(0, 10)}</span>
                 </div>
