@@ -1,4 +1,8 @@
 """Tests for the immutable weekly signal ledger and its shadow-portfolio scoring."""
+import json
+import threading
+import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -6,13 +10,114 @@ import pytest
 
 from signal_ledger import (
     JsonlLedgerStore,
+    LedgerIntegrityError,
+    LedgerUnavailableError,
     MemoryLedgerStore,
+    PostgresLedgerStore,
+    StalePublicationDataError,
+    build_ledger_store,
     build_publication,
     publication_id_for,
     publish_weekly,
     score_track_record,
     verify_publication,
 )
+
+
+def _normalized_sql(value: str) -> str:
+    return " ".join(value.lower().split())
+
+
+class _FakeCursor:
+    def __init__(self, adapter):
+        self._adapter = adapter
+        self._result = []
+        self.closed = False
+        self.rowcount = -1
+
+    def execute(self, sql, params=None):
+        normalized = _normalized_sql(sql)
+        self._adapter.statements.append((normalized, params))
+        if self._adapter.fail_on and self._adapter.fail_on in normalized:
+            raise RuntimeError("adapter failure containing a secret DSN")
+        if normalized.startswith("insert into signal_publications"):
+            publication_id, published_at, payload = params
+            record = json.loads(payload)
+            with self._adapter.lock:
+                inserted = publication_id not in self._adapter.rows
+                self._adapter.rows.setdefault(
+                    publication_id, (publication_id, published_at, record)
+                )
+                self.rowcount = 1 if inserted else 0
+        elif normalized.startswith("select publication_id"):
+            barrier = None
+            with self._adapter.lock:
+                self._result = sorted(
+                    self._adapter.rows.values(), key=lambda row: row[1]
+                )
+                self._adapter.select_calls += 1
+                if self._adapter.select_calls <= 2:
+                    barrier = self._adapter.initial_select_barrier
+            if barrier is not None:
+                barrier.wait(timeout=2)
+
+    def fetchall(self):
+        return list(self._result)
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeConnection:
+    def __init__(self, adapter):
+        self._adapter = adapter
+        self.cursors = []
+        self.commits = 0
+        self.rollbacks = 0
+        self.closed = False
+
+    def cursor(self):
+        cursor = _FakeCursor(self._adapter)
+        self.cursors.append(cursor)
+        return cursor
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+    def close(self):
+        self.closed = True
+
+
+class _FakePostgresAdapter:
+    def __init__(self):
+        self.connections = []
+        self.connect_kwargs = []
+        self.statements = []
+        self.rows = {}
+        self.lock = threading.Lock()
+        self.fail_on = None
+        self.initial_select_barrier = None
+        self.select_calls = 0
+
+    def connect(self, database_url, **kwargs):
+        assert database_url == "postgresql://ignored-in-tests"
+        self.connect_kwargs.append(kwargs)
+        connection = _FakeConnection(self)
+        self.connections.append(connection)
+        return connection
+
+
+def _postgres_store(adapter: _FakePostgresAdapter) -> PostgresLedgerStore:
+    return PostgresLedgerStore(
+        "postgresql://ignored-in-tests",
+        connect=adapter.connect,
+        jsonb_wrapper=lambda payload: json.dumps(
+            payload, ensure_ascii=False, sort_keys=True
+        ),
+    )
 
 
 def _ctx() -> dict:
@@ -85,6 +190,19 @@ def test_publish_weekly_idempotent():
     assert len(store.load_all()) == 1
 
 
+@pytest.mark.parametrize("stale_fields", [{"data_stale": True}, {"degraded": {"market_data": "unavailable"}}])
+def test_stale_context_only_allows_existing_publication(stale_fields):
+    store = MemoryLedgerStore()
+    stale_ctx = {**_ctx(), **stale_fields}
+
+    with pytest.raises(StalePublicationDataError, match="stale or unavailable"):
+        publish_weekly(store, stale_ctx, now=MON)
+    assert store.load_all() == []
+
+    first, _created = publish_weekly(store, _ctx(), now=MON)
+    assert publish_weekly(store, stale_ctx, now=MON) == (first, False)
+
+
 def test_jsonl_store_append_only(tmp_path):
     path = tmp_path / "ledger.jsonl"
     store = JsonlLedgerStore(path)
@@ -99,6 +217,233 @@ def test_jsonl_store_append_only(tmp_path):
     # Reload from disk round-trips.
     reloaded = JsonlLedgerStore(path).load_all()
     assert [r["publication_id"] for r in reloaded] == ["2026-W29", "2026-W30"]
+
+
+def test_postgres_store_initializes_exact_append_only_schema():
+    adapter = _FakePostgresAdapter()
+
+    _postgres_store(adapter)
+
+    assert adapter.statements == [
+        (
+            "create table if not exists signal_publications( publication_id text primary key, published_at timestamptz not null, payload jsonb not null )",
+            None,
+        )
+    ]
+    connection = adapter.connections[0]
+    assert connection.commits == 1
+    assert connection.rollbacks == 0
+    assert connection.closed is True
+    assert all(cursor.closed for cursor in connection.cursors)
+
+
+def test_postgres_connections_enforce_a_bounded_timeout():
+    adapter = _FakePostgresAdapter()
+
+    PostgresLedgerStore(
+        "postgresql://ignored-in-tests",
+        connect=adapter.connect,
+        connect_timeout_seconds=4,
+        jsonb_wrapper=lambda payload: json.dumps(payload),
+    )
+
+    assert adapter.connect_kwargs == [
+        {
+            "connect_timeout": 4,
+            "options": (
+                "-c statement_timeout=4000 "
+                "-c lock_timeout=4000 "
+                "-c idle_in_transaction_session_timeout=4000"
+            ),
+            "tcp_user_timeout": 4000,
+        }
+    ]
+
+
+def test_postgres_healthcheck_executes_select_one():
+    adapter = _FakePostgresAdapter()
+    store = _postgres_store(adapter)
+
+    assert store.healthcheck() is True
+    assert adapter.statements[-1] == ("select 1", None)
+
+
+def test_store_factory_uses_jsonl_only_in_explicit_development(tmp_path):
+    selected = build_ledger_store(
+        app_env="development",
+        database_url=None,
+        jsonl_path=tmp_path / "ledger.jsonl",
+    )
+
+    assert isinstance(selected, JsonlLedgerStore)
+
+
+def test_store_factory_requires_postgres_outside_development():
+    with pytest.raises(LedgerUnavailableError):
+        build_ledger_store(
+            app_env="production",
+            database_url=None,
+            jsonl_path="ignored.jsonl",
+        )
+
+
+def test_store_factory_selects_injected_postgres_factory():
+    selected = MemoryLedgerStore()
+    calls = []
+
+    result = build_ledger_store(
+        app_env="demo",
+        database_url="postgresql://ledger.example/app",
+        jsonl_path="ignored.jsonl",
+        connect_timeout_seconds=3,
+        postgres_store_factory=lambda url, **kwargs: calls.append((url, kwargs))
+        or selected,
+    )
+
+    assert result is selected
+    assert calls == [
+        ("postgresql://ledger.example/app", {"connect_timeout_seconds": 3})
+    ]
+
+
+def test_postgres_append_uses_conflict_safe_insert_and_jsonb_serialization():
+    adapter = _FakePostgresAdapter()
+    store = _postgres_store(adapter)
+    record = build_publication(_ctx(), now=MON)
+
+    store.append(record)
+    store.append(record)
+
+    inserts = [
+        (sql, params)
+        for sql, params in adapter.statements
+        if sql.startswith("insert into signal_publications")
+    ]
+    assert len(inserts) == 2
+    assert all(
+        "on conflict (publication_id) do nothing" in sql for sql, _params in inserts
+    )
+    assert json.loads(inserts[0][1][2]) == record
+    assert list(adapter.rows) == ["2026-W29"]
+    assert all(connection.commits == 1 for connection in adapter.connections)
+    assert all(connection.closed for connection in adapter.connections)
+    assert all(
+        cursor.closed
+        for connection in adapter.connections
+        for cursor in connection.cursors
+    )
+
+
+def test_postgres_load_all_returns_validated_payloads_ordered_by_published_at():
+    adapter = _FakePostgresAdapter()
+    store = _postgres_store(adapter)
+    later = build_publication(_ctx(), now=NEXT_MON)
+    earlier = build_publication(_ctx(), now=MON)
+    store.append(later)
+    store.append(earlier)
+
+    records = store.load_all()
+
+    assert [record["publication_id"] for record in records] == [
+        "2026-W29",
+        "2026-W30",
+    ]
+    select_sql = [
+        sql for sql, _params in adapter.statements if sql.startswith("select publication_id")
+    ]
+    assert select_sql == [
+        "select publication_id, published_at, payload from signal_publications order by published_at asc"
+    ]
+    load_connection = adapter.connections[-1]
+    assert load_connection.commits == 1
+    assert load_connection.closed is True
+    assert all(cursor.closed for cursor in load_connection.cursors)
+
+
+@pytest.mark.parametrize(
+    "bad_payload",
+    [
+        "not-json",
+        {"publication_id": "2026-W29", "published_at": MON.isoformat()},
+        {
+            **build_publication(_ctx(), now=MON),
+            "publication_id": "different-id",
+        },
+    ],
+)
+def test_postgres_load_all_rejects_malformed_or_tampered_rows(bad_payload):
+    adapter = _FakePostgresAdapter()
+    store = _postgres_store(adapter)
+    adapter.rows["2026-W29"] = ("2026-W29", MON.isoformat(), bad_payload)
+
+    with pytest.raises(LedgerIntegrityError):
+        store.load_all()
+
+    connection = adapter.connections[-1]
+    assert connection.rollbacks == 1
+    assert connection.closed is True
+    assert all(cursor.closed for cursor in connection.cursors)
+
+
+def test_postgres_transaction_failure_rolls_back_and_closes_resources():
+    adapter = _FakePostgresAdapter()
+    store = _postgres_store(adapter)
+    adapter.fail_on = "insert into signal_publications"
+
+    with pytest.raises(LedgerUnavailableError) as exc_info:
+        store.append(build_publication(_ctx(), now=MON))
+
+    formatted = "".join(
+        traceback.format_exception(
+            exc_info.type, exc_info.value, exc_info.tb, chain=True
+        )
+    )
+    assert "secret DSN" not in str(exc_info.value)
+    assert "secret DSN" not in formatted
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+    connection = adapter.connections[-1]
+    assert connection.commits == 0
+    assert connection.rollbacks == 1
+    assert connection.closed is True
+    assert all(cursor.closed for cursor in connection.cursors)
+
+
+def test_postgres_concurrent_append_keeps_one_publication_per_id():
+    adapter = _FakePostgresAdapter()
+    store = _postgres_store(adapter)
+    record = build_publication(_ctx(), now=MON)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(store.append, record) for _ in range(2)]
+        for future in futures:
+            future.result()
+
+    assert list(adapter.rows) == ["2026-W29"]
+    assert store.load_all() == [record]
+
+
+def test_postgres_concurrent_publish_reports_one_creator_and_one_existing_record():
+    adapter = _FakePostgresAdapter()
+    adapter.initial_select_barrier = threading.Barrier(2)
+    store = _postgres_store(adapter)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(publish_weekly, store, _ctx(), now=MON),
+            executor.submit(
+                publish_weekly,
+                store,
+                _ctx(),
+                now=MON + pd.Timedelta(hours=1),
+            ),
+        ]
+        results = [future.result() for future in futures]
+
+    assert sum(created for _record, created in results) == 1
+    assert results[0][0] == results[1][0] == store.load_all()[0]
+    assert list(adapter.rows) == ["2026-W29"]
 
 
 # --------------------------------------------------------------------------- #
@@ -172,8 +517,6 @@ def test_track_record_rebalances_from_drift_and_ignores_unavailable_prices():
 
 
 def test_signal_publication_is_idempotent_across_concurrent_store_instances(tmp_path):
-    from concurrent.futures import ThreadPoolExecutor
-
     path = tmp_path / "shared.jsonl"
     with ThreadPoolExecutor(max_workers=8) as pool:
         outcomes = list(pool.map(

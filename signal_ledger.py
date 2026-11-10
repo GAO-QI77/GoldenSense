@@ -28,7 +28,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Tuple
 
 import pandas as pd
 
@@ -48,9 +48,21 @@ WEEKS_PER_YEAR = 52
 # Stores
 # --------------------------------------------------------------------------- #
 class LedgerStore(Protocol):
-    def append(self, record: Dict[str, Any]) -> None: ...
+    def append(self, record: Dict[str, Any]) -> Optional[bool]: ...
     def load_all(self) -> List[Dict[str, Any]]: ...
-    def append_if_absent(self, record: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]: ...
+    def healthcheck(self) -> bool: ...
+
+
+class LedgerIntegrityError(RuntimeError):
+    """Stored publication data failed structural or hash validation."""
+
+
+class LedgerUnavailableError(RuntimeError):
+    """The durable publication ledger cannot currently serve requests."""
+
+
+class StalePublicationDataError(ValueError):
+    """The research context cannot support a new weekly publication."""
 
 
 class MemoryLedgerStore:
@@ -60,21 +72,20 @@ class MemoryLedgerStore:
         self._records: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
 
-    def append(self, record: Dict[str, Any]) -> None:
-        with self._lock:
-            self._records.append(json.loads(json.dumps(record, ensure_ascii=False)))
-
-    def append_if_absent(self, record: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    def append(self, record: Dict[str, Any]) -> bool:
         with self._lock:
             for existing in self._records:
                 if existing["publication_id"] == record["publication_id"]:
-                    return json.loads(json.dumps(existing)), False
-            self._records.append(json.loads(json.dumps(record)))
-            return record, True
+                    return False
+            self._records.append(json.loads(json.dumps(record, ensure_ascii=False)))
+            return True
 
     def load_all(self) -> List[Dict[str, Any]]:
         with self._lock:
             return [dict(r) for r in self._records]
+
+    def healthcheck(self) -> bool:
+        return True
 
 
 class JsonlLedgerStore:
@@ -96,21 +107,16 @@ class JsonlLedgerStore:
         stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         stream.flush()
 
-    def append(self, record: Dict[str, Any]) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._open_locked(writing=True) as stream:
-            self._write(stream, record)
-
-    def append_if_absent(self, record: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    def append(self, record: Dict[str, Any]) -> bool:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._open_locked(writing=True) as stream:
             for line in stream:
                 if line.strip():
                     existing = json.loads(line)
                     if existing["publication_id"] == record["publication_id"]:
-                        return existing, False
+                        return False
             self._write(stream, record)
-            return record, True
+            return True
 
     def load_all(self) -> List[Dict[str, Any]]:
         try:
@@ -118,6 +124,194 @@ class JsonlLedgerStore:
                 return [json.loads(line) for line in stream if line.strip()]
         except FileNotFoundError:
             return []
+
+    def healthcheck(self) -> bool:
+        return True
+
+
+class PostgresLedgerStore:
+    """Append-only PostgreSQL store for immutable weekly publications."""
+
+    _SCHEMA_SQL = """
+        CREATE TABLE IF NOT EXISTS signal_publications(
+            publication_id text primary key,
+            published_at timestamptz not null,
+            payload jsonb not null
+        )
+    """
+    _APPEND_SQL = """
+        INSERT INTO signal_publications (publication_id, published_at, payload)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (publication_id) DO NOTHING
+    """
+    _LOAD_SQL = """
+        SELECT publication_id, published_at, payload
+        FROM signal_publications
+        ORDER BY published_at ASC
+    """
+
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        connect: Optional[Callable[..., Any]] = None,
+        connect_timeout_seconds: int = 5,
+        jsonb_wrapper: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    ) -> None:
+        if not database_url:
+            raise LedgerUnavailableError("Signal publication ledger is unavailable.")
+        self._database_url = database_url
+        self._connect = connect or self._psycopg_connect
+        self._connect_timeout_seconds = max(1, int(connect_timeout_seconds))
+        self._operation_timeout_ms = self._connect_timeout_seconds * 1000
+        self._jsonb_wrapper = jsonb_wrapper or self._psycopg_jsonb
+        self._execute(lambda cursor: cursor.execute(self._SCHEMA_SQL))
+
+    @staticmethod
+    def _psycopg_connect(database_url: str, **kwargs: Any) -> Any:
+        import psycopg
+
+        return psycopg.connect(database_url, **kwargs)
+
+    @staticmethod
+    def _psycopg_jsonb(payload: Dict[str, Any]) -> Any:
+        from psycopg.types.json import Jsonb
+
+        return Jsonb(
+            payload,
+            dumps=lambda value: json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
+        )
+
+    def _execute(self, operation: Callable[[Any], Any]) -> Any:
+        connection = None
+        cursor = None
+        result = None
+        unavailable = False
+        try:
+            connection = self._connect(
+                self._database_url,
+                connect_timeout=self._connect_timeout_seconds,
+                options=(
+                    f"-c statement_timeout={self._operation_timeout_ms} "
+                    f"-c lock_timeout={self._operation_timeout_ms} "
+                    "-c idle_in_transaction_session_timeout="
+                    f"{self._operation_timeout_ms}"
+                ),
+                tcp_user_timeout=self._operation_timeout_ms,
+            )
+            cursor = connection.cursor()
+            result = operation(cursor)
+            connection.commit()
+        except LedgerIntegrityError:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            raise
+        except Exception:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            unavailable = True
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    unavailable = True
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    unavailable = True
+        if unavailable:
+            raise LedgerUnavailableError(
+                "Signal publication ledger is unavailable."
+            ) from None
+        return result
+
+    @staticmethod
+    def _validated_record(
+        publication_id: Any, published_at: Any, payload: Any
+    ) -> Dict[str, Any]:
+        try:
+            if isinstance(payload, (str, bytes, bytearray)):
+                payload = json.loads(payload)
+            if not isinstance(payload, Mapping):
+                raise TypeError("payload is not an object")
+            record = dict(payload)
+            if record.get("publication_id") != publication_id:
+                raise ValueError("publication id mismatch")
+            record_published_at = record.get("published_at")
+            if not isinstance(record_published_at, str) or not record_published_at:
+                raise ValueError("published_at missing")
+            payload_time = datetime.fromisoformat(record_published_at.replace("Z", "+00:00"))
+            row_time = (
+                published_at
+                if isinstance(published_at, datetime)
+                else datetime.fromisoformat(str(published_at).replace("Z", "+00:00"))
+            )
+            if payload_time.tzinfo is None or row_time.tzinfo is None:
+                raise ValueError("published_at must include a timezone")
+            if payload_time.astimezone(timezone.utc) != row_time.astimezone(timezone.utc):
+                raise ValueError("published_at mismatch")
+            if not verify_publication(record):
+                raise ValueError("content hash mismatch")
+            return record
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LedgerIntegrityError(
+                "Stored signal publication failed integrity validation."
+            ) from exc
+
+    def append(self, record: Dict[str, Any]) -> bool:
+        publication_id = record.get("publication_id")
+        published_at = record.get("published_at")
+        self._validated_record(publication_id, published_at, record)
+        payload = self._jsonb_wrapper(record)
+
+        def _append(cursor: Any) -> bool:
+            cursor.execute(
+                self._APPEND_SQL,
+                (publication_id, published_at, payload),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute(_append))
+
+    def load_all(self) -> List[Dict[str, Any]]:
+        def _load(cursor: Any) -> List[Dict[str, Any]]:
+            cursor.execute(self._LOAD_SQL)
+            return [self._validated_record(*row) for row in cursor.fetchall()]
+
+        return self._execute(_load)
+
+    def healthcheck(self) -> bool:
+        self._execute(lambda cursor: cursor.execute("SELECT 1"))
+        return True
+
+
+def build_ledger_store(
+    *,
+    app_env: str,
+    database_url: Optional[str],
+    jsonl_path: str | Path,
+    connect_timeout_seconds: int = 5,
+    postgres_store_factory: Callable[..., LedgerStore] = PostgresLedgerStore,
+) -> LedgerStore:
+    """Select the one ledger backend shared by the API and scheduled jobs."""
+    if app_env.strip().lower() == "development":
+        return JsonlLedgerStore(jsonl_path)
+    if not database_url:
+        raise LedgerUnavailableError("Signal publication ledger is unavailable.")
+    return postgres_store_factory(
+        database_url,
+        connect_timeout_seconds=max(1, int(connect_timeout_seconds)),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -193,13 +387,22 @@ def publish_weekly(
 ) -> Tuple[Dict[str, Any], bool]:
     """Publish this ISO week's record once; republishing returns the original."""
     now = now or datetime.now(timezone.utc)
+    pub_id = publication_id_for(now)
+    for existing in store.load_all():
+        if existing.get("publication_id") == pub_id:
+            return existing, False
     if ctx.get("data_stale") or (ctx.get("degraded") or {}).get("market_data"):
-        for existing in store.load_all():
-            if existing.get("publication_id") == publication_id_for(now):
-                return existing, False
-        raise ValueError("stale or unavailable research data")
+        raise StalePublicationDataError("stale or unavailable research data")
     record = build_publication(ctx, now=now)
-    return store.append_if_absent(record)
+    inserted = store.append(record)
+    if inserted is False:
+        for existing in store.load_all():
+            if existing.get("publication_id") == pub_id:
+                return existing, False
+        raise LedgerIntegrityError(
+            "Conflicting signal publication was not readable after insert."
+        )
+    return record, True
 
 
 # --------------------------------------------------------------------------- #

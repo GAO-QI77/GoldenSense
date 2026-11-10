@@ -126,7 +126,7 @@ REDIS_URL=rediss://...        # Upstash Redis connection string
 
 `APP_ENV=demo` 会显式使用 `yfinance + RSS`，并保留带标记的 fallback。该模式适合公开黑客松体验，不应描述为交易级行情基础设施。
 
-若需要先发布可体验版本，再补齐第三方服务，可以暂时省略 `DEEPSEEK_API_KEY`、`DATABASE_URL` 和 `REDIS_URL`。启动器会使用规则叙事、内存 trace 和显式降级结果。Neon、Upstash 与 DeepSeek 接入后，无需改代码，只需补充环境变量并重新部署。
+公开环境需要可访问的 PostgreSQL 持久化账本和审计连接。账本默认使用 `DATABASE_URL`，也可以通过 `SIGNAL_LEDGER_DATABASE_URL` 指定。LLM 和 Redis 仍可按项目配置选择，缺少 LLM 时用规则叙事。
 
 ### 成本基线
 
@@ -277,8 +277,8 @@ python3 scripts/competition_acceptance.py \
 | `GOLD_RISK_REVIEW_PATH` | 短期候选风险模型的复验摘要 |
 
 `python3 scripts/refresh_data.py` 刷新扩展行情，获取失败时保留上一份有效数据。
-部署时先手动运行一次，可在 Railway 单容器设置 `DATA_REFRESH_ENABLED=1` 启用后续定时刷新，并用
-`DATA_REFRESH_INTERVAL_SECONDS` 调整默认一天的间隔。启用 `GOLD_DRIVER_COT_REFRESH_ENABLED=1`
+Railway 单容器默认在启动时刷新并按天继续运行，可用
+`DATA_REFRESH_INTERVAL_SECONDS` 调整间隔。过期快照保留用于带标记的研究降级，当周发布等待数据恢复。启用 `GOLD_DRIVER_COT_REFRESH_ENABLED=1`
 后，刷新任务同时采集 COT。宏观版本单独运行 `python3 scripts/refresh_macro_vintages.py` 更新，
 可在执行环境配置 `FRED_API_KEY` 或用 `--alfred-exports` 导入核验过的离线数据。
 
@@ -291,7 +291,7 @@ python3 scripts/competition_acceptance.py \
 
 在迁移任务的运行环境配置 `DATABASE_URL`，先在测试数据库验证，再对目标数据库运行只读预检，
 确认历史事件表、新闻快照表和待清理审计记录的状态。确认目标与备份后可执行可重复运行的结构迁移，
-再以只读预检核对结果。Railway 启动器与 `/health/live` 检查独立于此迁移流程。
+再以只读预检核对结果。Railway 使用 `/health/ready` 检查下游和账本可用性，结构迁移和旧审计清理单独执行。
 
 ```bash
 python3 scripts/migrate_release.py

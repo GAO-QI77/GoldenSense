@@ -48,6 +48,12 @@ import {
 import { AdvancedProfileFields, CoreProfileFields } from './profileFields';
 import { getProfileCompletion, loadProfile, saveProfile, toLegacyAnalyzeProfile } from './profileStore';
 import { deriveDashboardState } from './presentationPolicy';
+import {
+  classifySourceHealth,
+  dataQualityStatusCopy,
+  degradationFlagCopy,
+  sourceReasonCopy,
+} from './researchContract';
 import { addSearchEntries } from './searchIndex';
 import { ViewModeContext, loadViewMode, saveViewMode, useViewMode } from './viewMode';
 
@@ -1220,16 +1226,23 @@ function IndicatorAuditDetails({ group, indicator }) {
 function QualityPanel({ quality, flags }) {
   return (
     <section className="panel-block">
-      <PanelTitle icon={DatabaseZap} title="数据质量" subtitle={quality?.status || 'unknown'} />
+      <PanelTitle
+        icon={DatabaseZap}
+        title="数据质量"
+        subtitle={dataQualityStatusCopy(quality?.status)}
+      />
       <div className="quality-list">
-        <MetricLine label="指标状态" value={quality?.indicator_status || 'N/A'} />
-        <MetricLine label="新闻状态" value={quality?.news_status || 'N/A'} />
-        <MetricLine label="新鲜度" value={quality ? `${quality.freshness_seconds}s` : 'N/A'} />
+        <MetricLine label="指标状态" value={dataQualityStatusCopy(quality?.indicator_status)} />
+        <MetricLine label="新闻状态" value={dataQualityStatusCopy(quality?.news_status)} />
+        <MetricLine
+          label="新鲜度"
+          value={quality?.freshness_seconds != null ? `${quality.freshness_seconds}s` : 'N/A'}
+        />
       </div>
       {flags.length ? (
         <div className="flag-stack">
           {flags.slice(0, 5).map((flag) => (
-            <span key={flag}>{flag}</span>
+            <span key={flag}>{degradationFlagCopy(flag)}</span>
           ))}
         </div>
       ) : (
@@ -1245,30 +1258,46 @@ function SourceHealthPanel({ sources, loading }) {
       <PanelTitle icon={LockKeyhole} title="数据源健康监控" subtitle={sources.length ? `${sources.length} 个来源` : '等待'} />
       <div className="source-health-list">
         {sources.length ? (
-          sources.map((source) => (
-            <article key={source.id} className={`source-health-row status-${source.status}`}>
-              <div className="source-health-topline">
-                <strong>{source.label}</strong>
-                <QualityDot status={source.status} />
-              </div>
-              <div className="source-health-meta">
-                <span>{source.cadence}</span>
-                <span>{source.freshness_seconds}s / SLA {source.expected_lag_seconds}s</span>
-              </div>
-              <div className="source-coverage">
-                {(source.coverage || []).slice(0, 3).map((item) => (
-                  <span key={item}>{item}</span>
-                ))}
-              </div>
-              {source.degraded_reason ? <p>{source.degraded_reason}</p> : <p>来源状态正常，暂无降级原因。</p>}
-              {source.url ? (
-                <a href={source.url} target="_blank" rel="noreferrer">
-                  来源入口
-                  <ExternalLink size={13} />
-                </a>
-              ) : null}
-            </article>
-          ))
+          sources.map((source) => {
+            const health = classifySourceHealth(source);
+            return (
+              <article key={source.id} className={`source-health-row status-${source.status}`}>
+                <div className="source-health-topline">
+                  <strong>{source.label}</strong>
+                  <QualityDot status={source.status} />
+                </div>
+                <div className="source-health-classification" aria-label="来源健康分类">
+                  <span className={health.timeliness === '延迟' ? 'is-late' : health.timeliness === '时效未知' ? 'is-unknown' : ''}>
+                    时效 · {health.timeliness}
+                  </span>
+                  <span className={health.provenance === '直接来源' ? '' : 'is-proxy'}>
+                    出处 · {health.provenance}
+                  </span>
+                </div>
+                <div className="source-health-meta">
+                  <span>更新频率 · {source.cadence}</span>
+                  <span>数据年龄 {source.freshness_seconds}s · 预期 {source.expected_lag_seconds}s</span>
+                </div>
+                <div className="source-coverage">
+                  {(source.coverage || []).slice(0, 3).map((item) => (
+                    <span key={item}>{item}</span>
+                  ))}
+                </div>
+                <p>{sourceReasonCopy(source)}</p>
+                {source.degraded_reason ? (
+                  <small className="source-health-audit">
+                    专业审计码 · <code>{source.degraded_reason}</code>
+                  </small>
+                ) : null}
+                {source.url ? (
+                  <a href={source.url} target="_blank" rel="noreferrer">
+                    来源入口
+                    <ExternalLink size={13} />
+                  </a>
+                ) : null}
+              </article>
+            );
+          })
         ) : (
           <p>{loading ? '正在读取数据源健康状态。' : 'dashboard 暂未返回 source_health。'}</p>
         )}
@@ -1391,9 +1420,15 @@ function StatusBadge({ status, loading }) {
 }
 
 function QualityDot({ status }) {
+  const label = {
+    ok: '正常',
+    degraded: '有降级',
+    unavailable: '不可用',
+    unknown: '未知',
+  }[status] || '未知';
   return (
     <span className={`quality-dot status-${status}`}>
-      {status}
+      {label}
     </span>
   );
 }

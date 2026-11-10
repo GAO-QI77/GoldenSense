@@ -90,15 +90,21 @@ from research_case import (
 )
 from research_orchestrator import build_research_case
 from signal_ledger import (
+    build_ledger_store,
     JsonlLedgerStore,
+    LedgerIntegrityError,
+    LedgerUnavailableError,
+    PostgresLedgerStore,
     publish_weekly,
     score_configured_track_record,
+    StalePublicationDataError,
 )
 from subscriptions import SubscriptionStore, mask_email, send_digest
 from outcome_tracker import (
     backfill_outcomes,
     calibration_summary,
     committee_weight_adjustments,
+    extract_analysis_record,
 )
 from regime_strategy import evaluate_regime, evaluate_regime_v2
 from research_context import shared_context as quant_research_context
@@ -1145,6 +1151,7 @@ class AgentTraceStore:
         self._db_ready = False
 
     async def startup(self) -> None:
+        schema_unavailable = False
         try:
             await asyncio.to_thread(self._ensure_schema_sync)
             self._db_ready = True
@@ -1156,7 +1163,9 @@ class AgentTraceStore:
                 type(exc).__name__,
             )
             if not self._allow_memory_fallback:
-                raise TraceStoreUnavailableError("trace_store_schema_unavailable") from exc
+                schema_unavailable = True
+        if schema_unavailable:
+            raise TraceStoreUnavailableError("trace_store_schema_unavailable") from None
 
     def _prune_memory(self) -> None:
         if not self._allow_memory_fallback:
@@ -1217,19 +1226,22 @@ class AgentTraceStore:
                 return analysis_id
             raise TraceStoreUnavailableError("trace_store_unavailable")
 
+        persist_unavailable = False
         try:
             await asyncio.to_thread(self._persist_analysis_sync, row)
             return analysis_id
         except Exception as exc:
             LOGGER.warning(
-                "agent_trace_persist_failed analysis_id=%s allow_memory_fallback=%s error=%s",
+                "agent_trace_persist_failed analysis_id=%s allow_memory_fallback=%s error_type=%s",
                 analysis_id,
                 self._allow_memory_fallback,
-                f"{type(exc).__name__}:{exc}",
+                type(exc).__name__,
             )
             if self._allow_memory_fallback:
                 return analysis_id
-            raise TraceStoreUnavailableError("trace_store_persist_failed") from exc
+            persist_unavailable = True
+        if persist_unavailable:
+            raise TraceStoreUnavailableError("trace_store_persist_failed") from None
 
     async def save_feedback(self, analysis_id: str, rating: str, comment: Optional[str]) -> bool:
         row = self._memory.get(analysis_id)
@@ -1237,21 +1249,24 @@ class AgentTraceStore:
             row["feedback_rating"] = rating
             row["feedback_comment"] = comment
 
+        feedback_unavailable = False
         if self._db_ready:
             try:
                 updated = await asyncio.to_thread(self._save_feedback_sync, analysis_id, rating, comment)
                 return updated or row is not None
             except Exception as exc:
                 LOGGER.warning(
-                    "agent_trace_feedback_failed analysis_id=%s allow_memory_fallback=%s error=%s",
+                    "agent_trace_feedback_failed analysis_id=%s allow_memory_fallback=%s error_type=%s",
                     analysis_id,
                     self._allow_memory_fallback,
-                    f"{type(exc).__name__}:{exc}",
+                    type(exc).__name__,
                 )
                 if row is not None and self._allow_memory_fallback:
                     return True
                 if not self._allow_memory_fallback:
-                    raise TraceStoreUnavailableError("trace_store_feedback_failed") from exc
+                    feedback_unavailable = True
+        if feedback_unavailable:
+            raise TraceStoreUnavailableError("trace_store_feedback_failed") from None
         return row is not None
 
     async def load_trace(self, analysis_id: str) -> Optional[Dict[str, Any]]:
@@ -1262,32 +1277,38 @@ class AgentTraceStore:
             if self._allow_memory_fallback:
                 return None
             raise TraceStoreUnavailableError("trace_store_unavailable")
+        load_unavailable = False
         try:
             return await asyncio.to_thread(self._load_trace_sync, analysis_id)
         except Exception as exc:
             LOGGER.warning(
-                "agent_trace_load_failed analysis_id=%s allow_memory_fallback=%s error=%s",
+                "agent_trace_load_failed analysis_id=%s allow_memory_fallback=%s error_type=%s",
                 analysis_id,
                 self._allow_memory_fallback,
-                f"{type(exc).__name__}:{exc}",
+                type(exc).__name__,
             )
             if self._allow_memory_fallback:
                 return None
-            raise TraceStoreUnavailableError("trace_store_load_failed") from exc
+            load_unavailable = True
+        if load_unavailable:
+            raise TraceStoreUnavailableError("trace_store_load_failed") from None
 
     async def load_recent_analyses(self, limit: int = 500) -> List[Dict[str, Any]]:
         """Recent analyses for outcome tracking. DB first, else dev memory."""
+        recent_unavailable = False
         if self._db_ready:
             try:
                 return await asyncio.to_thread(self._load_recent_sync, limit)
             except Exception as exc:
                 LOGGER.warning(
-                    "agent_trace_recent_failed allow_memory_fallback=%s error=%s",
+                    "agent_trace_recent_failed allow_memory_fallback=%s error_type=%s",
                     self._allow_memory_fallback,
-                    f"{type(exc).__name__}:{exc}",
+                    type(exc).__name__,
                 )
                 if not self._allow_memory_fallback:
-                    raise TraceStoreUnavailableError("trace_store_recent_failed") from exc
+                    recent_unavailable = True
+        if recent_unavailable:
+            raise TraceStoreUnavailableError("trace_store_recent_failed") from None
         self._prune_memory()
         rows = [
             {k: v for k, v in row.items() if k != "created_at_epoch"}
@@ -1990,7 +2011,8 @@ class AgentAnalysisService:
 
             prices, source = load_gold_outcome_prices(_decision_at())
             outcomes = backfill_outcomes(rows, prices)
-            summary = calibration_summary(outcomes)
+            valid_analysis_count = sum(extract_analysis_record(row) is not None for row in rows)
+            summary = calibration_summary(outcomes, total_valid_analyses=valid_analysis_count)
             summary["price_data_source"] = source
             summary["weight_adjustment"] = committee_weight_adjustments(summary)
             summary["recent_outcomes"] = [
@@ -2802,28 +2824,23 @@ class AgentAnalysisService:
             scores.append(self._sentiment_scorer.score(req.optional_news_text))
         return _clamp(_mean(scores), -1.0, 1.0)
 
-    def _memory_average(self, horizon: PublicHorizon, rag_events: List[RagEventItem]) -> float:
-        values: List[Optional[float]] = []
-        for event in rag_events:
-            if horizon == "short_term":
-                values.append(event.gold_t1_return)
-            elif horizon == "mid_term":
-                values.append(event.gold_t7_return)
-            else:
-                proxy = None
-                if event.gold_t7_return is not None:
-                    proxy = event.gold_t7_return * 1.6
-                elif event.gold_t1_return is not None:
-                    proxy = event.gold_t1_return * 2.8
-                values.append(proxy)
-        return _mean(values)
+    def _memory_average(
+        self, horizon: PublicHorizon, rag_events: List[RagEventItem],
+    ) -> Optional[float]:
+        if horizon == "short_term":
+            values = [event.gold_t1_return for event in rag_events if event.gold_t1_return is not None]
+        elif horizon == "mid_term":
+            values = [event.gold_t7_return for event in rag_events if event.gold_t7_return is not None]
+        else:
+            return None
+        return sum(values) / len(values) if values else None
 
     def _compute_conflict(
         self,
         *,
         quant_direction: int,
         news_sentiment: float,
-        memory_avg: float,
+        memory_avg: Optional[float],
         technical_state: str,
         macro_signal: int,
     ) -> Tuple[int, bool]:
@@ -2834,9 +2851,9 @@ class AgentAnalysisService:
             signals.append(1)
         elif news_sentiment < -0.08:
             signals.append(-1)
-        if memory_avg > 0.002:
+        if memory_avg is not None and memory_avg > 0.002:
             signals.append(1)
-        elif memory_avg < -0.002:
+        elif memory_avg is not None and memory_avg < -0.002:
             signals.append(-1)
         if technical_state == "bullish":
             signals.append(1)
@@ -2928,13 +2945,13 @@ class AgentAnalysisService:
         elif horizon == "mid_term":
             horizon_reason = (
                 f"历史相似事件在中期代理口径的均值表现约 {memory_avg * 100:+.2f}%，只用于判断冲击延续性。"
-                if rag_events
+                if memory_avg is not None
                 else "中期视角同时参考政策路径、状态切换、美元、实际利率和资金流。"
             )
         else:
             horizon_reason = (
                 f"历史相似事件在短期代理口径的均值表现约 {memory_avg * 100:+.2f}%，只作为事件风险参考。"
-                if rag_events
+                if memory_avg is not None
                 else "短期 1–21 天更容易受事件预期差、美元、实际利率、技术结构与流动性影响。"
             )
 
@@ -3233,31 +3250,25 @@ class AgentAnalysisService:
             )
         )
 
-        memory_avg = _mean(
-            [
-                event.gold_t1_return if bundle.horizon == "short_term" else event.gold_t7_return
-                for event in bundle.rag_events
-            ]
-        )
+        memory_avg = self._memory_average(bundle.horizon, bundle.rag_events)
+        memory_takeaway = _memory_unavailable_copy(bundle.memory_status, bundle.memory_degraded_reason)
+        if bundle.memory_status == "ok":
+            if memory_avg is None:
+                memory_takeaway = "所选研究期限暂无成熟的历史类比收益。"
+            else:
+                label = "1 日" if bundle.horizon == "short_term" else "7 日"
+                memory_takeaway = f"历史相似事件的成熟收益均值为 {memory_avg:+.2%}（{label}模型窗口）。"
         memory_direction = "neutral"
-        if memory_avg > 0.002:
+        if memory_avg is not None and memory_avg > 0.002:
             memory_direction = "supportive" if bullish else "contradictory"
-        elif memory_avg < -0.002:
+        elif memory_avg is not None and memory_avg < -0.002:
             memory_direction = "supportive" if not bullish else "contradictory"
         cards.append(
             EvidenceCard(
                 id="ev-memory",
                 title="历史相似事件",
                 signal_type="memory",
-                takeaway=(
-                    _memory_unavailable_copy(bundle.memory_status, bundle.memory_degraded_reason)
-                    if bundle.memory_status != "ok"
-                    else (
-                        "历史相似事件均值表现 "
-                        f"{memory_avg * 100:+.2f}%（按{'短期' if bundle.horizon == 'short_term' else '中长期代理'}口径），"
-                        "可用于判断新闻冲击是否容易延续。"
-                    )
-                ),
+                takeaway=memory_takeaway,
                 direction="neutral" if bundle.memory_status != "ok" else memory_direction,
                 citation_ids=["cit-memory"] if any(c.id == "cit-memory" for c in citations) else ["cit-macro"],
             )
@@ -3479,6 +3490,50 @@ def _trim_gold_history(
     )
 
 
+class _GuardedLedgerStore:
+    """Normalize store-boundary failures without exposing backend details."""
+
+    def __init__(self, store: Any, *, on_availability: Optional[Any] = None) -> None:
+        self._store = store
+        self._on_availability = on_availability
+
+    def _report_availability(self, available: bool) -> None:
+        if self._on_availability is not None:
+            self._on_availability(available)
+
+    def _call(self, operation: str, callback: Any) -> Any:
+        unavailable = False
+        result = None
+        try:
+            result = callback()
+        except Exception as exc:
+            LOGGER.error(
+                "signal_ledger_operation_failed operation=%s error_type=%s",
+                operation,
+                type(exc).__name__,
+            )
+            unavailable = True
+        if unavailable:
+            self._report_availability(False)
+            raise LedgerUnavailableError(
+                "Signal publication ledger is unavailable."
+            ) from None
+        self._report_availability(True)
+        return result
+
+    def load_all(self) -> list:
+        return self._call("load", lambda: self._store.load_all())
+
+    def append(self, record: Dict[str, Any]) -> Optional[bool]:
+        return self._call("append", lambda: self._store.append(record))
+
+    def healthcheck(self) -> bool:
+        callback = getattr(self._store, "healthcheck", None)
+        if callback is None:
+            callback = lambda: self._store.load_all() is not None
+        return bool(self._call("healthcheck", callback))
+
+
 
 def create_app(
     *,
@@ -3494,7 +3549,7 @@ def create_app(
 ) -> FastAPI:
     tool_timeout_seconds = float(_env("AGENT_TOOL_TIMEOUT_SECONDS", "35.0"))
     tool_connect_timeout_seconds = float(_env("AGENT_TOOL_CONNECT_TIMEOUT_SECONDS", "1.5"))
-    app_env = _env("APP_ENV", "development").lower()
+    app_env = os.environ.get("APP_ENV", "").strip().lower()
     cfg = AgentGatewayConfig(
         forecast_url=_env("FORECAST_URL", "http://localhost:8010/api/v1/forecast"),
         memory_url=_env("MEMORY_URL", "http://localhost:8012/api/v1/memory/search"),
@@ -3508,7 +3563,15 @@ def create_app(
         stale_after_seconds=int(_env("MARKET_STALE_AFTER_SECONDS", "180")),
         news_stale_after_seconds=int(_env("NEWS_STALE_AFTER_SECONDS", "300")),
     )
-    database_url = _env("DATABASE_URL", "postgresql://localhost/postgres")
+    database_url = os.environ.get("DATABASE_URL") or (
+        "postgresql://localhost/postgres" if app_env == "development" else ""
+    )
+    signal_ledger_database_url = os.environ.get(
+        "SIGNAL_LEDGER_DATABASE_URL"
+    ) or os.environ.get("DATABASE_URL")
+    signal_ledger_connect_timeout_seconds = max(
+        1, int(_env("SIGNAL_LEDGER_CONNECT_TIMEOUT_SECONDS", "5"))
+    )
     public_keys_raw = os.environ.get("AGENT_PUBLIC_API_KEYS")
     internal_keys_raw = os.environ.get("AGENT_INTERNAL_API_KEYS")
     if app_env != "development" and (not public_keys_raw or not internal_keys_raw):
@@ -3571,9 +3634,30 @@ def create_app(
                 window_seconds=analyze_rate_limit_window_seconds,
             ),
         }
-        app.state.signal_ledger_store = signal_ledger_store or JsonlLedgerStore(
-            _env("SIGNAL_LEDGER_PATH", "data_cache/signal_ledger.jsonl")
-        )
+        if signal_ledger_store is not None:
+            app.state.signal_ledger_store = signal_ledger_store
+            app.state.signal_ledger_available = True
+        else:
+            try:
+                app.state.signal_ledger_store = await asyncio.to_thread(
+                    build_ledger_store,
+                    app_env=app_env,
+                    database_url=signal_ledger_database_url,
+                    jsonl_path=_env(
+                        "SIGNAL_LEDGER_PATH",
+                        "data_cache/signal_ledger.jsonl",
+                    ),
+                    connect_timeout_seconds=signal_ledger_connect_timeout_seconds,
+                    postgres_store_factory=PostgresLedgerStore,
+                )
+                app.state.signal_ledger_available = True
+            except Exception as exc:
+                app.state.signal_ledger_store = None
+                app.state.signal_ledger_available = False
+                LOGGER.error(
+                    "signal_ledger_initialization_failed error_type=%s",
+                    type(exc).__name__,
+                )
         app.state.subscription_store = subscription_store or SubscriptionStore(
             _env("SUBSCRIPTIONS_PATH", "data_cache/subscriptions.jsonl")
         )
@@ -3605,40 +3689,61 @@ def create_app(
             try:
                 quant_research_context.get_context()
             except Exception as exc:  # pragma: no cover - defensive
-                LOGGER.warning("quant_context_warmup_failed error=%s", f"{type(exc).__name__}:{exc}")
+                LOGGER.warning(
+                    "quant_context_warmup_failed error_type=%s",
+                    type(exc).__name__,
+                )
 
         if _env("AGENT_WARM_QUANT_CONTEXT", "1") == "1":
             threading.Thread(target=_warm_quant_context, name="quant-warmup", daemon=True).start()
 
-        # Optional startup autopublish: freeze this ISO week's signal if it is
-        # missing. Publishing is idempotent, so this is safe to run on every
-        # boot; failures are logged and never block startup.
+        # Optional startup autopublish: freeze this ISO week's signal before
+        # traffic is accepted. Publishing is idempotent on every boot.
         def _autopublish_signal() -> None:
+            from signal_ledger import publish_weekly as _publish
+
+            decision_at = datetime.now(timezone.utc)
+            ctx = quant_research_context.get_context_at(decision_at)
+            record, created = _publish(_ledger_store(), ctx, now=decision_at)
+            LOGGER.info(
+                "signal_autopublish %s publication_id=%s",
+                "created" if created else "already_exists",
+                record["publication_id"],
+            )
+
+        autopublish_enabled = _env("SIGNAL_AUTOPUBLISH_ENABLED", "0") == "1"
+        app.state.signal_publication_ready = not autopublish_enabled
+        if autopublish_enabled and app.state.signal_ledger_available:
             try:
-                from signal_ledger import publish_weekly as _publish
-
-                decision_at = datetime.now(timezone.utc)
-                ctx = quant_research_context.get_context_at(decision_at)
-                record, created = _publish(app.state.signal_ledger_store, ctx, now=decision_at)
-                LOGGER.info(
-                    "signal_autopublish %s publication_id=%s",
-                    "created" if created else "already_exists",
-                    record["publication_id"],
+                await asyncio.to_thread(_autopublish_signal)
+                app.state.signal_publication_ready = True
+            except StalePublicationDataError:
+                LOGGER.warning("signal_autopublish_held reason=stale_or_unavailable_research")
+            except Exception as exc:
+                LOGGER.error(
+                    "signal_autopublish_failed error_type=%s", type(exc).__name__
                 )
-            except Exception as exc:  # pragma: no cover - defensive
-                LOGGER.warning(
-                    "signal_autopublish_failed error=%s:%s", type(exc).__name__, exc
-                )
-
-        if _env("SIGNAL_AUTOPUBLISH_ENABLED", "0") == "1":
-            threading.Thread(
-                target=_autopublish_signal, name="signal-autopublish", daemon=True
-            ).start()
+                raise RuntimeError("Initial signal publication failed.") from None
         yield
         if own_http:
             await http.aclose()
 
     app = FastAPI(title="GoldenSense Agent Gateway", version="2.0.0", lifespan=lifespan)
+
+    @app.exception_handler(LedgerUnavailableError)
+    async def signal_ledger_unavailable_handler(
+        _request: Request, _exc: LedgerUnavailableError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unavailable",
+                "error_code": "signal_ledger_unavailable",
+                "message": "信号发布台账暂时不可用，请稍后重试。",
+                "guidance": "持久化恢复前不会返回空历史或接受新发布。",
+                "retryable": True,
+            },
+        )
     # Metrics registry is created eagerly (not in lifespan) so the recording
     # middleware always has it, even for requests during startup.
     app.state.metrics = MetricsRegistry()
@@ -3719,6 +3824,19 @@ def create_app(
         errors: List[str] = []
         if not trace_health.get("db_ready") and not trace_health.get("allow_memory_fallback"):
             errors.append("trace_store_unavailable")
+        ledger_is_healthy = False
+        if getattr(app.state, "signal_ledger_store", None) is not None:
+            try:
+                ledger_is_healthy = await asyncio.to_thread(
+                    _ledger_store().healthcheck
+                )
+            except Exception:
+                ledger_is_healthy = False
+        signal_ledger_health = {
+            "status": "ok" if ledger_is_healthy else "unavailable"
+        }
+        if signal_ledger_health["status"] != "ok":
+            errors.append("signal_ledger_unavailable")
 
         downstream: Dict[str, Any] = {}
         if getattr(app.state, "uses_injected_toolbox", False):
@@ -3744,7 +3862,10 @@ def create_app(
                     if not ok:
                         errors.append(f"{name}_unavailable")
                 except Exception as exc:
-                    downstream[name] = {"status": "unavailable", "error": f"{type(exc).__name__}:{exc}"}
+                    downstream[name] = {
+                        "status": "unavailable",
+                        "error_type": type(exc).__name__,
+                    }
                     errors.append(f"{name}_unavailable")
 
         status = "ok" if not errors else "unavailable"
@@ -3753,6 +3874,7 @@ def create_app(
             content={
                 "status": status,
                 "trace_store": trace_health,
+                "signal_ledger": signal_ledger_health,
                 "downstream": downstream,
                 "errors": errors,
             },
@@ -4287,8 +4409,18 @@ def create_app(
             ) from exc
         return JSONResponse(content=jsonable_encoder(payload))
 
+    def _ledger_store() -> _GuardedLedgerStore:
+        store = getattr(app.state, "signal_ledger_store", None)
+        if store is None:
+            raise LedgerUnavailableError("Signal publication ledger is unavailable.")
+
+        def _set_availability(available: bool) -> None:
+            app.state.signal_ledger_available = available
+
+        return _GuardedLedgerStore(store, on_availability=_set_availability)
+
     def _ledger_records() -> list:
-        return app.state.signal_ledger_store.load_all()
+        return _ledger_store().load_all()
 
     @app.get("/api/v1/signals/current")
     async def signals_current(request: Request) -> JSONResponse:
@@ -4336,16 +4468,34 @@ def create_app(
         def _score() -> Dict[str, Any]:
             return score_configured_track_record(_ledger_records(), decision_at=_decision_at())
 
+        unexpected_error_type = None
         try:
             payload = await asyncio.to_thread(_score)
+        except LedgerUnavailableError:
+            raise
+        except LedgerIntegrityError as exc:
+            app.state.signal_ledger_available = False
+            LOGGER.error(
+                "signal_ledger_operation_failed operation=track_integrity error_type=%s",
+                type(exc).__name__,
+            )
+            raise LedgerUnavailableError(
+                "Signal publication ledger is unavailable."
+            ) from None
         except Exception as exc:
+            unexpected_error_type = type(exc).__name__
+        if unexpected_error_type:
+            LOGGER.error(
+                "signal_track_record_failed error_type=%s",
+                unexpected_error_type,
+            )
             raise HTTPException(
                 status_code=503,
                 detail={
                     "error_code": "track_record_unavailable",
-                    "message": f"{type(exc).__name__}: {exc}",
+                    "message": "前向记分卡暂时不可用，请稍后重试。",
                 },
-            ) from exc
+            ) from None
         return JSONResponse(content=jsonable_encoder(payload))
 
     @app.post("/api/v1/signals/publish")
@@ -4354,19 +4504,38 @@ def create_app(
         publication is an operational act, not a public mutation."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=True)
         await app.state.rate_limiters["write"].check(auth_ctx["client_id"])
+        store = _ledger_store()
+        unexpected_error_type = None
         try:
             ctx = await asyncio.to_thread(quant_research_context.get_context_at, _decision_at())
             record, created = await asyncio.to_thread(
-                publish_weekly, app.state.signal_ledger_store, ctx, now=_decision_at()
+                publish_weekly, store, ctx, now=_decision_at()
             )
+        except LedgerUnavailableError:
+            raise
+        except LedgerIntegrityError as exc:
+            app.state.signal_ledger_available = False
+            LOGGER.error(
+                "signal_ledger_operation_failed operation=publish_integrity error_type=%s",
+                type(exc).__name__,
+            )
+            raise LedgerUnavailableError(
+                "Signal publication ledger is unavailable."
+            ) from None
         except Exception as exc:
+            unexpected_error_type = type(exc).__name__
+        if unexpected_error_type:
+            LOGGER.error(
+                "signal_publish_failed error_type=%s",
+                unexpected_error_type,
+            )
             raise HTTPException(
                 status_code=503,
                 detail={
                     "error_code": "publish_failed",
-                    "message": f"{type(exc).__name__}: {exc}",
+                    "message": "本周信号暂时无法发布，请稍后重试。",
                 },
-            ) from exc
+            ) from None
         return JSONResponse(
             content=jsonable_encoder({"record": record, "created": created})
         )

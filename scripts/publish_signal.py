@@ -8,7 +8,8 @@ Usage:
     python3 scripts/publish_signal.py
 
 Env:
-    SIGNAL_LEDGER_PATH  ledger file (default data_cache/signal_ledger.jsonl)
+    SIGNAL_LEDGER_DATABASE_URL or DATABASE_URL  PostgreSQL ledger outside development
+    SIGNAL_LEDGER_PATH  development ledger file (default data_cache/signal_ledger.jsonl)
 """
 from __future__ import annotations
 
@@ -22,17 +23,17 @@ from typing import Any, Dict, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from env_loader import load_env_file  # noqa: E402
-from signal_ledger import JsonlLedgerStore, LedgerStore, publish_weekly  # noqa: E402
+from signal_ledger import LedgerStore, build_ledger_store, publish_weekly  # noqa: E402
 
 load_env_file()
 
 LOGGER = logging.getLogger("publish_signal")
 
 
-def _load_ctx() -> Dict[str, Any]:
+def _load_ctx(decision_at: datetime) -> Dict[str, Any]:
     from research_context import shared_context
 
-    return shared_context.get_context_at(datetime.now(timezone.utc))
+    return shared_context.get_context_at(decision_at)
 
 
 def publish_once(
@@ -43,11 +44,25 @@ def publish_once(
     send_digest_on_create: bool = False,
 ) -> Dict[str, Any]:
     """Publish this week's record once; returns {record, created[, digest]}."""
-    store = store or JsonlLedgerStore(
-        os.environ.get("SIGNAL_LEDGER_PATH", "data_cache/signal_ledger.jsonl")
+    decision_at = now or datetime.now(timezone.utc)
+    if decision_at.tzinfo is None:
+        decision_at = decision_at.replace(tzinfo=timezone.utc)
+    store = store or build_ledger_store(
+        app_env=os.environ.get("APP_ENV", ""),
+        database_url=(
+            os.environ.get("SIGNAL_LEDGER_DATABASE_URL")
+            or os.environ.get("DATABASE_URL")
+        ),
+        jsonl_path=os.environ.get(
+            "SIGNAL_LEDGER_PATH", "data_cache/signal_ledger.jsonl"
+        ),
+        connect_timeout_seconds=max(
+            1, int(os.environ.get("SIGNAL_LEDGER_CONNECT_TIMEOUT_SECONDS", "5"))
+        ),
     )
-    ctx = ctx or _load_ctx()
-    record, created = publish_weekly(store, ctx, now=now)
+    if ctx is None:
+        ctx = _load_ctx(decision_at)
+    record, created = publish_weekly(store, ctx, now=decision_at)
     result: Dict[str, Any] = {"record": record, "created": created}
 
     # Retention loop: a *new* publication fans out to digest subscribers.
@@ -61,7 +76,7 @@ def publish_once(
             track = None
             try:
                 track = score_configured_track_record(
-                    store.load_all(), decision_at=now or datetime.now(timezone.utc),
+                    store.load_all(), decision_at=decision_at,
                 )
             except Exception:
                 track = None

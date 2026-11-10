@@ -12,19 +12,12 @@ import {
 import { toPersonalResearchBody } from './profileStore';
 import { ThreeDimensionalBrief } from './ResearchCasePanel';
 import { getResearchHeaders, useActiveResearchCase } from './researchCaseStore';
+import { isPositionAnalysisAllowed, positionGapCopy } from './researchContract';
 
 const API_URL = import.meta.env.VITE_AGENT_API_URL || '/api/v1/agent/analyze';
 const PERSONAL_URL =
   import.meta.env.VITE_AGENT_PERSONAL_URL || API_URL.replace('/analyze', '/personal-research');
 const API_KEY = import.meta.env.VITE_AGENT_API_KEY || 'dev-public-key';
-
-const gapLabels = {
-  within: { text: '处于参考区间内', tone: 'bull' },
-  above: { text: '高于参考区间上沿', tone: 'risk' },
-  below: { text: '低于参考区间下沿', tone: 'neutral' },
-  unknown: { text: '区间不可用', tone: 'neutral' },
-  withheld: { text: '适当性闸门暂停对比', tone: 'neutral' },
-};
 
 const flagLabels = {
   position_above_range_in_stress: '压力状态下仓位超区间',
@@ -110,9 +103,14 @@ export default function AllocationResearchPanel({ profile }) {
   const narrative = result?.narrative;
   const gap = facts?.position_gap;
   const range = facts?.reference_range;
-  const gapMeta = gapLabels[gap?.status] || gapLabels.unknown;
   const horizonSection = facts?.horizon_evidence?.section;
   const suitability = facts?.suitability;
+  const positionAnalysisAllowed = isPositionAnalysisAllowed(suitability, gap);
+  const gapMeta = positionGapCopy(positionAnalysisAllowed ? gap : { status: 'withheld' });
+  const positionSuppressionReason =
+    suitability?.position_analysis_allowed === true
+      ? '仓位差距状态不可识别'
+      : '适当性校验未允许个人仓位分析';
   const polishing = phase === 'polishing';
   const loading = phase === 'draft-loading';
 
@@ -186,7 +184,7 @@ export default function AllocationResearchPanel({ profile }) {
                 <>
                   <div className={`suitability-verdict status-${suitability?.status || 'insufficient'}`}>
                     <strong>{suitability?.status === 'eligible' ? '适当性通过' : suitability?.status === 'restricted' ? '工具或风险约束不匹配' : '适当性信息不足'}</strong>
-                    <span>{suitability?.position_analysis_allowed ? '允许显示个人仓位差距' : '个人仓位差距已暂停'}</span>
+                    <span>{positionAnalysisAllowed ? '允许显示个人仓位差距' : '个人仓位差距已暂停'}</span>
                     {suitability?.missing_fields?.length ? <small>待补充：{suitability.missing_fields.join(' · ')}</small> : null}
                   </div>
                   <div className="advisor-range-line">
@@ -195,14 +193,24 @@ export default function AllocationResearchPanel({ profile }) {
                     </strong>
                     <span>中点 {range.midpoint}%</span>
                   </div>
-                  <div className={`advisor-gap-line ${gap?.status === 'withheld' ? 'withheld' : ''}`}>
+                  <div className={`advisor-gap-line ${positionAnalysisAllowed ? '' : 'withheld'}`}>
                     <span className={`stance-badge tone-${gapMeta.tone === 'bull' ? 'bull' : gapMeta.tone === 'risk' ? 'risk' : 'neutral'}`}>
-                      {gapMeta.text}
+                      {gapMeta.label}
                     </span>
-                    {gap?.status !== 'withheld' ? <span>
-                      当前仓位 {gap?.current_gold_pct}%
-                      {gap?.gap_pct ? ` · 差距 ${gap.gap_pct} 个百分点` : ''}
-                    </span> : <span>仅保留一般教育型研究，不形成个人配置判断。</span>}
+                    {positionAnalysisAllowed ? (
+                      <span>
+                        当前仓位 {Number.isFinite(gap?.current_gold_pct) ? `${gap.current_gold_pct}%` : '未提供'}
+                        {Number.isFinite(gap?.gap_pct) && gap.gap_pct !== 0
+                          ? ` · 差距 ${gap.gap_pct} 个百分点`
+                          : ''}
+                      </span>
+                    ) : (
+                      <span>
+                        参考区间可用；个人仓位差距暂不计算。当前仓位{' '}
+                        {Number.isFinite(gap?.current_gold_pct) ? `${gap.current_gold_pct}%` : '未提供'}；
+                        {positionSuppressionReason}，仅保留一般教育型研究。
+                      </span>
+                    )}
                   </div>
                 </>
               ) : (
@@ -238,7 +246,11 @@ export default function AllocationResearchPanel({ profile }) {
               </div>
               <div className="advisor-narrative">
                 <p>{narrative?.overview}</p>
-                <p>{narrative?.position_analysis}</p>
+                <p>
+                  {positionAnalysisAllowed
+                    ? narrative?.position_analysis
+                    : `本次不展示个人仓位判断：${positionSuppressionReason}。`}
+                </p>
                 {(narrative?.risk_notes || []).map((note) => (
                   <p key={note} className="advisor-risk-note">
                     <AlertTriangle size={13} /> {note}

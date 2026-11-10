@@ -22,6 +22,11 @@ import {
 import { addSearchEntries } from './searchIndex';
 import { ActiveCaseRibbon, ModelGovernancePanel } from './ResearchCasePanel';
 import { dedupeOutcomes, presentHalfLife } from './presentationPolicy';
+import {
+  calibrationPendingCopy,
+  calibrationProgressCopy,
+  isCalibrationReady,
+} from './researchContract';
 import { useViewMode } from './viewMode';
 import { forecastWindowLabel } from './horizons';
 
@@ -963,7 +968,8 @@ function AllocationPanel({ allocation, degraded, isPro }) {
 
 /* ---------------------------- calibration -------------------------------- */
 function CalibrationPanel({ calibration, isPro }) {
-  const hasData = calibration && calibration.total_scored > 0;
+  const hasData = isCalibrationReady(calibration);
+  const pendingCopy = calibrationPendingCopy(calibration);
   return (
     <PanelShell
       id="panel-calibration"
@@ -974,12 +980,17 @@ function CalibrationPanel({ calibration, isPro }) {
       wide
     >
       <span className="truth-class-badge class-live">真实前向</span>
-      {!hasData && (
-        <p className="quant-note">
-          尚无足够的已到期历史判断可供评分。短期、中期、长期研究会按各自复核日回填实际金价走势并计分。
-        </p>
-      )}
-      {calibration?.governance && <GovernanceBadge governance={calibration.governance} />}
+      {!hasData && calibration ? (
+        <div className="calibration-accumulation" role="status">
+          <strong>{calibrationProgressCopy(calibration)}</strong>
+          <small>达到治理门槛前不展示命中率；各期限研究会在复核日按真实结果计分。</small>
+          {pendingCopy ? <small>{pendingCopy}</small> : null}
+        </div>
+      ) : null}
+      {!calibration ? (
+        <p className="quant-note">校准记录暂不可用，请稍后重试。</p>
+      ) : null}
+      {hasData && calibration?.governance ? <GovernanceBadge governance={calibration.governance} /> : null}
       {hasData && (
         <>
           <div className="calib-tiles">

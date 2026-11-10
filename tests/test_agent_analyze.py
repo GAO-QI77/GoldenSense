@@ -1099,3 +1099,6 @@ def test_agent_research_focus_exposes_descriptive_gold_driver_evidence(monkeypat
     assert focus["horizon"] == "long_term"
     assert focus["data_asof"] == "2026-07-14"
     assert "从 -10.00 变为 -3.00" in focus["section"]["evidence"][0]
+    memory = next(card for card in response.json()["evidence_cards"] if card["id"] == "ev-memory")
+    assert memory["takeaway"] == "所选研究期限暂无成熟的历史类比收益。"
+    assert memory["direction"] == "neutral"
