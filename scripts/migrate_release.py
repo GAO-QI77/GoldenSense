@@ -121,7 +121,9 @@ def main() -> int:
     if args.batch_size < 1:
         parser.error("batch size must be positive")
     try:
-        with psycopg.connect(dsn, connect_timeout=5) as conn:
+        with psycopg.connect(
+            dsn, connect_timeout=5, options="-c lock_timeout=5000 -c statement_timeout=45000",
+        ) as conn:
             conn.read_only = not (args.apply_schema or args.redact_legacy)
             before = release_plan(conn)
             if args.apply_schema:

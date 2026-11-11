@@ -6,7 +6,7 @@
   },
   "deploy": {
     "startCommand": "python3 scripts/public_stack.py",
-    "preDeployCommand": "PGOPTIONS='-c lock_timeout=5000 -c statement_timeout=45000' python3 scripts/migrate_release.py --apply-schema",
+    "preDeployCommand": "python3 scripts/migrate_release.py --apply-schema",
     "preDeployTimeoutSeconds": 90,
     "healthcheckPath": "/health/ready",
     "healthcheckTimeout": 300,
