@@ -32,6 +32,23 @@ def _matches_domain(hostname: str, registered_domain: str) -> bool:
     return hostname == registered_domain or hostname.endswith(f".{registered_domain}")
 
 
+def primary_authority_for_url(url: str | None) -> str | None:
+    """Recognize a primary authority from the article URL's hostname."""
+    hostname = ""
+    if url:
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme in {"https", "http"}:
+                hostname = (parsed.hostname or "").lower().rstrip(".")
+        except ValueError:
+            hostname = ""
+
+    for domain, authority in _PRIMARY_AUTHORITIES:
+        if _matches_domain(hostname, domain):
+            return authority
+    return None
+
+
 def classify_news_source(item: NewsEventItem) -> NewsEventItem:
     """Return a copy with a presentation-safe source tier and authority."""
 
@@ -44,24 +61,15 @@ def classify_news_source(item: NewsEventItem) -> NewsEventItem:
             }
         )
 
-    hostname = ""
-    if item.url:
-        try:
-            parsed = urlparse(item.url)
-            if parsed.scheme in {"https", "http"}:
-                hostname = (parsed.hostname or "").lower().rstrip(".")
-        except ValueError:
-            hostname = ""
-
-    for domain, authority in _PRIMARY_AUTHORITIES:
-        if _matches_domain(hostname, domain):
-            return item.model_copy(
-                update={
-                    "source_tier": "primary",
-                    "source_authority": authority,
-                    "is_primary_source": True,
-                }
-            )
+    authority = primary_authority_for_url(item.url)
+    if authority is not None:
+        return item.model_copy(
+            update={
+                "source_tier": "primary",
+                "source_authority": authority,
+                "is_primary_source": True,
+            }
+        )
 
     return item.model_copy(
         update={

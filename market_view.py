@@ -114,6 +114,9 @@ def _short_term(ctx: Dict[str, Any]) -> Dict[str, Any]:
         coverage = ((review.get("21") or {}).get("log_har_vra") or {}).get("coverage")
         detail = f"，其中 21 个观测窗口的 log-HAR 加成熟误差校准覆盖率为 {coverage:.1%}" if coverage is not None else ""
         evidence.insert(0, f"短期候选独立记分{detail}。候选进入生产前须满足会话、样本量、误差和尾部条件。")
+        garch_coverage = ((review.get("21") or {}).get("student_t_garch") or {}).get("coverage")
+        if garch_coverage is not None:
+            evidence.append(f"Student-t GARCH 在 21 个观测窗口的成熟覆盖率为 {garch_coverage:.1%}。")
     ann_vol = h21.get("ann_vol_forecast")
     if ann_vol is not None:
         evidence.append(f"HAR-RV 年化波动率预测 {float(ann_vol) * 100:.1f}%。")

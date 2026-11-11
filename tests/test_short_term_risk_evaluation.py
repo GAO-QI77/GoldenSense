@@ -47,3 +47,21 @@ def test_positive_variance_challengers_use_only_mature_outcomes():
     pd.testing.assert_frame_equal(base.loc[:dates[299], columns], altered.loc[:dates[299], columns])
     assert (base[columns] > 0).all().all()
     assert not base[columns[0]].equals(base[columns[1]])
+
+
+def test_student_t_garch_does_not_see_future_prices():
+    from garch_risk import walk_forward_garch
+
+    dates = pd.bdate_range("2022-01-03", periods=360)
+    rng = np.random.default_rng(62)
+    returns = rng.standard_t(df=5, size=len(dates)) * 0.008
+    prices = pd.Series(np.exp(5 + returns.cumsum()), index=dates)
+    modified = prices.copy()
+    modified.iloc[300:] *= 1.2
+
+    observed = walk_forward_garch(prices, horizons=(1, 5), min_history=180)
+    revised = walk_forward_garch(modified, horizons=(1, 5), min_history=180)
+
+    pd.testing.assert_frame_equal(observed.loc[:dates[299]], revised.loc[:dates[299]])
+    assert (observed.dropna()[5] > observed.dropna()[1]).all()
+    assert observed[1].notna().sum() >= 100

@@ -30,6 +30,20 @@ def test_read_review_respects_generation_cutoff_and_code_version(tmp_path):
     assert read_risk_review(path, decision_at=now, data_asof="2026-11-06") is None
     result = read_risk_review(path, decision_at=now, data_asof="2026-11-09")
     assert all(candidate["status"] == "hold" for w in result["windows"].values() for candidate in w.values())
+    from risk_review import GARCH_CANDIDATE, garch_model_hash
+
+    report["protocol"] = "daily_close_variance_baselines_v4"
+    report["garch"] = {"code_sha256": garch_model_hash()}
+    for window in report["windows"].values():
+        window["release_review"][GARCH_CANDIDATE] = {"status": "hold", "blockers": ["incomplete_forecasts"]}
+        window["bands"][GARCH_CANDIDATE] = {"n": 0}
+    path.write_text(json.dumps(report), encoding="utf-8")
+    result = read_risk_review(path, decision_at=now, data_asof="2026-11-09")
+    assert result["windows"]["1"][GARCH_CANDIDATE]["blockers"] == ["incomplete_forecasts"]
+    report["garch"]["code_sha256"] = "wrong"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    assert read_risk_review(path, decision_at=now, data_asof="2026-11-09") is None
+    report["garch"]["code_sha256"] = garch_model_hash()
     report["model_code_sha256"] = "different"
     path.write_text(json.dumps(report), encoding="utf-8")
     assert read_risk_review(path, decision_at=now, data_asof="2026-11-09") is None

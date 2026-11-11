@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from evidence_shield import EvidencePacket
 from market_view import build_market_view
+from risk_review import GARCH_CANDIDATE
 from research_case import (
     AgentView,
     AuditReport,
@@ -216,7 +217,11 @@ def _model_registry(ctx: Dict[str, Any]) -> List[ModelCard]:
         ),
     ]
     risk_windows = (ctx.get("risk_review") or {}).get("windows") or {}
-    for model_id, label in (("log_har", "log-HAR"), ("log_har_vra", "log-HAR with matured error adjustment")):
+    for model_id, label in (
+        ("log_har", "log-HAR"),
+        ("log_har_vra", "log-HAR with matured error adjustment"),
+        (GARCH_CANDIDATE, "Student-t GARCH"),
+    ):
         reports = [window[model_id] for window in risk_windows.values() if model_id in window]
         coverage = [f"{window[model_id]['coverage']:.1%}" for window in risk_windows.values()
                     if model_id in window and window[model_id]["coverage"] is not None]

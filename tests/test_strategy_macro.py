@@ -120,3 +120,26 @@ def test_middle_term_forecasts_purge_unmatured_labels():
     assert before.index[-1] == dates[-64]
     assert before["matures_on"].iloc[-1] == dates[-1]
     assert not before.loc[:dates[649], "realized_return"].equals(after.loc[:dates[649], "realized_return"])
+
+
+def test_oil_interaction_compares_forecasts_on_same_mature_origins():
+    from strategy_macro import walk_forward_drivers
+
+    rng = np.random.default_rng(38)
+    dates = pd.bdate_range("2022-01-01", periods=600)
+    frame = pd.DataFrame({
+        "Gold": 1500 * np.exp(rng.normal(0, 0.01, len(dates)).cumsum()),
+        "USD_Index": 100 * np.exp(rng.normal(0, 0.01, len(dates)).cumsum()),
+        "Crude_Oil": 60 * np.exp(rng.normal(0, 0.025, len(dates)).cumsum()),
+        "Real_10Y": rng.normal(0, 0.02, len(dates)).cumsum(),
+    }, index=dates)
+    frame.loc[dates[270], "Crude_Oil"] = -5.0
+    forecasts = walk_forward_drivers(frame, horizon=21, training_rows=126, include_oil_interaction=True)
+    altered = frame.copy()
+    altered.loc[dates[500]:, "Crude_Oil"] *= 2
+    revised = walk_forward_drivers(altered, horizon=21, training_rows=126, include_oil_interaction=True)
+    columns = ["driver_forecast", "oil_additive_forecast", "oil_interaction_forecast"]
+
+    assert dates[270] not in forecasts.index and dates[291] not in forecasts.index
+    assert forecasts[columns].notna().all().all()
+    pd.testing.assert_frame_equal(forecasts.loc[:dates[499], columns], revised.loc[:dates[499], columns])

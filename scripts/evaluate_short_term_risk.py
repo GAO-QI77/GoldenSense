@@ -15,6 +15,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from gold_sessions import completed_gold_sessions
+from risk_review import GARCH_CANDIDATE
 from vol_models import walk_forward_variance
 
 
@@ -27,20 +28,29 @@ def _paired_block_interval(errors: pd.Series, block: int = 21) -> list[float] | 
         return None
     rng = np.random.default_rng(20261110)
     blocks_needed = (len(errors) + block - 1) // block
-    starts = rng.integers(0, len(errors) - block + 1, size=(1000, blocks_needed))
-    indices = (starts[:, :, None] + np.arange(block)).reshape(len(starts), -1)
+    starts = rng.integers(0, len(errors), size=(1000, blocks_needed))
+    indices = ((starts[:, :, None] + np.arange(block)) % len(errors)).reshape(len(starts), -1)
     draws = errors.to_numpy()[indices[:, :len(errors)]].mean(axis=1)
     return np.quantile(draws, [0.025, 0.975]).tolist()
+
+
+def _finite_number(value: float) -> float | None:
+    return float(value) if np.isfinite(value) else None
 
 
 def summarize_risk(
     prices: pd.Series, *, horizon: int, min_history: int = 260,
     evaluation_from: pd.Timestamp | None = None, include_challengers: bool = False,
+    garch_variance: pd.Series | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     comparison = walk_forward_variance(
         prices, horizon=horizon, min_history=min_history, include_challengers=include_challengers,
     )
-    models = ("rolling", "ewma", "har", "log_har", "log_har_vra") if include_challengers else ("rolling", "ewma", "har")
+    challengers = ("log_har", "log_har_vra") if include_challengers else ()
+    if garch_variance is not None:
+        comparison[f"{GARCH_CANDIDATE}_variance"] = garch_variance.reindex(comparison.index)
+        challengers = (*challengers, GARCH_CANDIDATE)
+    models = ("rolling", "ewma", "har", *challengers)
     forward = prices.shift(-horizon).div(prices).sub(1).reindex(comparison.index)
     comparison["realized_return"] = forward
     for model in models:
@@ -59,13 +69,13 @@ def summarize_risk(
     losses = {}
     bands = {}
     for model in models:
-        losses[model] = float(comparison[f"{model}_qlike"].mean())
+        losses[model] = _finite_number(comparison[f"{model}_qlike"].mean())
         valid = comparison.dropna(subset=[f"{model}_p10", f"{model}_p90"])
         standardized = comparison["realized_return"] / np.sqrt(comparison[f"{model}_variance"])
         result = {
             "n": len(valid),
-            "standardized_bias": float(standardized.mean()),
-            "standardized_dispersion": float(standardized.std(ddof=1)) if len(standardized) > 1 else None,
+            "standardized_bias": _finite_number(standardized.mean()),
+            "standardized_dispersion": _finite_number(standardized.std(ddof=1)),
         }
         if not valid.empty:
             below = valid["realized_return"] < valid[f"{model}_p10"]
@@ -80,9 +90,13 @@ def summarize_risk(
 
     difference = comparison["har_qlike"] - comparison["ewma_qlike"]
     paired = {}
-    for model in ("log_har", "log_har_vra") if include_challengers else ():
-        candidate = comparison[f"{model}_qlike"] - comparison["ewma_qlike"]
-        paired[model] = {"mean_difference": float(candidate.mean()), "ci95": _paired_block_interval(candidate)}
+    for model in challengers:
+        candidate = (comparison[f"{model}_qlike"] - comparison["ewma_qlike"]).dropna()
+        paired[model] = {
+            "mean_difference": _finite_number(candidate.mean()),
+            "n": len(candidate),
+            "ci95": _paired_block_interval(candidate) if len(candidate) == len(comparison) else None,
+        }
     return comparison, {
         "mature_forecasts": len(comparison),
         "first_origin": str(comparison.index[0].date()),
@@ -106,7 +120,9 @@ def main() -> int:
     parser.add_argument("--evaluation-from", help="First eligible evaluation origin (YYYY-MM-DD)")
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--challengers", action="store_true", help="Include log-HAR and mature-error VRA")
+    parser.add_argument("--student-t-garch", action="store_true", help="Also fit rolling Student-t GARCH(1,1)")
     args = parser.parse_args()
+    include_challengers = args.challengers or args.student_t_garch
 
     source_bytes = args.closes.read_bytes()
     frame = pd.read_csv(io.BytesIO(source_bytes), usecols=["Date", args.price_column])
@@ -123,12 +139,14 @@ def main() -> int:
         parser.error("no prices on or before --through")
     out = args.output_dir
     out.mkdir(parents=True, exist_ok=True)
+    version = 4 if args.student_t_garch else 3 if include_challengers else 2
     summary = {
         "research_horizon": "short_term",
-        "protocol": "daily_close_variance_baselines_v3" if args.challengers else "daily_close_variance_baselines_v2",
+        "protocol": f"daily_close_variance_baselines_v{version}",
         "calendar_sha256": hashlib.sha256(session_bytes).hexdigest() if session_bytes else None,
         "evaluation_from": args.evaluation_from,
         "paired_bootstrap_block": 21,
+        "paired_bootstrap_sampling": "circular_moving_block",
         "band_min_mature_samples": 126,
         "band_calibration_window": 500,
         "instrument": args.instrument,
@@ -145,16 +163,30 @@ def main() -> int:
         "rolling_window": 22,
         "ewma_decay": 0.94,
         "evidence_status": "exploratory",
-        "generated_at": datetime.now(timezone.utc).isoformat(),
         "windows": {},
     }
     evaluation_from = pd.to_datetime(args.evaluation_from, format="%Y-%m-%d")
-    for horizon in (1, 5, 21):
+    horizons = (1, 5, 21)
+    garch = None
+    if args.student_t_garch:
+        import arch
+        from garch_risk import FIT_WINDOW, REFIT_EVERY, walk_forward_garch
+        from risk_review import garch_model_hash
+
+        garch = walk_forward_garch(prices, horizons=horizons)
+        summary["garch"] = {
+            "arch_version": arch.__version__,
+            "fit_window": FIT_WINDOW,
+            "refit_every": REFIT_EVERY,
+            "code_sha256": garch_model_hash(),
+        }
+    for horizon in horizons:
         comparison, diagnostics = summarize_risk(
-            prices, horizon=horizon, evaluation_from=evaluation_from, include_challengers=args.challengers,
+            prices, horizon=horizon, evaluation_from=evaluation_from, include_challengers=include_challengers,
+            garch_variance=garch[horizon] if garch is not None else None,
         )
         comparison.to_csv(out / f"window_{horizon}.csv")
-        if args.challengers:
+        if include_challengers:
             review = {}
             for model, difference in diagnostics["challenger_qlike_vs_ewma"].items():
                 bands = diagnostics["bands"][model]
@@ -163,6 +195,8 @@ def main() -> int:
                     blockers.append("session_timestamps_missing")
                 if evaluation_from is None:
                     blockers.append("evaluation_start_missing")
+                if difference["n"] < diagnostics["mature_forecasts"]:
+                    blockers.append("incomplete_forecasts")
                 if bands["n"] < 126:
                     blockers.append("insufficient_mature_bands")
                 if not 0.75 <= bands.get("coverage", 0) <= 0.85 or max(bands.get("below", 1), bands.get("above", 1)) > 0.15:
@@ -172,8 +206,10 @@ def main() -> int:
                 review[model] = {"status": "hold" if blockers else "review_required", "blockers": blockers}
             diagnostics["release_review"] = review
         summary["windows"][horizon] = diagnostics
-    (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(summary, indent=2))
+    summary["generated_at"] = datetime.now(timezone.utc).isoformat()
+    report = json.dumps(summary, indent=2, allow_nan=False)
+    (out / "summary.json").write_text(report + "\n", encoding="utf-8")
+    print(report)
     return 0
 
 

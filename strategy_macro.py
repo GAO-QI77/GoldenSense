@@ -166,7 +166,7 @@ def driver_attribution(raw: pd.DataFrame, *, window: int = 252) -> pd.DataFrame 
 
 
 def walk_forward_drivers(
-    raw: pd.DataFrame, *, horizon: int, training_rows: int = 504,
+    raw: pd.DataFrame, *, horizon: int, training_rows: int = 504, include_oil_interaction: bool = False,
 ) -> pd.DataFrame:
     """Compare fixed rolling trend and macro models on the same mature sample."""
     from sklearn.linear_model import Ridge
@@ -179,7 +179,19 @@ def walk_forward_drivers(
     if not drivers:
         raise ValueError("no driver series available")
     gold = np.log(raw["Gold"].astype(float))
-    frame = pd.DataFrame({"trend": gold.diff(63), **drivers}).replace([np.inf, -np.inf], np.nan)
+    frame = pd.DataFrame({"trend": gold.diff(63), **drivers})
+    models = [("trend", ["trend"]), ("driver", list(frame.columns))]
+    if include_oil_interaction:
+        if not {"Crude_Oil", "Real_10Y"} <= set(raw):
+            raise ValueError("oil interaction requires crude oil and point-in-time real rates")
+        oil = raw["Crude_Oil"].astype(float)
+        earlier = oil.shift(21)
+        frame["oil_21"] = oil.where(oil > 0).div(earlier.where(earlier > 0)).sub(1)
+        frame["real_rate_21"] = raw["Real_10Y"].astype(float).diff(21)
+        models.append(("oil_additive", list(frame.columns)))
+        frame["oil_rate_interaction"] = frame["oil_21"] * frame["real_rate_21"]
+        models.append(("oil_interaction", list(frame.columns)))
+    frame = frame.replace([np.inf, -np.inf], np.nan)
     target = gold.shift(-horizon).sub(gold)
     maturity = raw.index.to_series().shift(-horizon)
     rows = []
@@ -197,7 +209,7 @@ def walk_forward_drivers(
             "realized_return": valid["target"],
             "zero_forecast": 0.0,
         })
-        for name, inputs in (("trend", ["trend"]), ("driver", list(frame.columns))):
+        for name, inputs in models:
             model = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
             model.fit(train[inputs], train["target"])
             result[f"{name}_forecast"] = model.predict(valid[inputs])
@@ -206,6 +218,8 @@ def walk_forward_drivers(
         raise ValueError("insufficient common mature driver history")
     result = pd.concat(rows)
     result.attrs["drivers"] = list(drivers)
+    if include_oil_interaction:
+        result.attrs["oil_features"] = models[-1][1][len(models[1][1]):]
     return result
 
 

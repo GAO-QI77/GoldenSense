@@ -740,6 +740,10 @@ function FactorPanel({ factors, attribution, degraded, macroDegraded }) {
       degraded={degraded}
     >
       {macroDegraded && <p className="quant-note">部分宏观历史版本缺失。当前展示已有来源的因子和归因。</p>}
+      <p className="quant-note">
+        利率数据来自美联储理事会 H.15，通胀预期数据来自圣路易斯联储。
+        <a href="https://alfred.stlouisfed.org/" target="_blank" rel="noreferrer"> FRED / ALFRED 历史版本</a>
+      </p>
       <ul className="factor-list">
         {used.map((key) => {
           const meta = FACTOR_LABELS[key] || { label: key, hint: '' };
@@ -827,12 +831,19 @@ function GoldDriverEvidencePanel({ drivers }) {
 }
 
 /* -------------------------------- vol ------------------------------------ */
+const riskCandidateLabels = {
+  log_har: 'log-HAR',
+  log_har_vra: 'log-HAR 加成熟误差校准',
+  student_t_garch: 'Student-t GARCH',
+};
+
 const riskBlockerLabels = {
   session_timestamps_missing: '缺少核验会话',
   evaluation_start_missing: '缺少留出起点',
   insufficient_mature_bands: '成熟样本不足',
   coverage_or_tail_failed: '覆盖率或尾部未达标',
   incremental_error_not_demonstrated: '误差改善尚待验证',
+  incomplete_forecasts: '候选模型的预测记录不完整',
 };
 
 function RiskCandidateReview({ review }) {
@@ -848,8 +859,11 @@ function RiskCandidateReview({ review }) {
             {Object.entries(candidates).map(([name, candidate]) => (
               <div key={name}>
                 <strong>{fmt.pct(candidate.coverage, 1)}</strong>
-                <small>{name === 'log_har' ? 'log-HAR' : 'log-HAR 加成熟误差校准'}</small>
-                <small>{candidate.n} 个成熟样本 · {candidate.status === 'hold' ? '暂缓晋级' : '待独立评审'}</small>
+                <small>{riskCandidateLabels[name] ?? name}</small>
+                <small>
+                  {candidate.n == null ? '成熟样本数待确认' : `${candidate.n} 个成熟样本`}
+                  {' · '}{candidate.status === 'hold' ? '暂缓晋级' : '待独立评审'}
+                </small>
                 <small>{(candidate.blockers || []).map((flag) => riskBlockerLabels[flag] || flag).join('、')}</small>
               </div>
             ))}

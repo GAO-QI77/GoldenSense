@@ -350,21 +350,40 @@ export default function SignalsPage() {
               {trackRecord.price_evidence === 'date_only_proxy' && (
                 <p className="muted-copy">行情按日期估算可用时间，记分供研究参考。</p>
               )}
-              {Object.entries(trackRecord.per_profile || {}).map(([profile, stats]) => (
-                <div key={profile} className="track-row">
-                  <strong>{{ conservative: '保守', balanced: '稳健', aggressive: '进取' }[profile]}</strong>
-                  <span>周数 {stats.weeks_scored}</span>
-                  <span>
-                    累计 {stats.cum_return != null ? `${(stats.cum_return * 100).toFixed(2)}%` : '—'}
-                  </span>
-                  <span>
-                    回撤 {stats.max_drawdown != null ? `${(stats.max_drawdown * 100).toFixed(2)}%` : '—'}
-                  </span>
-                  {trackRecord.benchmarks?.[`${profile}_fixed_net`]?.cum_return != null && (
-                    <span className="track-row-benchmark">同成本固定仓位 {(trackRecord.benchmarks[`${profile}_fixed_net`].cum_return * 100).toFixed(2)}%</span>
-                  )}
-                </div>
-              ))}
+              {Object.entries(trackRecord.per_profile || {}).map(([profile, stats]) => {
+                const fixed = trackRecord.benchmarks?.[`${profile}_fixed_net`];
+                const riskMatched = trackRecord.benchmarks?.[`${profile}_risk_matched_net`];
+                const samePeriodReturn = riskMatched?.strategy_same_period?.cum_return;
+                return (
+                  <div key={profile} className="track-row">
+                    <strong>{{ conservative: '保守', balanced: '稳健', aggressive: '进取' }[profile]}</strong>
+                    <span>周数 {stats.weeks_scored}</span>
+                    <span>
+                      累计 {stats.cum_return != null ? `${(stats.cum_return * 100).toFixed(2)}%` : '—'}
+                    </span>
+                    <span>
+                      回撤 {stats.max_drawdown != null ? `${(stats.max_drawdown * 100).toFixed(2)}%` : '—'}
+                    </span>
+                    {fixed?.cum_return != null && (
+                      <span className="track-row-benchmark">同成本固定仓位 {(fixed.cum_return * 100).toFixed(2)}%</span>
+                    )}
+                    {Number.isFinite(riskMatched?.cum_return) && (
+                      <span className="track-row-benchmark">
+                        同成本风险匹配基准 {(riskMatched.cum_return * 100).toFixed(2)}%
+                        {Number.isFinite(samePeriodReturn)
+                          ? ` · 同期策略 ${(samePeriodReturn * 100).toFixed(2)}%`
+                          : null}
+                        {Number.isFinite(riskMatched.target_ann_vol)
+                          ? ` · 目标年化波动率 ${(riskMatched.target_ann_vol * 100).toFixed(1)}%`
+                          : null}
+                        {typeof riskMatched.start_at === 'string' && riskMatched.start_at
+                          ? ` · 自 ${riskMatched.start_at.slice(0, 10)} 起`
+                          : null}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
               <div className="track-benchmarks">
                 <span>
                   基准·金价买入持有：

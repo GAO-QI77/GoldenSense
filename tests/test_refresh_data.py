@@ -218,6 +218,32 @@ def test_archive_recent_news_ingests_relevant_items(tmp_path):
     assert report["dropped"] == 1
 
 
+def test_scheduled_news_archive_keeps_article_link_and_observation_clocks(tmp_path):
+    from news_archive import NewsArchive
+
+    path = tmp_path / "archive.jsonl"
+    archive = NewsArchive(path)
+    first_seen = datetime.now(timezone.utc) - timedelta(minutes=1)
+    original_url = "https://www.bls.gov/news.release/example?from=rss"
+    items = [
+        {"title": "美国 CPI 通胀数据", "published": first_seen.isoformat(),
+         "first_seen_at": first_seen, "url": original_url},
+        {"title": "黄金 ETF 资金流出", "published": first_seen.isoformat(),
+         "url": "https://fake@news.example/article"},
+    ]
+
+    report = refresh_data.archive_recent_news(fetch_items=lambda: items, archive=archive)
+
+    assert report["kept"] == 2
+    observed, legacy = [json.loads(line) for line in path.read_text().splitlines()]
+    assert observed["url"] == original_url
+    assert observed["first_seen_at"] == first_seen.isoformat()
+    assert observed["available_at"] == observed["archived_at"]
+    assert "url" not in legacy
+    assert "first_seen_at" not in legacy
+    assert legacy["available_at"] == legacy["archived_at"]
+
+
 def test_archive_recent_news_degrades_on_feed_failure(tmp_path):
     from news_archive import NewsArchive
     from scripts.refresh_data import archive_recent_news

@@ -7,6 +7,8 @@ import os
 import numpy as np
 import pandas as pd
 
+PRICE_AVAILABILITY_ATTR = "available_at_by_close"
+
 
 def _utc_timestamps(values: pd.Series) -> pd.Series:
     if not values.astype(str).str.fullmatch(
@@ -47,7 +49,7 @@ def completed_gold_sessions(prices: pd.Series, calendar: pd.DataFrame, *, throug
 
 
 def load_gold_outcome_prices(decision_at: datetime) -> tuple[pd.Series, str]:
-    """Return completed prices by execution timestamp when the source files exist."""
+    """Return completed prices with their availability clocks keyed by UTC close."""
     close_path = os.environ.get("GOLD_VERIFIED_CLOSES_PATH")
     session_path = os.environ.get("GOLD_VERIFIED_SESSIONS_PATH")
     if bool(close_path) != bool(session_path):
@@ -57,10 +59,22 @@ def load_gold_outcome_prices(decision_at: datetime) -> tuple[pd.Series, str]:
         dates = pd.to_datetime(rows["Date"], format="%Y-%m-%d")
         prices = pd.Series(rows["Gold"].to_numpy(), index=pd.DatetimeIndex(dates))
         bars = completed_gold_sessions(prices, pd.read_csv(session_path), through=decision_at.isoformat())
-        return bars.set_index("close_at")["Gold"], "session_timestamps"
+        verified_prices = bars.set_index("close_at")["Gold"]
+        verified_prices.attrs[PRICE_AVAILABILITY_ATTR] = dict(
+            zip(verified_prices.index, bars["available_at"])
+        )
+        return verified_prices, "session_timestamps"
 
-    from data_loader import market_data_as_of
+    from data_loader import market_availability_times, market_data_as_of
     from data_sources import load_market_data
 
     raw, source = load_market_data()
-    return market_data_as_of(raw[["Gold"]], decision_at)["Gold"], source
+    dates = pd.DatetimeIndex(raw.index)
+    availability_by_close = dict(
+        zip(pd.to_datetime(dates, utc=True), market_availability_times(dates))
+    )
+    prices = market_data_as_of(raw[["Gold"]], decision_at)["Gold"]
+    prices.attrs[PRICE_AVAILABILITY_ATTR] = {
+        close: availability_by_close[close] for close in pd.to_datetime(prices.index, utc=True)
+    }
+    return prices, source

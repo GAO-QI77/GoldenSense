@@ -6,11 +6,16 @@ from math import isfinite
 from pathlib import Path
 
 CANDIDATES = ("log_har", "log_har_vra")
+GARCH_CANDIDATE = "student_t_garch"
 WINDOWS = ("1", "5", "21")
 BLOCKERS = {
     "session_timestamps_missing", "evaluation_start_missing", "insufficient_mature_bands",
-    "coverage_or_tail_failed", "incremental_error_not_demonstrated",
+    "coverage_or_tail_failed", "incremental_error_not_demonstrated", "incomplete_forecasts",
 }
+
+
+def garch_model_hash() -> str:
+    return sha256(Path(__file__).with_name("garch_risk.py").read_bytes()).hexdigest()
 
 
 def read_risk_review(path: Path, *, decision_at: datetime, data_asof: str) -> dict | None:
@@ -21,18 +26,23 @@ def read_risk_review(path: Path, *, decision_at: datetime, data_asof: str) -> di
         model_digest = sha256(Path(__file__).with_name("vol_models.py").read_bytes()).hexdigest()
         generated_at = datetime.fromisoformat(raw["generated_at"])
         if (
-            raw["protocol"] != "daily_close_variance_baselines_v3"
+            raw["protocol"] not in ("daily_close_variance_baselines_v3", "daily_close_variance_baselines_v4")
             or raw["instrument"] != "GC=F"
             or raw["model_code_sha256"] != model_digest
             or generated_at > decision_at
             or date.fromisoformat(raw["price_end"]) > date.fromisoformat(data_asof)
         ):
             return None
+        candidates = CANDIDATES
+        if raw["protocol"] == "daily_close_variance_baselines_v4":
+            if raw["garch"]["code_sha256"] != garch_model_hash():
+                return None
+            candidates = (*candidates, GARCH_CANDIDATE)
         windows = {}
         for horizon in WINDOWS:
             window = raw["windows"][horizon]
             windows[horizon] = {}
-            for model in CANDIDATES:
+            for model in candidates:
                 report = window["release_review"][model]
                 bands = window["bands"][model]
                 flags = report["blockers"]

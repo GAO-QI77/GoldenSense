@@ -28,11 +28,12 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Protocol, Tuple
 
 import pandas as pd
 
 from allocation import ALLOCATION_DISCLAIMER
+from gold_sessions import PRICE_AVAILABILITY_ATTR
 from market_view import build_market_view, summarize_for_ledger
 
 TRACK_RECORD_DISCLAIMER = (
@@ -42,6 +43,8 @@ TRACK_RECORD_DISCLAIMER = (
 
 PROFILES = ("conservative", "balanced", "aggressive")
 WEEKS_PER_YEAR = 52
+RISK_MATCH_LOOKBACK_SESSIONS = 20
+RISK_MATCH_WEIGHT_CAP = 1.0
 
 
 # --------------------------------------------------------------------------- #
@@ -408,6 +411,12 @@ def publish_weekly(
 # --------------------------------------------------------------------------- #
 # Track record scoring
 # --------------------------------------------------------------------------- #
+class _Execution(NamedTuple):
+    at: pd.Timestamp
+    record: Dict[str, Any]
+    price: float
+
+
 def _rebalance_price(prices: pd.Series, published_at: str) -> Optional[Tuple[pd.Timestamp, float]]:
     """First price strictly after publication. Date-only bars start at UTC midnight."""
     try:
@@ -474,25 +483,54 @@ def score_track_record(
     cost_bps: float = 5.0,
     decision_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
-    """Score matured weeks of the shadow portfolios against fixed benchmarks."""
+    """Score matured shadow returns and comparable fixed and risk-matched portfolios.
+
+    At the first comparable execution, freeze the profile's published weight
+    times the annualized sample volatility of the last 20 visible gold close
+    returns. The gold volatility must be positive. The benchmark targets that
+    risk at each subsequent execution using only prices available strictly
+    before the trade. It holds only gold (capped at 100%) and cash. If a later
+    volatility estimate is unusable, it keeps its drifted exposure.
+    """
+    from data_loader import market_availability_times
+
     prices = prices.astype(float).dropna().sort_index()
     if not prices.index.is_unique or not prices.map(lambda p: math.isfinite(p) and p > 0).all():
         raise ValueError("shadow prices must be positive and uniquely timestamped")
     if not 0 <= cost_bps < 10000:
         raise ValueError("invalid shadow transaction cost")
+    rate = cost_bps / 10000.0
+    availability_by_close = prices.attrs.get(PRICE_AVAILABILITY_ATTR)
+    if availability_by_close is None:
+        availability = market_availability_times(pd.DatetimeIndex(prices.index))
+    else:
+        availability = pd.DatetimeIndex(
+            [availability_by_close[close] for close in pd.to_datetime(prices.index, utc=True)],
+            tz="UTC",
+        )
     if decision_at is not None:
-        from data_loader import market_data_as_of
-
-        prices = market_data_as_of(prices.to_frame("Gold"), decision_at)["Gold"]
+        visible = availability <= pd.to_datetime(decision_at, utc=True)
+        prices = prices.loc[visible]
+        availability = availability[visible]
     ordered = sorted(publications, key=lambda r: r.get("published_at") or "")
 
     # Resolve each publication's rebalance point; drop those without prices.
-    executions: Dict[pd.Timestamp, Tuple[Dict[str, Any], float]] = {}
+    executions: Dict[pd.Timestamp, _Execution] = {}
     for record in ordered:
         resolved = _rebalance_price(prices, record.get("published_at", ""))
         if resolved is not None:
-            executions[resolved[0]] = (record, resolved[1])
+            at, price = resolved
+            executions[at] = _Execution(at, record, price)
     points = [executions[date] for date in sorted(executions)]
+
+    trailing_vol = prices.pct_change().rolling(RISK_MATCH_LOOKBACK_SESSIONS).std() * math.sqrt(252)
+    prior_gold_vol: Dict[pd.Timestamp, float] = {}
+    for point in points[:-1]:
+        visible_count = availability.searchsorted(pd.to_datetime(point.at, utc=True), side="left")
+        if visible_count > RISK_MATCH_LOOKBACK_SESSIONS:
+            vol = float(trailing_vol.iloc[visible_count - 1])
+            if math.isfinite(vol) and vol > 0:
+                prior_gold_vol[point.at] = vol
 
     result: Dict[str, Any] = {
         "evidence_class": "simulated_forward",
@@ -509,28 +547,52 @@ def score_track_record(
     # A week matures when the *next* publication's rebalance price exists.
     matured_pairs = list(zip(points[:-1], points[1:]))
     if matured_pairs:
-        result["matured_through"] = matured_pairs[-1][1][0].get("publication_id")
+        result["matured_through"] = points[-1].record.get("publication_id")
 
     for profile in PROFILES:
         weekly_returns: List[float] = []
         fixed_returns: List[float] = []
+        risk_matched_returns: List[float] = []
+        same_period_strategy_returns: List[float] = []
         fixed_weight = None
+        risk_target = risk_start_at = None
         drift = fixed_drift = 0.0
-        for (rec, p0), (_next_rec, p1) in matured_pairs:
-            midpoint = ((rec.get("allocations") or {}).get(profile) or {}).get("midpoint")
+        risk_matched_drift = same_period_strategy_drift = 0.0
+        for current, following in matured_pairs:
+            midpoint = ((current.record.get("allocations") or {}).get(profile) or {}).get("midpoint")
             if midpoint is None and not weekly_returns:
                 continue
             weight = drift if midpoint is None else float(midpoint) / 100.0
             if not 0 <= weight <= 1:
                 raise ValueError("shadow allocations must lie between 0% and 100%")
-            gold_return = p1 / p0 - 1.0
-            rate = cost_bps / 10000.0
+            gold_return = following.price / current.price - 1.0
             period_return, drift = _shadow_step(weight, drift, gold_return, rate)
             weekly_returns.append(period_return)
             if fixed_weight is None:
                 fixed_weight = weight
             fixed_return, fixed_drift = _shadow_step(fixed_weight, fixed_drift, gold_return, rate)
             fixed_returns.append(fixed_return)
+
+            gold_vol = prior_gold_vol.get(current.at)
+            if risk_target is None:
+                if gold_vol is None or midpoint is None:
+                    continue
+                risk_target = weight * gold_vol
+                risk_start_at = pd.to_datetime(current.at, utc=True).isoformat()
+            risk_weight = (
+                min(RISK_MATCH_WEIGHT_CAP, risk_target / gold_vol)
+                if gold_vol is not None else risk_matched_drift
+            )
+            risk_return, risk_matched_drift = _shadow_step(
+                risk_weight, risk_matched_drift, gold_return, rate,
+            )
+            risk_matched_returns.append(risk_return)
+            # Compare the exact same intervals, starting both portfolios in cash.
+            strategy_weight = same_period_strategy_drift if midpoint is None else weight
+            strategy_return, same_period_strategy_drift = _shadow_step(
+                strategy_weight, same_period_strategy_drift, gold_return, rate,
+            )
+            same_period_strategy_returns.append(strategy_return)
         result["per_profile"][profile] = {
             **_profile_stats(weekly_returns),
             "evidence_class": "simulated_forward",
@@ -543,11 +605,29 @@ def score_track_record(
                 "weight_pct": round(fixed_weight * 100, 4),
                 "description": "首期仓位固定权重，同期再平衡，计入同口径成本",
             }
+        result["benchmarks"][f"{profile}_risk_matched_net"] = {
+            **_profile_stats(risk_matched_returns),
+            "evidence_class": "simulated_forward",
+            "cost_bps": cost_bps,
+            "lookback_sessions": RISK_MATCH_LOOKBACK_SESSIONS,
+            "weight_cap_pct": RISK_MATCH_WEIGHT_CAP * 100,
+            "target_ann_vol": risk_target,
+            "start_at": risk_start_at,
+            "strategy_same_period": {
+                **_profile_stats(same_period_strategy_returns),
+                "evidence_class": "simulated_forward",
+            },
+            "description": (
+                "以首个可比区间的策略黄金仓位乘以当时的黄金年化波动率，冻结目标。"
+                "每次按执行前已可见的近20个交易日收益估算波动率，"
+                "调整黄金仓位（上限100%），同日再平衡并计入同口径成本。"
+            ),
+        }
 
     # Gross reference benchmarks over the full matured span.
     if matured_pairs:
-        p_first = matured_pairs[0][0][1]
-        p_last = matured_pairs[-1][1][1]
+        p_first = points[0].price
+        p_last = points[-1].price
         gold_cum = p_last / p_first - 1.0
         result["benchmarks"]["gold_buy_hold"] = {
             "evidence_class": "simulated_forward",
@@ -555,12 +635,13 @@ def score_track_record(
             "description": "同期 100% 黄金买入持有（无成本）",
         }
         first_mid = (
-            (matured_pairs[0][0][0].get("allocations") or {}).get("balanced") or {}
+            (points[0].record.get("allocations") or {}).get("balanced") or {}
         ).get("midpoint")
         if first_mid is not None:
             w = float(first_mid) / 100.0
             static_returns = [
-                w * (p1 / p0 - 1.0) for (_r, p0), (_n, p1) in matured_pairs
+                w * (following.price / current.price - 1.0)
+                for current, following in matured_pairs
             ]
             equity = 1.0
             for r in static_returns:

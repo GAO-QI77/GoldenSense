@@ -489,9 +489,17 @@ ETF、COT、央行数据按 45、21、145 个自然日判断过期，GLD 成交�
 `data_cache/market_extended.csv`，可用 `GOLD_RESEARCH_MARKET_PATH` 指定路径。
 日级市场快照采用次日 UTC 截止。短期复验用
 `scripts/evaluate_short_term_risk.py --challengers` 计算 log-HAR 及成熟误差校准候选。
+加 `--student-t-garch` 可纳入使用厚尾误差的 GARCH(1,1)。研究环境需安装 `requirements.txt`，
+使用至多 756 个历史观测拟合，每 21 个观测重新估计。未收敛的窗口保留为缺失并阻止晋级。
 将生成的 `summary.json` 放在 `data_cache/gold_risk_review.json` 或通过
 `GOLD_RISK_REVIEW_PATH` 指定，可在量化页看到样本、覆盖率和暂缓晋级原因。
 候选产物只进入研究证据，现有风险区间继续使用基线。
+
+中期可用 `scripts/evaluate_mid_term_drivers.py --oil-interaction` 在共同成熟样本上比较
+WTI 与实际利率的主效应、交互项和零收益基准，逐期预测另存为 CSV。
+影子账本的风险匹配基准以首个可比较区间的实际仓位和近 20 个交易日的黄金波动率确定目标。
+之后仅用执行前已可见的收益估计波动率，黄金仓位上限为 100%，与策略同期计费和再平衡。
+
 
 ### 生产运维
 

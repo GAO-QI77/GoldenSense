@@ -561,3 +561,84 @@ def test_static_comparator_uses_same_costs_and_initial_exposure():
     assert benchmark["cost_bps"] == 100
     assert benchmark["evidence_class"] == "simulated_forward"
     assert benchmark["cum_return"] == score["per_profile"]["balanced"]["cum_return"]
+
+
+@pytest.mark.parametrize("configured_proxy", [False, True])
+def test_risk_matched_comparator_uses_prior_visible_prices_and_same_fees(configured_proxy, monkeypatch):
+    dates = pd.bdate_range("2026-06-08", "2026-07-28")
+    prices = pd.Series(
+        [100 + i * 0.4 + (-1) ** i * (0.5 if i < 28 else 2.0) for i in range(len(dates))],
+        index=dates,
+    )
+    scoring_prices = prices
+    if configured_proxy:
+        from gold_sessions import load_gold_outcome_prices
+
+        # Local midnight labels retain their delayed availability after UTC conversion.
+        raw = prices.tz_localize("Asia/Shanghai").to_frame("Gold")
+        monkeypatch.delenv("GOLD_VERIFIED_CLOSES_PATH", raising=False)
+        monkeypatch.delenv("GOLD_VERIFIED_SESSIONS_PATH", raising=False)
+        monkeypatch.setattr("data_sources.load_market_data", lambda: (raw, "base"))
+        scoring_prices, _source = load_gold_outcome_prices(MON + pd.Timedelta(days=16))
+
+    records = [build_publication(_ctx(), now=MON + pd.Timedelta(weeks=i)) for i in range(3)]
+    full_score = score_track_record(records, scoring_prices, cost_bps=100)
+    first_score = score_track_record(records[:2], scoring_prices, cost_bps=100)
+    benchmark = full_score["benchmarks"]["balanced_risk_matched_net"]
+    first_only = first_score["benchmarks"]["balanced_risk_matched_net"]
+
+    returns = prices.pct_change()
+    first_vol = returns.loc[:"2026-07-10"].tail(20).std() * 252**0.5
+    second_vol = returns.loc[:"2026-07-17"].tail(20).std() * 252**0.5
+    first_weight = 0.085
+    second_weight = first_weight * first_vol / second_vol
+    first_gold_return = prices["2026-07-21"] / prices["2026-07-14"] - 1
+    second_gold_return = prices["2026-07-28"] / prices["2026-07-21"] - 1
+    first_growth = 1 + first_weight * first_gold_return
+    first_cost = 0.01 * first_weight / (1 + 0.01 * first_weight)
+    drift = first_weight * (1 + first_gold_return) / first_growth
+    assert second_weight < drift
+    second_cost = 0.01 * (drift - second_weight) / (1 - 0.01 * second_weight)
+    expected = (
+        (1 - first_cost) * first_growth * (1 - second_cost) * (1 + second_weight * second_gold_return)
+        - 1
+    )
+
+    assert benchmark["weeks_scored"] == benchmark["strategy_same_period"]["weeks_scored"] == 2
+    assert benchmark["target_ann_vol"] == first_only["target_ann_vol"] == pytest.approx(first_weight * first_vol)
+    assert benchmark["cum_return"] == pytest.approx(expected, abs=5e-7)
+    assert first_only["cum_return"] == first_only["strategy_same_period"]["cum_return"]
+    assert benchmark["evidence_class"] == "simulated_forward"
+
+
+def test_risk_matched_comparator_waits_for_enough_strictly_prior_verified_closes(monkeypatch, tmp_path):
+    from signal_ledger import score_configured_track_record
+
+    records = [build_publication(_ctx(), now=MON + pd.Timedelta(weeks=i)) for i in range(3)]
+    dates = pd.bdate_range(end="2026-07-10", periods=21).append(
+        pd.DatetimeIndex(["2026-07-13", "2026-07-20", "2026-07-27"])
+    )
+    closes = tmp_path / "prices.csv"
+    closes.write_text("Date,Gold\n" + "".join(
+        f"{date.date()},{100 + i + (-1) ** i}\n" for i, date in enumerate(dates)
+    ))
+    sessions = tmp_path / "sessions.csv"
+    sessions.write_text("Date,close_at,available_at\n" + "".join(
+        f"{date.date()},{date.date()}T18:00:00Z,"
+        f"{'2026-07-13T18:00:00Z' if i == 20 else f'{date.date()}T19:00:00Z'}\n"
+        for i, date in enumerate(dates)
+    ))
+    monkeypatch.setenv("GOLD_VERIFIED_CLOSES_PATH", str(closes))
+    monkeypatch.setenv("GOLD_VERIFIED_SESSIONS_PATH", str(sessions))
+    score = score_configured_track_record(records, decision_at=MON + pd.Timedelta(days=15))
+    benchmark = score["benchmarks"]["balanced_risk_matched_net"]
+
+    assert score["per_profile"]["balanced"]["weeks_scored"] == 2
+    assert benchmark["start_at"] == "2026-07-20T18:00:00+00:00"
+    assert benchmark["weeks_scored"] == benchmark["strategy_same_period"]["weeks_scored"] == 1
+    assert benchmark["cum_return"] == benchmark["strategy_same_period"]["cum_return"]
+
+    early = score_configured_track_record(records, decision_at=MON + pd.Timedelta(days=8))
+    early_benchmark = early["benchmarks"]["balanced_risk_matched_net"]
+    assert early_benchmark["weeks_scored"] == 0
+    assert early_benchmark["cum_return"] is None

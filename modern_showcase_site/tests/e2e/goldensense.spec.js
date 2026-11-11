@@ -1498,7 +1498,10 @@ test('quant page displays driver attribution and matured valuation evidence', as
       risk_review: {
         price_end: '2026-07-14',
         windows: {
-          '1': { log_har: { n: 82, coverage: 0.817, status: 'hold', blockers: ['session_timestamps_missing'] } },
+          '1': {
+            log_har: { n: 82, coverage: 0.817, status: 'hold', blockers: ['session_timestamps_missing'] },
+            student_t_garch: { n: null, coverage: null, status: 'hold', blockers: ['incomplete_forecasts'] },
+          },
         },
       },
       fair_value: {
@@ -1526,6 +1529,9 @@ test('quant page displays driver attribution and matured valuation evidence', as
   await expect(page.getByRole('heading', { name: '短期风险候选复验' })).toBeVisible();
   await expect(page.getByText('82 个成熟样本 · 暂缓晋级')).toBeVisible();
   await expect(page.getByText('缺少核验会话')).toBeVisible();
+  await expect(page.getByText('Student-t GARCH', { exact: true })).toBeVisible();
+  await expect(page.getByText('成熟样本数待确认 · 暂缓晋级')).toBeVisible();
+  await expect(page.getByText('候选模型的预测记录不完整')).toBeVisible();
 });
 
 test('signals page labels date-only proxy scoring and same-cost benchmarks', async ({ page }) => {
@@ -1542,8 +1548,21 @@ test('signals page labels date-only proxy scoring and same-cost benchmarks', asy
     route.fulfill({
       json: {
         price_evidence: 'date_only_proxy',
-        per_profile: { balanced: { weeks_scored: 2, cum_return: 0.04, max_drawdown: -0.01 } },
-        benchmarks: { balanced_fixed_net: { cum_return: 0.03 } },
+        per_profile: {
+          conservative: { weeks_scored: 2, cum_return: 0.02 },
+          balanced: { weeks_scored: 2, cum_return: 0.04, max_drawdown: -0.01 },
+        },
+        benchmarks: {
+          conservative_risk_matched_net: { weeks_scored: 0, cum_return: null },
+          balanced_fixed_net: { cum_return: 0.03 },
+          balanced_risk_matched_net: {
+            weeks_scored: 1,
+            cum_return: 0.025,
+            target_ann_vol: 0.08,
+            start_at: '2026-07-20T18:00:00+00:00',
+            strategy_same_period: { weeks_scored: 1, cum_return: 0.035 },
+          },
+        },
       },
     }),
   );
@@ -1553,6 +1572,8 @@ test('signals page labels date-only proxy scoring and same-cost benchmarks', asy
   await page.goto('/signals');
   await expect(page.getByText('行情按日期估算可用时间，记分供研究参考。')).toBeVisible();
   await expect(page.getByText('同成本固定仓位 3.00%')).toBeVisible();
+  await expect(page.getByText('同成本风险匹配基准 2.50% · 同期策略 3.50% · 目标年化波动率 8.0% · 自 2026-07-20 起')).toBeVisible();
+  await expect(page.getByText(/同成本风险匹配基准/)).toHaveCount(1);
 });
 
 for (const scenario of [

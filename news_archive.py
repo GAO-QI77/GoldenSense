@@ -18,8 +18,10 @@ import math
 import re
 import threading
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from event_classifier import HIGH_SEVERITY_TERMS, classify_news
 
@@ -55,15 +57,55 @@ def _normalize_title(title: str) -> str:
     return _WS_RE.sub("", (title or "").strip().lower())
 
 
-def _parse_ts(value: Any) -> Optional[datetime]:
+def parse_archive_timestamp(value: Any, *, require_timezone: bool = False) -> Optional[datetime]:
+    """Read stored ISO clocks and RSS clocks with an explicit timezone."""
     if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if isinstance(value, str):
+        parsed = value
+    elif isinstance(value, str):
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
         except ValueError:
+            try:
+                parsed = parsedate_to_datetime(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            require_timezone = True
+    else:
+        return None
+    if parsed.utcoffset() is None:
+        return None if require_timezone else parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _version_times(record: Dict[str, Any]) -> dict[str, datetime] | None:
+    times = {}
+    for field in ("first_seen_at", "available_at", "updated", "updated_at"):
+        value = record.get(field)
+        if value is None:
+            continue
+        parsed = parse_archive_timestamp(value, require_timezone=True)
+        if parsed is None:
             return None
+        times[field] = parsed
+    return times
+
+
+def _article_url(value: Any) -> str | None:
+    if not isinstance(value, str) or any(
+        char.isspace() or ord(char) < 32 or char == "\\" for char in value
+    ):
+        return None
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme in {"http", "https"}
+            and parsed.hostname
+            and parsed.username is None
+            and (parsed.port is None or parsed.port > 0)
+        ):
+            return value
+    except ValueError:
+        pass
     return None
 
 
@@ -109,7 +151,7 @@ class NewsArchive:
 
     @staticmethod
     def _is_expired(record: Dict[str, Any], now: datetime) -> bool:
-        ts = _parse_ts(record.get("published_at"))
+        ts = parse_archive_timestamp(record.get("published_at"))
         if ts is None:
             return True
         return (now - ts).days > TTL_DAYS
@@ -129,8 +171,14 @@ class NewsArchive:
             kept = dropped = deduped = 0
             for item in items:
                 key = _normalize_title(item.get("title", ""))
-                published = _parse_ts(item.get("published_at"))
-                if not key or published is None:
+                published = parse_archive_timestamp(item.get("published_at"))
+                version_times = _version_times(item)
+                if (
+                    not key
+                    or published is None
+                    or version_times is None
+                    or any(ts > now for ts in version_times.values())
+                ):
                     dropped += 1
                     continue
                 if key in seen:
@@ -149,7 +197,13 @@ class NewsArchive:
                     "relevance": score,
                     "classification": classify_news(text),
                     "archived_at": now.isoformat(),
+                    "available_at": max(now, published, *version_times.values()).isoformat(),
                 }
+                if "first_seen_at" in version_times:
+                    record["first_seen_at"] = version_times["first_seen_at"].isoformat()
+                url = _article_url(item.get("url"))
+                if url is not None:
+                    record["url"] = url
                 existing.append(record)
                 seen.add(key)
                 kept += 1
@@ -172,14 +226,17 @@ class NewsArchive:
             return []
         results: List[Dict[str, Any]] = []
         for record in self._load():
-            published = _parse_ts(record.get("published_at"))
-            archived = _parse_ts(record.get("archived_at"))
+            published = parse_archive_timestamp(record.get("published_at"))
+            archived = parse_archive_timestamp(record.get("archived_at"))
+            version_times = _version_times(record)
             if (
                 published is None
                 or published > now
                 or archived is None
                 or archived > now
-                or self._is_expired(record, now)
+                or version_times is None
+                or any(ts > now for ts in version_times.values())
+                or (now - published).days > TTL_DAYS
             ):
                 continue
             text = f"{record.get('title', '')} {record.get('summary', '')}".lower()

@@ -186,6 +186,11 @@ def archive_recent_news(*, fetch_items=None, archive=None) -> dict:
                 "summary": item.get("summary"),
                 "source": item.get("source"),
                 "published_at": item.get("published_at") or item.get("published"),
+                "url": item.get("url") or item.get("link"),
+                "first_seen_at": item.get("first_seen_at"),
+                "available_at": item.get("available_at"),
+                "updated": item.get("updated"),
+                "updated_at": item.get("updated_at"),
             }
             for item in items
         ]

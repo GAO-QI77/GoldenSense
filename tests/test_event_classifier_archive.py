@@ -1,5 +1,6 @@
 """Tests for the news event classifier and the decision-relevant news archive."""
 from datetime import datetime, timedelta, timezone
+import json
 
 import pytest
 
@@ -116,3 +117,31 @@ def test_archive_search_excludes_future_and_late_ingested_news(tmp_path):
     ], now=NOW + timedelta(minutes=10))
 
     assert [item["title"] for item in archive.search("黄金", now=NOW)] == ["美联储加息影响黄金"]
+
+
+def test_archive_reads_legacy_rss_clocks_without_bypassing_capture_cutoff(tmp_path):
+    path = tmp_path / "archive.jsonl"
+    records = [
+        {**_item("黄金报道一"), "published_at": "Thu, 16 Jul 2026 11:00:00 Z", "archived_at": NOW.isoformat()},
+        {**_item("黄金报道二"), "published_at": "Thu, 16 Jul 2026 11:00:00 GMT", "archived_at": NOW.isoformat()},
+        {**_item("黄金日期不明确"), "published_at": "Thu, 16 Jul 2026 11:00:00 -0000", "archived_at": NOW.isoformat()},
+        {**_item("黄金报道入档延迟"), "published_at": "Thu, 16 Jul 2026 11:00:00 GMT",
+         "archived_at": (NOW + timedelta(seconds=1)).isoformat()},
+    ]
+    path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+
+    assert [item["title"] for item in NewsArchive(path).search("黄金", now=NOW)] == ["黄金报道一", "黄金报道二"]
+
+
+@pytest.mark.parametrize("field", ["first_seen_at", "available_at", "updated"])
+def test_archive_defers_future_versions_at_ingest_and_replay(tmp_path, field):
+    path = tmp_path / "archive.jsonl"
+    archive = NewsArchive(path)
+    item = _item("美联储报告影响黄金", ts=NOW - timedelta(minutes=1))
+    visible_at = NOW + timedelta(seconds=1)
+    item[field] = visible_at.isoformat()
+
+    assert archive.ingest([item], now=NOW)["dropped"] == 1
+    path.write_text(json.dumps({**item, "archived_at": NOW.isoformat()}), encoding="utf-8")
+    assert archive.search("黄金", now=NOW) == []
+    assert len(archive.search("黄金", now=visible_at)) == 1
