@@ -7,6 +7,9 @@ gateway. Narrator behaviour in tests is exercised via injected stubs only.
 """
 import os
 
+# Local test apps opt in to the only environment allowed to use JSONL stores.
+os.environ.setdefault("APP_ENV", "development")
+
 os.environ.pop("DEEPSEEK_API_KEY", None)
 os.environ.pop("OPENAI_API_KEY", None)
 # Ensure the loader cannot re-populate them mid-session: an empty value in

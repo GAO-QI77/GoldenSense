@@ -11,23 +11,23 @@ ANALOG_PRIOR = {
     "n_30d": 19,
     "mean_30d": 0.036,
     "positive_share_30d": 0.74,
+    "matched_n_30d": 8,
+    "matched_mean_excess_30d": 0.013,
 }
 
 
-def test_news_analyst_prior_shifts_stance_bounded():
+def test_news_analyst_reports_matched_analogs_without_shifting_stance():
     base = news_analyst(0.0, 15.0)
     with_prior = news_analyst(0.0, 15.0, analog_prior=ANALOG_PRIOR)
-    assert with_prior.stance > base.stance          # positive-mean prior lifts stance
-    assert abs(with_prior.stance - base.stance) <= 0.3  # hard cap
-    # Evidence must cite the sample honestly.
-    joined = " ".join(with_prior.evidence)
-    assert "19" in joined and "30" in joined
+    assert with_prior.stance == base.stance
+    assert with_prior.confidence == base.confidence
+    assert "8 次事件" in " ".join(with_prior.evidence)
+    assert "+1.3%" in " ".join(with_prior.evidence)
 
 
-def test_news_analyst_small_sample_prior_ignored():
-    small = dict(ANALOG_PRIOR, n_30d=3)
-    view = news_analyst(0.0, 15.0, analog_prior=small)
-    assert view.stance == news_analyst(0.0, 15.0).stance
+def test_news_analyst_does_not_tilt_stance_using_unmatched_returns():
+    raw = dict(ANALOG_PRIOR, matched_n_30d=0, matched_mean_excess_30d=None)
+    assert news_analyst(0.0, 15.0, analog_prior=raw).stance == news_analyst(0.0, 15.0).stance
 
 
 def test_news_analyst_vix_gate_still_caps_after_prior():
@@ -45,7 +45,8 @@ def test_build_committee_passes_analog_prior():
     )
     news_a = next(v for v in with_prior["views"] if v["name"] == "news")
     news_b = next(v for v in without["views"] if v["name"] == "news")
-    assert news_a["stance"] > news_b["stance"]
+    assert news_a["stance"] == news_b["stance"]
+    assert any("+1.3%" in line for line in news_a["evidence"])
 
 
 # --------------------------------------------------------------------------- #

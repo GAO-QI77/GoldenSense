@@ -76,7 +76,7 @@ service_status() {
 }
 
 start_all() {
-  start_service inference env APP_ENV=development MARKET_DATA_PROVIDER="$MARKET_DATA_PROVIDER" NEWS_DATA_PROVIDER="$NEWS_DATA_PROVIDER" INFERENCE_MODEL_CHECKPOINTS_DIR_T1=model_checkpoints INFERENCE_MODEL_CHECKPOINTS_DIR_T7=model_checkpoints python3 -m uvicorn inference_service:app --host 127.0.0.1 --port 8010
+  start_service inference env APP_ENV=development MARKET_DATA_PROVIDER="$MARKET_DATA_PROVIDER" NEWS_DATA_PROVIDER="$NEWS_DATA_PROVIDER" INFERENCE_MODEL_CHECKPOINTS_DIR_T1=model_checkpoints INFERENCE_MODEL_CHECKPOINTS_DIR_T7=model_checkpoints_t7 python3 -m uvicorn inference_service:app --host 127.0.0.1 --port 8010
   start_service memory env APP_ENV=development DATABASE_URL="$DATABASE_URL" MEMORY_START_BACKGROUND_LOAD="$MEMORY_START_BACKGROUND_LOAD" MEMORY_ALLOW_UNAVAILABLE_READY="$MEMORY_ALLOW_UNAVAILABLE_READY" MPLCONFIGDIR="$MPL_DIR" python3 -m uvicorn memory_service:app --host 127.0.0.1 --port 8012
   start_service market env APP_ENV=development DATABASE_URL="$DATABASE_URL" REDIS_URL="$REDIS_URL" MARKET_DATA_PROVIDER="$MARKET_DATA_PROVIDER" MARKET_START_BACKGROUND_TASK=0 MARKET_ALLOW_SYNTHETIC_FALLBACK=1 python3 -m uvicorn market_snapshot_service:app --host 127.0.0.1 --port 8014
   start_service news env APP_ENV=development DATABASE_URL="$DATABASE_URL" REDIS_URL="$REDIS_URL" NEWS_DATA_PROVIDER="$NEWS_DATA_PROVIDER" NEWS_START_BACKGROUND_TASK=0 NEWS_ALLOW_SAMPLE_FALLBACK=1 python3 -m uvicorn news_ingest_service:app --host 127.0.0.1 --port 8016

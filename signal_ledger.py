@@ -15,21 +15,25 @@ into an append-only ledger. Records are:
 
 Scoring holds, for each risk profile, a hypothetical shadow portfolio at the
 published midpoint gold weight (rest in zero-yield cash), rebalanced at each
-publication, net of turnover costs, and only over *matured* weeks (the next
-publication's rebalance price must exist).
+publication, net of turnover costs, and only over matured publication intervals
+(the next publication's rebalance price must exist).
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import math
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Protocol, Tuple
 
 import pandas as pd
 
 from allocation import ALLOCATION_DISCLAIMER
+from gold_sessions import PRICE_AVAILABILITY_ATTR
 from market_view import build_market_view, summarize_for_ledger
 
 TRACK_RECORD_DISCLAIMER = (
@@ -39,14 +43,29 @@ TRACK_RECORD_DISCLAIMER = (
 
 PROFILES = ("conservative", "balanced", "aggressive")
 WEEKS_PER_YEAR = 52
+RISK_MATCH_LOOKBACK_SESSIONS = 20
+RISK_MATCH_WEIGHT_CAP = 1.0
 
 
 # --------------------------------------------------------------------------- #
 # Stores
 # --------------------------------------------------------------------------- #
 class LedgerStore(Protocol):
-    def append(self, record: Dict[str, Any]) -> None: ...
+    def append(self, record: Dict[str, Any]) -> Optional[bool]: ...
     def load_all(self) -> List[Dict[str, Any]]: ...
+    def healthcheck(self) -> bool: ...
+
+
+class LedgerIntegrityError(RuntimeError):
+    """Stored publication data failed structural or hash validation."""
+
+
+class LedgerUnavailableError(RuntimeError):
+    """The durable publication ledger cannot currently serve requests."""
+
+
+class StalePublicationDataError(ValueError):
+    """The research context cannot support a new weekly publication."""
 
 
 class MemoryLedgerStore:
@@ -56,13 +75,20 @@ class MemoryLedgerStore:
         self._records: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
 
-    def append(self, record: Dict[str, Any]) -> None:
+    def append(self, record: Dict[str, Any]) -> bool:
         with self._lock:
+            for existing in self._records:
+                if existing["publication_id"] == record["publication_id"]:
+                    return False
             self._records.append(json.loads(json.dumps(record, ensure_ascii=False)))
+            return True
 
     def load_all(self) -> List[Dict[str, Any]]:
         with self._lock:
             return [dict(r) for r in self._records]
+
+    def healthcheck(self) -> bool:
+        return True
 
 
 class JsonlLedgerStore:
@@ -70,24 +96,225 @@ class JsonlLedgerStore:
 
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
-        self._lock = threading.Lock()
 
-    def append(self, record: Dict[str, Any]) -> None:
-        with self._lock:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with self._path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    @contextmanager
+    def _open_locked(self, *, writing: bool):
+        with self._path.open("a+" if writing else "r", encoding="utf-8") as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX if writing else fcntl.LOCK_SH)
+            stream.seek(0)
+            yield stream
+            # Closing the stream releases the lock after any buffered write.
+
+    @staticmethod
+    def _write(stream, record: Dict[str, Any]) -> None:
+        stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        stream.flush()
+
+    def append(self, record: Dict[str, Any]) -> bool:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._open_locked(writing=True) as stream:
+            for line in stream:
+                if line.strip():
+                    existing = json.loads(line)
+                    if existing["publication_id"] == record["publication_id"]:
+                        return False
+            self._write(stream, record)
+            return True
 
     def load_all(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            if not self._path.exists():
-                return []
-            records = []
-            for line in self._path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line:
-                    records.append(json.loads(line))
-            return records
+        try:
+            with self._open_locked(writing=False) as stream:
+                return [json.loads(line) for line in stream if line.strip()]
+        except FileNotFoundError:
+            return []
+
+    def healthcheck(self) -> bool:
+        return True
+
+
+class PostgresLedgerStore:
+    """Append-only PostgreSQL store for immutable weekly publications."""
+
+    _SCHEMA_SQL = """
+        CREATE TABLE IF NOT EXISTS signal_publications(
+            publication_id text primary key,
+            published_at timestamptz not null,
+            payload jsonb not null
+        )
+    """
+    _APPEND_SQL = """
+        INSERT INTO signal_publications (publication_id, published_at, payload)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (publication_id) DO NOTHING
+    """
+    _LOAD_SQL = """
+        SELECT publication_id, published_at, payload
+        FROM signal_publications
+        ORDER BY published_at ASC
+    """
+
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        connect: Optional[Callable[..., Any]] = None,
+        connect_timeout_seconds: int = 5,
+        jsonb_wrapper: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    ) -> None:
+        if not database_url:
+            raise LedgerUnavailableError("Signal publication ledger is unavailable.")
+        self._database_url = database_url
+        self._connect = connect or self._psycopg_connect
+        self._connect_timeout_seconds = max(1, int(connect_timeout_seconds))
+        self._operation_timeout_ms = self._connect_timeout_seconds * 1000
+        self._jsonb_wrapper = jsonb_wrapper or self._psycopg_jsonb
+        self._execute(lambda cursor: cursor.execute(self._SCHEMA_SQL))
+
+    @staticmethod
+    def _psycopg_connect(database_url: str, **kwargs: Any) -> Any:
+        import psycopg
+
+        return psycopg.connect(database_url, **kwargs)
+
+    @staticmethod
+    def _psycopg_jsonb(payload: Dict[str, Any]) -> Any:
+        from psycopg.types.json import Jsonb
+
+        return Jsonb(
+            payload,
+            dumps=lambda value: json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ),
+        )
+
+    def _execute(self, operation: Callable[[Any], Any]) -> Any:
+        connection = None
+        cursor = None
+        result = None
+        unavailable = False
+        try:
+            connection = self._connect(
+                self._database_url,
+                connect_timeout=self._connect_timeout_seconds,
+                options=(
+                    f"-c statement_timeout={self._operation_timeout_ms} "
+                    f"-c lock_timeout={self._operation_timeout_ms} "
+                    "-c idle_in_transaction_session_timeout="
+                    f"{self._operation_timeout_ms}"
+                ),
+                tcp_user_timeout=self._operation_timeout_ms,
+            )
+            cursor = connection.cursor()
+            result = operation(cursor)
+            connection.commit()
+        except LedgerIntegrityError:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            raise
+        except Exception:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            unavailable = True
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    unavailable = True
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    unavailable = True
+        if unavailable:
+            raise LedgerUnavailableError(
+                "Signal publication ledger is unavailable."
+            ) from None
+        return result
+
+    @staticmethod
+    def _validated_record(
+        publication_id: Any, published_at: Any, payload: Any
+    ) -> Dict[str, Any]:
+        try:
+            if isinstance(payload, (str, bytes, bytearray)):
+                payload = json.loads(payload)
+            if not isinstance(payload, Mapping):
+                raise TypeError("payload is not an object")
+            record = dict(payload)
+            if record.get("publication_id") != publication_id:
+                raise ValueError("publication id mismatch")
+            record_published_at = record.get("published_at")
+            if not isinstance(record_published_at, str) or not record_published_at:
+                raise ValueError("published_at missing")
+            payload_time = datetime.fromisoformat(record_published_at.replace("Z", "+00:00"))
+            row_time = (
+                published_at
+                if isinstance(published_at, datetime)
+                else datetime.fromisoformat(str(published_at).replace("Z", "+00:00"))
+            )
+            if payload_time.tzinfo is None or row_time.tzinfo is None:
+                raise ValueError("published_at must include a timezone")
+            if payload_time.astimezone(timezone.utc) != row_time.astimezone(timezone.utc):
+                raise ValueError("published_at mismatch")
+            if not verify_publication(record):
+                raise ValueError("content hash mismatch")
+            return record
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LedgerIntegrityError(
+                "Stored signal publication failed integrity validation."
+            ) from exc
+
+    def append(self, record: Dict[str, Any]) -> bool:
+        publication_id = record.get("publication_id")
+        published_at = record.get("published_at")
+        self._validated_record(publication_id, published_at, record)
+        payload = self._jsonb_wrapper(record)
+
+        def _append(cursor: Any) -> bool:
+            cursor.execute(
+                self._APPEND_SQL,
+                (publication_id, published_at, payload),
+            )
+            return cursor.rowcount == 1
+
+        return bool(self._execute(_append))
+
+    def load_all(self) -> List[Dict[str, Any]]:
+        def _load(cursor: Any) -> List[Dict[str, Any]]:
+            cursor.execute(self._LOAD_SQL)
+            return [self._validated_record(*row) for row in cursor.fetchall()]
+
+        return self._execute(_load)
+
+    def healthcheck(self) -> bool:
+        self._execute(lambda cursor: cursor.execute("SELECT 1"))
+        return True
+
+
+def build_ledger_store(
+    *,
+    app_env: str,
+    database_url: Optional[str],
+    jsonl_path: str | Path,
+    connect_timeout_seconds: int = 5,
+    postgres_store_factory: Callable[..., LedgerStore] = PostgresLedgerStore,
+) -> LedgerStore:
+    """Select the one ledger backend shared by the API and scheduled jobs."""
+    if app_env.strip().lower() == "development":
+        return JsonlLedgerStore(jsonl_path)
+    if not database_url:
+        raise LedgerUnavailableError("Signal publication ledger is unavailable.")
+    return postgres_store_factory(
+        database_url,
+        connect_timeout_seconds=max(1, int(connect_timeout_seconds)),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -148,7 +375,7 @@ def build_publication(ctx: Dict[str, Any], *, now: datetime) -> Dict[str, Any]:
             "fair_value_deviation_z": fair.get("deviation_z"),
             "macro_composite": factors.get("composite"),
         },
-        "degraded": dict(ctx.get("degraded", {})),
+        "degraded": dict(ctx.get("degraded") or {}),
         "disclaimer": ALLOCATION_DISCLAIMER,
     }
     record["content_hash"] = _canonical_hash(record)
@@ -167,59 +394,99 @@ def publish_weekly(
     for existing in store.load_all():
         if existing.get("publication_id") == pub_id:
             return existing, False
+    if ctx.get("data_stale") or (ctx.get("degraded") or {}).get("market_data"):
+        raise StalePublicationDataError("stale or unavailable research data")
     record = build_publication(ctx, now=now)
-    store.append(record)
+    inserted = store.append(record)
+    if inserted is False:
+        for existing in store.load_all():
+            if existing.get("publication_id") == pub_id:
+                return existing, False
+        raise LedgerIntegrityError(
+            "Conflicting signal publication was not readable after insert."
+        )
     return record, True
 
 
 # --------------------------------------------------------------------------- #
 # Track record scoring
 # --------------------------------------------------------------------------- #
+class _Execution(NamedTuple):
+    at: pd.Timestamp
+    record: Dict[str, Any]
+    price: float
+
+
 def _rebalance_price(prices: pd.Series, published_at: str) -> Optional[Tuple[pd.Timestamp, float]]:
-    """First close at/after the publication date; None if not yet available."""
+    """First price strictly after publication. Date-only bars start at UTC midnight."""
     try:
         when = pd.Timestamp(published_at)
     except (ValueError, TypeError):
         return None
-    if when.tzinfo is not None:
-        when = when.tz_convert("UTC").tz_localize(None)
-    when = when.normalize()
-    pos = prices.index.searchsorted(when)
+    if pd.isna(when):
+        return None
+    when = when.tz_localize("UTC") if when.tzinfo is None else when.tz_convert("UTC")
+    # Midnight labels carry no intraday close time. For those inputs, use a
+    # later session rather than crediting the publication with same-day prices.
+    pos = pd.to_datetime(prices.index, utc=True).searchsorted(when, side="right")
     if pos >= len(prices):
         return None
     return prices.index[pos], float(prices.iloc[pos])
 
 
-def _profile_stats(weekly_returns: List[float]) -> Dict[str, Any]:
-    if not weekly_returns:
+def _profile_stats(
+    interval_returns: List[float], interval_durations: List[pd.Timedelta],
+) -> Dict[str, Any]:
+    """Annualize only seven-day intervals. weeks_scored is a legacy count alias."""
+    if not interval_returns:
         return {
             "weeks_scored": 0,
+            "intervals_scored": 0,
             "cum_return": None,
             "ann_vol": None,
             "max_drawdown": None,
             "sharpe": None,
+            "annualization_reason": "insufficient_intervals",
         }
     import numpy as np
 
-    equity = np.cumprod([1.0] + [1.0 + r for r in weekly_returns])
+    equity = np.cumprod([1.0] + [1.0 + r for r in interval_returns])
     cum_return = float(equity[-1] - 1.0)
     running_max = np.maximum.accumulate(equity)
     max_dd = float((equity / running_max - 1.0).min())
-    if len(weekly_returns) >= 2:
-        vol = float(np.std(weekly_returns, ddof=1) * np.sqrt(WEEKS_PER_YEAR))
-        mean_ann = float(np.mean(weekly_returns) * WEEKS_PER_YEAR)
+    if any(duration != pd.Timedelta(weeks=1) for duration in interval_durations):
+        annualization_reason = "nonweekly_intervals"
+    elif len(interval_returns) < 2:
+        annualization_reason = "insufficient_intervals"
+    else:
+        annualization_reason = None
+    if annualization_reason is None:
+        vol = float(np.std(interval_returns, ddof=1) * np.sqrt(WEEKS_PER_YEAR))
+        mean_ann = float(np.mean(interval_returns) * WEEKS_PER_YEAR)
         sharpe = round(mean_ann / vol, 3) if vol > 0 else None
         ann_vol = round(vol, 4)
     else:
         ann_vol = None
         sharpe = None
     return {
-        "weeks_scored": len(weekly_returns),
+        "weeks_scored": len(interval_returns),
+        "intervals_scored": len(interval_returns),
         "cum_return": round(cum_return, 6),
         "ann_vol": ann_vol,
         "max_drawdown": round(max_dd, 6),
         "sharpe": sharpe,
+        "annualization_reason": annualization_reason,
     }
+
+
+def _shadow_step(weight: float, drift: float, gold_return: float, rate: float) -> Tuple[float, float]:
+    # Trade sizing and fee are both fractions of pre-trade NAV. The target
+    # weight is a fraction of the smaller, post-fee NAV.
+    side = 1 if weight >= drift else -1
+    fee = rate * abs(weight - drift) / (1.0 + side * rate * weight)
+    growth = 1.0 + weight * gold_return
+    next_drift = weight * (1.0 + gold_return) / growth
+    return (1.0 - fee) * growth - 1.0, next_drift
 
 
 def score_track_record(
@@ -227,17 +494,56 @@ def score_track_record(
     prices: pd.Series,
     *,
     cost_bps: float = 5.0,
+    decision_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
-    """Score matured weeks of the shadow portfolios against fixed benchmarks."""
+    """Score matured shadow returns and comparable fixed and risk-matched portfolios.
+
+    At the first comparable execution, freeze the profile's published weight
+    times the annualized sample volatility of the last 20 visible gold close
+    returns. The gold volatility must be positive. The benchmark targets that
+    risk at each subsequent execution using only prices available strictly
+    before the trade. It holds only gold (capped at 100%) and cash. If a later
+    volatility estimate is unusable, it keeps its drifted exposure.
+    """
+    from data_loader import market_availability_times
+
     prices = prices.astype(float).dropna().sort_index()
+    if not prices.index.is_unique or not prices.map(lambda p: math.isfinite(p) and p > 0).all():
+        raise ValueError("shadow prices must be positive and uniquely timestamped")
+    if not 0 <= cost_bps < 10000:
+        raise ValueError("invalid shadow transaction cost")
+    rate = cost_bps / 10000.0
+    availability_by_close = prices.attrs.get(PRICE_AVAILABILITY_ATTR)
+    if availability_by_close is None:
+        availability = market_availability_times(pd.DatetimeIndex(prices.index))
+    else:
+        availability = pd.DatetimeIndex(
+            [availability_by_close[close] for close in pd.to_datetime(prices.index, utc=True)],
+            tz="UTC",
+        )
+    if decision_at is not None:
+        visible = availability <= pd.to_datetime(decision_at, utc=True)
+        prices = prices.loc[visible]
+        availability = availability[visible]
     ordered = sorted(publications, key=lambda r: r.get("published_at") or "")
 
     # Resolve each publication's rebalance point; drop those without prices.
-    points: List[Tuple[Dict[str, Any], float]] = []
+    executions: Dict[pd.Timestamp, _Execution] = {}
     for record in ordered:
         resolved = _rebalance_price(prices, record.get("published_at", ""))
         if resolved is not None:
-            points.append((record, resolved[1]))
+            at, price = resolved
+            executions[at] = _Execution(at, record, price)
+    points = [executions[date] for date in sorted(executions)]
+
+    trailing_vol = prices.pct_change().rolling(RISK_MATCH_LOOKBACK_SESSIONS).std() * math.sqrt(252)
+    prior_gold_vol: Dict[pd.Timestamp, float] = {}
+    for point in points[:-1]:
+        visible_count = availability.searchsorted(pd.to_datetime(point.at, utc=True), side="left")
+        if visible_count > RISK_MATCH_LOOKBACK_SESSIONS:
+            vol = float(trailing_vol.iloc[visible_count - 1])
+            if math.isfinite(vol) and vol > 0:
+                prior_gold_vol[point.at] = vol
 
     result: Dict[str, Any] = {
         "evidence_class": "simulated_forward",
@@ -245,35 +551,100 @@ def score_track_record(
         "benchmarks": {},
         "matured_through": None,
         "cost_bps": cost_bps,
+        "execution_policy": "first_close_after_publication",
+        "cash_yield": 0.0,
+        "turnover_method": "drift_adjusted_self_financing",
         "disclaimer": TRACK_RECORD_DISCLAIMER,
     }
 
-    # A week matures when the *next* publication's rebalance price exists.
+    # An interval matures when the next publication's rebalance price exists.
     matured_pairs = list(zip(points[:-1], points[1:]))
     if matured_pairs:
-        result["matured_through"] = matured_pairs[-1][1][0].get("publication_id")
+        result["matured_through"] = points[-1].record.get("publication_id")
 
     for profile in PROFILES:
-        weekly_returns: List[float] = []
-        prev_weight = 0.0
-        for (rec, p0), (_next_rec, p1) in matured_pairs:
-            midpoint = ((rec.get("allocations") or {}).get(profile) or {}).get("midpoint")
-            if midpoint is None or p0 <= 0:
+        interval_returns: List[float] = []
+        interval_durations: List[pd.Timedelta] = []
+        fixed_returns: List[float] = []
+        risk_matched_returns: List[float] = []
+        risk_matched_durations: List[pd.Timedelta] = []
+        same_period_strategy_returns: List[float] = []
+        fixed_weight = None
+        risk_target = risk_start_at = None
+        drift = fixed_drift = 0.0
+        risk_matched_drift = same_period_strategy_drift = 0.0
+        for current, following in matured_pairs:
+            midpoint = ((current.record.get("allocations") or {}).get(profile) or {}).get("midpoint")
+            if midpoint is None and not interval_returns:
                 continue
-            weight = float(midpoint) / 100.0
-            gold_ret = p1 / p0 - 1.0
-            turnover_cost = abs(weight - prev_weight) * cost_bps / 10000.0
-            weekly_returns.append((1.0 + weight * gold_ret) * (1.0 - turnover_cost) - 1.0)
-            prev_weight = weight
+            weight = drift if midpoint is None else float(midpoint) / 100.0
+            if not 0 <= weight <= 1:
+                raise ValueError("shadow allocations must lie between 0% and 100%")
+            gold_return = following.price / current.price - 1.0
+            period_return, drift = _shadow_step(weight, drift, gold_return, rate)
+            interval_returns.append(period_return)
+            interval_durations.append(following.at - current.at)
+            if fixed_weight is None:
+                fixed_weight = weight
+            fixed_return, fixed_drift = _shadow_step(fixed_weight, fixed_drift, gold_return, rate)
+            fixed_returns.append(fixed_return)
+
+            gold_vol = prior_gold_vol.get(current.at)
+            if risk_target is None:
+                if gold_vol is None or midpoint is None:
+                    continue
+                risk_target = weight * gold_vol
+                risk_start_at = pd.to_datetime(current.at, utc=True).isoformat()
+            risk_weight = (
+                min(RISK_MATCH_WEIGHT_CAP, risk_target / gold_vol)
+                if gold_vol is not None else risk_matched_drift
+            )
+            risk_return, risk_matched_drift = _shadow_step(
+                risk_weight, risk_matched_drift, gold_return, rate,
+            )
+            risk_matched_returns.append(risk_return)
+            risk_matched_durations.append(following.at - current.at)
+            # Compare the exact same intervals, starting both portfolios in cash.
+            strategy_weight = same_period_strategy_drift if midpoint is None else weight
+            strategy_return, same_period_strategy_drift = _shadow_step(
+                strategy_weight, same_period_strategy_drift, gold_return, rate,
+            )
+            same_period_strategy_returns.append(strategy_return)
         result["per_profile"][profile] = {
-            **_profile_stats(weekly_returns),
+            **_profile_stats(interval_returns, interval_durations),
             "evidence_class": "simulated_forward",
         }
+        if fixed_weight is not None:
+            result["benchmarks"][f"{profile}_fixed_net"] = {
+                **_profile_stats(fixed_returns, interval_durations),
+                "evidence_class": "simulated_forward",
+                "cost_bps": cost_bps,
+                "weight_pct": round(fixed_weight * 100, 4),
+                "description": "首期仓位固定权重，同期再平衡，计入同口径成本",
+            }
+        result["benchmarks"][f"{profile}_risk_matched_net"] = {
+            **_profile_stats(risk_matched_returns, risk_matched_durations),
+            "evidence_class": "simulated_forward",
+            "cost_bps": cost_bps,
+            "lookback_sessions": RISK_MATCH_LOOKBACK_SESSIONS,
+            "weight_cap_pct": RISK_MATCH_WEIGHT_CAP * 100,
+            "target_ann_vol": risk_target,
+            "start_at": risk_start_at,
+            "strategy_same_period": {
+                **_profile_stats(same_period_strategy_returns, risk_matched_durations),
+                "evidence_class": "simulated_forward",
+            },
+            "description": (
+                "以首个可比区间的策略黄金仓位乘以当时的黄金年化波动率，冻结目标。"
+                "每次按执行前已可见的近20个交易日收益估算波动率，"
+                "调整黄金仓位（上限100%），同日再平衡并计入同口径成本。"
+            ),
+        }
 
-    # Benchmarks over the same matured span, cost-free by construction.
+    # Gross reference benchmarks over the full matured span.
     if matured_pairs:
-        p_first = matured_pairs[0][0][1]
-        p_last = matured_pairs[-1][1][1]
+        p_first = points[0].price
+        p_last = points[-1].price
         gold_cum = p_last / p_first - 1.0
         result["benchmarks"]["gold_buy_hold"] = {
             "evidence_class": "simulated_forward",
@@ -281,12 +652,13 @@ def score_track_record(
             "description": "同期 100% 黄金买入持有（无成本）",
         }
         first_mid = (
-            (matured_pairs[0][0][0].get("allocations") or {}).get("balanced") or {}
+            (points[0].record.get("allocations") or {}).get("balanced") or {}
         ).get("midpoint")
         if first_mid is not None:
             w = float(first_mid) / 100.0
             static_returns = [
-                w * (p1 / p0 - 1.0) for (_r, p0), (_n, p1) in matured_pairs
+                w * (following.price / current.price - 1.0)
+                for current, following in matured_pairs
             ]
             equity = 1.0
             for r in static_returns:
@@ -305,4 +677,15 @@ def score_track_record(
             "evidence_class": "simulated_forward", "cum_return": None
         }
 
+    return result
+
+
+def score_configured_track_record(
+    publications: List[Dict[str, Any]], *, decision_at: datetime,
+) -> Dict[str, Any]:
+    from gold_sessions import load_gold_outcome_prices
+
+    prices, source = load_gold_outcome_prices(decision_at)
+    result = score_track_record(publications, prices)
+    result["price_evidence"] = "session_timestamps" if source == "session_timestamps" else "date_only_proxy"
     return result

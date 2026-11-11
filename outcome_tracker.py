@@ -33,6 +33,7 @@ HORIZON_DAYS = {
 }
 STANCE_TO_DIRECTION = {"偏多": 1, "偏空": -1, "中性": 0, "高风险观望": 0}
 CONFIDENCE_TO_PROB = {"高": 0.75, "中": 0.65, "低": 0.55}
+MINIMUM_DIRECTIONAL_CALLS = 20
 
 
 def _parse_ts(value: Any) -> Optional[datetime]:
@@ -114,7 +115,11 @@ def backfill_outcomes(
     return outcomes
 
 
-def calibration_summary(outcomes: List[Dict[str, Any]]) -> Dict[str, Any]:
+def calibration_summary(
+    outcomes: List[Dict[str, Any]],
+    *,
+    total_valid_analyses: Optional[int] = None,
+) -> Dict[str, Any]:
     """Hit rates + Brier score for directional (偏多/偏空) calls.
 
     Neutral / risk-gated stances are excluded from hit-rate math but counted,
@@ -125,8 +130,20 @@ def calibration_summary(outcomes: List[Dict[str, Any]]) -> Dict[str, Any]:
     ]
     neutral_count = len(outcomes) - len(directional)
 
+    valid_analyses = max(len(outcomes), int(total_valid_analyses or 0))
+    pending_analyses = max(0, valid_analyses - len(outcomes))
+    evidence_status = (
+        "ready"
+        if len(directional) >= MINIMUM_DIRECTIONAL_CALLS
+        else "accumulating"
+        if valid_analyses > 0
+        else "awaiting_first_analysis"
+    )
     summary: Dict[str, Any] = {
         "evidence_class": "live_forward",
+        "evidence_status": evidence_status,
+        "minimum_directional_calls": MINIMUM_DIRECTIONAL_CALLS,
+        "pending_analyses": pending_analyses,
         "total_scored": len(outcomes),
         "directional_calls": len(directional),
         "neutral_or_gated": neutral_count,
@@ -135,7 +152,7 @@ def calibration_summary(outcomes: List[Dict[str, Any]]) -> Dict[str, Any]:
         "by_stance": {},
         "by_confidence": {},
     }
-    if not directional:
+    if len(directional) < MINIMUM_DIRECTIONAL_CALLS:
         return summary
 
     hits: List[float] = []
@@ -179,7 +196,7 @@ def committee_weight_adjustments(
     never run away.
     """
     hit_rate = summary.get("hit_rate")
-    if hit_rate is None or summary.get("directional_calls", 0) < 20:
+    if hit_rate is None or summary.get("directional_calls", 0) < MINIMUM_DIRECTIONAL_CALLS:
         return {"fused_confidence_multiplier": 1.0, "basis": "insufficient_samples"}
     edge = float(np.clip((hit_rate - 0.5) * 2.0, -1.0, 1.0))
     multiplier = float(np.clip(1.0 + edge * max_shift, 1.0 - max_shift, 1.0 + max_shift))

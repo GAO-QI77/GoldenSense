@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 TRADING_DAYS = 252
+QUARTILES = ("q1_cheapest", "q2", "q3", "q4_richest")
 
 
 @dataclass
@@ -46,6 +47,11 @@ class FairValueResult:
     deviation_series_tail: List[float] = field(default_factory=list)
     quartile_forward_returns: Dict[str, float] = field(default_factory=dict)
     n_obs: int = 0
+    quartile_sample_counts: Dict[str, int] = field(default_factory=dict)
+    forward_horizon_days: int = TRADING_DAYS
+    stress_scenarios_pct: Dict[str, float] = field(default_factory=dict)
+    cointegration_pvalue: Optional[float] = None
+    anchor_status: str = "conditional"
 
     def as_dict(self) -> Dict:
         return {
@@ -66,6 +72,14 @@ class FairValueResult:
                 k: round(v, 4) for k, v in self.quartile_forward_returns.items()
             },
             "n_obs": self.n_obs,
+            "quartile_sample_counts": self.quartile_sample_counts,
+            "forward_horizon_days": self.forward_horizon_days,
+            "evidence_method": "monthly_walk_forward",
+            "stress_scenarios_pct": self.stress_scenarios_pct,
+            "anchor_status": self.anchor_status,
+            "cointegration_pvalue": (
+                round(self.cointegration_pvalue, 4) if self.cointegration_pvalue is not None else None
+            ),
         }
 
 
@@ -83,8 +97,7 @@ def _interpret_deviation(deviation_pct: float, deviation_z: float) -> tuple:
         text = (
             f"当前金价{side}宏观公允值 {abs(deviation_pct):.1f}%，已超出历史正常波动带"
             f"（{abs(deviation_z):.1f} 倍标准差），处于结构性偏离期。"
-            "2022 年后央行购金抬升了结构性需求，实际利率+美元锚在此机制下会系统性低估金价；"
-            "该读数是机制信号，不能解读为简单的高估/低估或反转依据。"
+            "需求结构变化是可能解释，单凭偏离无法区分其来源。"
         )
     elif abs(deviation_z) >= 1.0:
         side = "偏贵" if deviation_pct >= 0 else "偏便宜"
@@ -103,6 +116,50 @@ def _interpret_deviation(deviation_pct: float, deviation_z: float) -> tuple:
 def _ols(X: np.ndarray, y: np.ndarray) -> np.ndarray:
     coef, *_ = np.linalg.lstsq(X, y, rcond=None)
     return coef
+
+
+def _valuation_design(frame: pd.DataFrame) -> np.ndarray:
+    return np.column_stack([
+        np.ones(len(frame)), frame["Real_10Y"], np.log(frame["USD_Index"]),
+    ])
+
+
+def walk_forward_valuation(
+    raw: pd.DataFrame, *, min_obs: int = 750, fit_window_obs: Optional[int] = 2520,
+    forward_horizon_days: int = TRADING_DAYS,
+) -> pd.DataFrame:
+    """Classify valuation at each origin using parameters and thresholds from prior months."""
+    if not raw.index.is_monotonic_increasing or not raw.index.is_unique:
+        raise ValueError("valuation dates must be unique and increasing")
+    if forward_horizon_days < 1 or min_obs < 4 or (fit_window_obs and fit_window_obs < min_obs):
+        raise ValueError("invalid valuation research window")
+    gold = raw["Gold"].astype(float)
+    forward = gold.shift(-forward_horizon_days).div(gold).sub(1)
+    frame = raw[["Gold", "Real_10Y", "USD_Index"]].astype(float).dropna()
+    design = _valuation_design(frame)
+    actual = np.log(frame["Gold"].to_numpy())
+    rows = []
+    for _, month in frame.groupby(frame.index.to_period("M"), sort=False):
+        start = frame.index.get_loc(month.index[0])
+        if start < min_obs:
+            continue
+        end = start + len(month)
+        left = max(0, start - fit_window_obs) if fit_window_obs else 0
+        train = design[left:start]
+        y = actual[left:start]
+        coef = _ols(train, y)
+        edges = np.quantile(y - np.einsum("ij,j->i", train, coef), [0.25, 0.5, 0.75])
+        if not (np.diff(edges) > 0).all():
+            continue
+        deviation = actual[start:end] - np.einsum("ij,j->i", design[start:end], coef)
+        rows.append(pd.DataFrame({
+            "quartile": np.asarray(QUARTILES)[np.searchsorted(edges, deviation, side="left")],
+            "deviation_pct": np.expm1(deviation) * 100.0,
+            "forward_return": forward.reindex(month.index),
+        }, index=month.index))
+    if not rows:
+        return pd.DataFrame(columns=["quartile", "deviation_pct", "forward_return"])
+    return pd.concat(rows).dropna(subset=["forward_return"])
 
 
 def fit_fair_value(
@@ -150,18 +207,25 @@ def fit_fair_value(
     # Error-correction speed: does the deviation actually decay?
     d_log_gold = np.diff(log_gold)
     lam = float(_ols(resid[:-1].reshape(-1, 1), d_log_gold)[0])
-    half_life = float(np.log(2) / -lam) if lam < 0 else None
+    from statsmodels.tsa.stattools import coint
 
-    # Evidence card: mean forward returns by deviation quartile.
-    resid_series = pd.Series(resid, index=frame.index)
-    prices = frame["Gold"]
-    fwd = prices.shift(-forward_horizon_days) / prices - 1.0
-    quartiles = pd.qcut(resid_series, 4, labels=["q1_cheapest", "q2", "q3", "q4_richest"])
-    quartile_stats = {
-        str(label): float(fwd[quartiles == label].mean())
-        for label in ["q1_cheapest", "q2", "q3", "q4_richest"]
-        if fwd[quartiles == label].notna().any()
-    }
+    pvalue = None
+    if np.linalg.matrix_rank(X) == X.shape[1] and np.std(resid) > 1e-9:
+        try:
+            _, estimate, _ = coint(log_gold, X[:, 1:], trend="c", autolag="aic")
+            if np.isfinite(estimate):
+                pvalue = float(estimate)
+        except (ValueError, np.linalg.LinAlgError):
+            pass
+
+    # Out-of-sample classifications use a separately fitted historical anchor.
+    evidence = walk_forward_valuation(
+        raw, min_obs=min_obs, fit_window_obs=fit_window_obs,
+        forward_horizon_days=forward_horizon_days,
+    )
+    grouped = evidence.groupby("quartile")["forward_return"]
+    quartile_stats = grouped.mean().to_dict()
+    quartile_counts = grouped.size().to_dict()
 
     spot = float(frame["Gold"].iloc[-1])
     fair = float(np.exp(fitted[-1]))
@@ -173,12 +237,22 @@ def fit_fair_value(
     band_std_pct = resid_std * 100.0
     deviation_z = float(resid[-1] / resid_std) if resid_std > 1e-9 else 0.0
     regime_break, interpretation = _interpret_deviation(deviation_pct, deviation_z)
+    stable = pvalue is not None and pvalue < 0.05 and -1 < lam < 0 and not regime_break
+    half_life = float(np.log(0.5) / np.log1p(lam)) if stable else None
+    if not stable:
+        interpretation = (
+            f"金价相对实际利率与美元的条件估值锚偏离 {deviation_pct:+.1f}%。"
+            + ("当前处于结构性偏离期。" if regime_break else "")
+            + "现有检验未支持把偏离解释为均值回归信号。"
+        )
 
     return FairValueResult(
         deviation_pct=deviation_pct,
         fair_value=fair,
         spot=spot,
         half_life_days=half_life,
+        anchor_status="stationarity_supported" if stable else "conditional",
+        cointegration_pvalue=pvalue,
         lambda_daily=lam,
         r_squared=r_squared,
         deviation_z=deviation_z,
@@ -192,5 +266,12 @@ def fit_fair_value(
         },
         deviation_series_tail=[float(x * 100.0) for x in resid[-260:]],
         quartile_forward_returns=quartile_stats,
+        quartile_sample_counts=quartile_counts,
+        forward_horizon_days=forward_horizon_days,
+        stress_scenarios_pct={
+            "real_yield_up_100bp": round(float(np.expm1(coef[1]) * 100), 2),
+            "dollar_up_5pct": round(float(np.expm1(coef[2] * np.log1p(0.05)) * 100), 2),
+            "joint_up": round(float(np.expm1(coef[1] + coef[2] * np.log1p(0.05)) * 100), 2),
+        },
         n_obs=len(frame),
     )

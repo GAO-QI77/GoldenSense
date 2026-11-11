@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,13 @@ class ServiceSpec:
     name: str
     command: tuple[str, ...]
     env: dict[str, str]
+
+
+PUBLIC_ENV_DEFAULTS = {
+    "APP_ENV": "demo",
+    "DATA_REFRESH_ENABLED": "1",
+    "REDIS_URL": "redis://localhost:6379/0",
+}
 
 
 def _service_env(source: Mapping[str, str], defaults: Mapping[str, str]) -> dict[str, str]:
@@ -37,7 +45,7 @@ def _uvicorn(module: str, *, host: str, port: str) -> tuple[str, ...]:
 
 
 def validate_public_env(env: Mapping[str, str]) -> None:
-    if env.get("APP_ENV", "demo").lower() == "development":
+    if env.get("APP_ENV", "demo").strip().lower() == "development":
         raise RuntimeError("APP_ENV=development is not allowed in the public stack.")
     public_keys = env.get("AGENT_PUBLIC_API_KEYS", "")
     internal_keys = env.get("AGENT_INTERNAL_API_KEYS", "")
@@ -48,14 +56,7 @@ def validate_public_env(env: Mapping[str, str]) -> None:
 
 
 def build_service_specs(source_env: Mapping[str, str]) -> list[ServiceSpec]:
-    env = _service_env(
-        source_env,
-        {
-            "APP_ENV": "demo",
-            "DATABASE_URL": "postgresql://localhost/postgres",
-            "REDIS_URL": "redis://localhost:6379/0",
-        },
-    )
+    env = _service_env(source_env, PUBLIC_ENV_DEFAULTS)
     public_port = env.get("PORT", "8020")
     inference = ServiceSpec(
         name="inference",
@@ -64,7 +65,7 @@ def build_service_specs(source_env: Mapping[str, str]) -> list[ServiceSpec]:
             env,
             {
                 "INFERENCE_MODEL_CHECKPOINTS_DIR_T1": "model_checkpoints",
-                "INFERENCE_MODEL_CHECKPOINTS_DIR_T7": "model_checkpoints",
+                "INFERENCE_MODEL_CHECKPOINTS_DIR_T7": "model_checkpoints_t7",
                 "INFERENCE_ALLOW_SYNTHETIC_FALLBACK": "1",
             },
         ),
@@ -118,6 +119,7 @@ def build_service_specs(source_env: Mapping[str, str]) -> list[ServiceSpec]:
                 "RECENT_NEWS_URL": "http://127.0.0.1:8016/api/v1/news/recent",
                 "AGENT_ALLOW_TRACE_MEMORY_FALLBACK": "1",
                 "AGENT_ANALYZE_RATE_LIMIT_PER_MINUTE": "20",
+                "SIGNAL_AUTOPUBLISH_ENABLED": "1",
             },
         ),
     )
@@ -137,9 +139,90 @@ def _stop_all(processes: Sequence[subprocess.Popen[bytes]]) -> None:
             process.kill()
 
 
+def _refresh_dependencies() -> tuple[Callable[[], dict], Callable[..., Any], Callable[[dict], dict], Callable[[dict], bool]]:
+    if __package__:
+        from .refresh_data import (
+            has_usable_data_asof,
+            refresh_once,
+            safe_refresh_summary,
+            start_background_refresh,
+        )
+    else:
+        from refresh_data import (  # type: ignore[no-redef]
+            has_usable_data_asof,
+            refresh_once,
+            safe_refresh_summary,
+            start_background_refresh,
+        )
+    return (
+        refresh_once,
+        start_background_refresh,
+        safe_refresh_summary,
+        has_usable_data_asof,
+    )
+
+
+def start_public_services(
+    specs: Sequence[ServiceSpec],
+    *,
+    env: Mapping[str, str],
+    refresh_once_fn: Optional[Callable[[], dict]] = None,
+    start_background_refresh_fn: Optional[Callable[..., Any]] = None,
+    popen_fn: Callable[..., Any] = subprocess.Popen,
+) -> list[Any]:
+    """Run refresh preflight/scheduling and then launch child services."""
+    (
+        default_refresh_once,
+        default_start_background_refresh,
+        safe_refresh_summary,
+        has_usable_data_asof,
+    ) = _refresh_dependencies()
+    refresh_once_fn = refresh_once_fn or default_refresh_once
+    start_background_refresh_fn = (
+        start_background_refresh_fn or default_start_background_refresh
+    )
+
+    if env.get("DATA_REFRESH_ENABLED", "0") == "1":
+        try:
+            summary = refresh_once_fn()
+        except Exception as exc:
+            summary = {
+                "ok": False,
+                "step": "preflight_exception",
+                "error_type": type(exc).__name__,
+            }
+        print(
+            "data_refresh_preflight "
+            + json.dumps(safe_refresh_summary(summary), ensure_ascii=False),
+            flush=True,
+        )
+        if not has_usable_data_asof(summary):
+            raise RuntimeError(
+                "Public stack startup degraded: refresh produced no usable data_asof."
+            ) from None
+        refresh_thread = start_background_refresh_fn(
+            run_immediately=False,
+            enabled=True,
+        )
+        if refresh_thread is None:
+            raise RuntimeError(
+                "Public stack startup degraded: recurring data refresh did not start."
+            )
+        print("started embedded data-refresh scheduler", flush=True)
+
+    processes: list[Any] = []
+    try:
+        for spec in specs:
+            print(f"starting {spec.name}: {' '.join(spec.command)}", flush=True)
+            processes.append(popen_fn(spec.command, env=spec.env))
+    except Exception:
+        _stop_all(processes)
+        raise
+    return processes
+
+
 def main() -> int:
-    env = dict(os.environ)
-    env.setdefault("APP_ENV", "demo")
+    env = _service_env(os.environ, PUBLIC_ENV_DEFAULTS)
     validate_public_env(env)
     specs = build_service_specs(env)
     processes: list[subprocess.Popen[bytes]] = []
@@ -150,20 +233,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    # Embedded daily data refresh (opt-in via DATA_REFRESH_ENABLED=1). Keeps
-    # the single-container demo's extended dataset from ageing without needing
-    # a separate Railway cron service. Failures degrade to the last good CSV.
-    try:
-        from refresh_data import start_background_refresh
-
-        if start_background_refresh() is not None:
-            print("started embedded data-refresh scheduler", flush=True)
-    except Exception as exc:  # never let refresh wiring block service startup
-        print(f"data-refresh scheduler unavailable: {exc}", file=sys.stderr, flush=True)
-
-    for spec in specs:
-        print(f"starting {spec.name}: {' '.join(spec.command)}", flush=True)
-        processes.append(subprocess.Popen(spec.command, env=spec.env))
+    processes.extend(start_public_services(specs, env=env))
 
     try:
         while True:

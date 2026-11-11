@@ -29,11 +29,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 DEFAULT_CACHE_DIR = "data_cache"
 EXTENDED_DATA_PATH = "raw_market_data_extended.csv"
+RESEARCH_MARKET_CACHE_PATH = os.path.join(DEFAULT_CACHE_DIR, "market_extended.csv")
 BASE_DATA_PATH = "raw_market_data.csv"
 DEFAULT_START = "2004-01-01"
 
@@ -65,6 +67,7 @@ class DataBuildMeta:
     start: Optional[str] = None
     end: Optional[str] = None
     rows: int = 0
+    price_end_by_column: Dict[str, str] = field(default_factory=dict)
 
     @property
     def degraded(self) -> bool:
@@ -78,6 +81,7 @@ class DataBuildMeta:
             "end": self.end,
             "rows": self.rows,
             "degraded": self.degraded,
+            "price_end_by_column": dict(self.price_end_by_column),
         }
 
 
@@ -228,7 +232,8 @@ def merge_market_frames(
     if not price_series:
         raise ValueError("at least one price series is required")
     prices = pd.DataFrame(price_series).sort_index()
-    prices = prices.ffill().dropna()
+    calendar = prices.index[prices["Gold"].notna()] if "Gold" in prices else prices.index
+    prices = prices.ffill().loc[calendar].dropna()
     combined = prices
     for name, series in macro_series.items():
         aligned = series.sort_index().reindex(prices.index, method="ffill")
@@ -250,6 +255,10 @@ def build_extended_market_data(
         YF_TICKERS, start=start, cache_dir=cache_dir, max_age_days=max_age_days
     )
     meta.sources_ok.extend(sorted(price_series))
+    meta.price_end_by_column = {
+        name: pd.Timestamp(series.index.max()).date().isoformat()
+        for name, series in price_series.items() if not series.empty
+    }
     meta.sources_degraded.update(price_failures)
 
     macro_series: Dict[str, pd.Series] = {}
@@ -290,22 +299,87 @@ def build_extended_market_data(
     return combined, meta
 
 
+def _align_macro_vintages(frame: pd.DataFrame, path: str) -> pd.DataFrame:
+    # The legacy extended file aliases FRED DGS2 as 2Y_Bond.
+    frame = frame.drop(columns=[*FRED_SERIES, "2Y_Bond"], errors="ignore")
+    try:
+        vintages = pd.read_csv(path, dtype=str, usecols=[
+            "series_id", "observation_date", "available_at", "value",
+        ])
+    except (OSError, ValueError) as exc:
+        frame.attrs["macro_vintages_error"] = type(exc).__name__
+        return frame
+
+    # Date-only releases are ambiguous. Require a clock and explicit UTC offset.
+    offset = r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}.*(?:Z|[+-]\d{2}:\d{2})$"
+    vintages["available_at"] = pd.to_datetime(
+        vintages["available_at"].where(vintages["available_at"].str.match(offset, na=False)),
+        utc=True, format="mixed", errors="coerce",
+    )
+    observation_date = vintages["observation_date"]
+    vintages["observation_date"] = pd.to_datetime(
+        observation_date.where(observation_date.str.fullmatch(r"\d{4}-\d{2}-\d{2}", na=False)),
+        utc=True, format="%Y-%m-%d", errors="coerce",
+    )
+    vintages["value"] = pd.to_numeric(vintages["value"], errors="coerce")
+    vintages = vintages.dropna()
+    vintages = vintages.loc[
+        np.isfinite(vintages["value"])
+        & (vintages["observation_date"] <= vintages["available_at"])
+    ]
+    from data_loader import market_availability_times
+
+    decisions = market_availability_times(pd.DatetimeIndex(frame.index))
+    keys = ["available_at", "observation_date"]
+    for name, series_id in FRED_SERIES.items():
+        series = vintages.loc[vintages["series_id"] == series_id].drop_duplicates()
+        if series.empty or series.duplicated(keys).any():
+            continue
+        series = series.sort_values(keys)
+        # A revision changes the active reading only if it revises the latest
+        # observation available at that time. A late older release cannot replace it.
+        series = series.loc[series["observation_date"].eq(series["observation_date"].cummax())]
+        timeline = series.drop_duplicates("available_at", keep="last").set_index("available_at")
+        aligned = timeline["value"].reindex(decisions, method="ffill")
+        if aligned.notna().any():
+            frame[name] = aligned.to_numpy()
+    if "2Y_CMT" in frame:
+        frame["2Y_Bond"] = frame["2Y_CMT"]
+    return frame
+
+
 def load_market_data(
     *,
     prefer_extended: bool = True,
-    extended_path: str = EXTENDED_DATA_PATH,
+    extended_path: Optional[str] = None,
     base_path: str = BASE_DATA_PATH,
+    require_macro_vintages: bool = False,
+    macro_vintage_path: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, str]:
     """Load the best locally available market frame.
 
     Returns (frame, source) where source is ``extended`` or ``base``. Never
     touches the network -- run ``python3 data_sources.py`` to refresh.
     """
-    if prefer_extended and os.path.exists(extended_path):
-        frame = pd.read_csv(extended_path, index_col=0, parse_dates=True)
-        return frame.ffill().dropna(subset=["Gold"]), "extended"
-    frame = pd.read_csv(base_path, index_col=0, parse_dates=True)
-    return frame.ffill().dropna(), "base"
+    if prefer_extended and extended_path is None:
+        configured = os.environ.get("GOLD_RESEARCH_MARKET_PATH")
+        if configured and not os.path.isfile(configured):
+            raise FileNotFoundError("configured research market file is unavailable")
+        extended_path = configured or (
+            RESEARCH_MARKET_CACHE_PATH if os.path.isfile(RESEARCH_MARKET_CACHE_PATH) else EXTENDED_DATA_PATH
+        )
+    if prefer_extended and extended_path and os.path.isfile(extended_path):
+        frame = pd.read_csv(extended_path, index_col=0, parse_dates=True).sort_index()
+        frame, source = frame.dropna(subset=["Gold"]).ffill(), "extended"
+    else:
+        frame = pd.read_csv(base_path, index_col=0, parse_dates=True).sort_index()
+        frame, source = frame.dropna(subset=["Gold"]).ffill().dropna(), "base"
+    if require_macro_vintages:
+        vintage_path = macro_vintage_path or os.environ.get(
+            "MACRO_VINTAGES_PATH", os.path.join(DEFAULT_CACHE_DIR, "macro_vintages.csv")
+        )
+        frame = _align_macro_vintages(frame, vintage_path)
+    return frame, source
 
 
 if __name__ == "__main__":

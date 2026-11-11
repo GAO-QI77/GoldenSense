@@ -148,3 +148,18 @@ def test_monte_carlo_cone_is_deterministic_given_seed():
 
 def test_monte_carlo_cone_returns_none_on_short_history():
     assert monte_carlo_cone(_regime_prices(n=120)) is None
+
+
+def test_long_term_evidence_classifies_each_origin_before_future_prices():
+    from fair_value import walk_forward_valuation
+
+    original = _macro_frame(n=800)
+    changed = original.copy()
+    changed.loc[changed.index[674]:, "Gold"] *= 1.8
+    before = walk_forward_valuation(original, min_obs=250, forward_horizon_days=126)
+    after = walk_forward_valuation(changed, min_obs=250, forward_horizon_days=126)
+
+    assert before.index[-1] == original.index[-127]
+    pd.testing.assert_series_equal(before["quartile"], after["quartile"])
+    pd.testing.assert_series_equal(before["deviation_pct"], after["deviation_pct"])
+    assert not before["forward_return"].equals(after["forward_return"])

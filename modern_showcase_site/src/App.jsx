@@ -39,9 +39,21 @@ import QuantPage from './QuantPage';
 import SignalsPage from './SignalsPage';
 import { ActiveCaseRibbon, ResearchCaseWorkspace } from './ResearchCasePanel';
 import { MarketSnapshotHero, PrimarySourceFeed, ResearchSummary } from './DashboardExperience';
+import {
+  forecastWindowLabel,
+  horizonLabel,
+  RESEARCH_HORIZON_LABELS,
+  RESEARCH_HORIZON_WINDOWS,
+} from './horizons';
 import { AdvancedProfileFields, CoreProfileFields } from './profileFields';
 import { getProfileCompletion, loadProfile, saveProfile, toLegacyAnalyzeProfile } from './profileStore';
 import { deriveDashboardState } from './presentationPolicy';
+import {
+  classifySourceHealth,
+  dataQualityStatusCopy,
+  degradationFlagCopy,
+  sourceReasonCopy,
+} from './researchContract';
 import { addSearchEntries } from './searchIndex';
 import { ViewModeContext, loadViewMode, saveViewMode, useViewMode } from './viewMode';
 
@@ -50,21 +62,7 @@ const DASHBOARD_URL =
   import.meta.env.VITE_AGENT_DASHBOARD_URL || API_URL.replace('/analyze', '/dashboard/current');
 const FEEDBACK_URL = import.meta.env.VITE_AGENT_FEEDBACK_URL || API_URL.replace('/analyze', '/feedback');
 const API_KEY = import.meta.env.VITE_AGENT_API_KEY || 'dev-public-key';
-
-// Public research periods. Legacy T+ model keys never reach the UI.
-const horizonLabels = {
-  short_term: '短期',
-  mid_term: '中期',
-  long_term: '长期',
-};
-
-const horizonSubLabels = {
-  short_term: '1–21天',
-  mid_term: '1–6月',
-  long_term: '6月以上',
-};
-
-const horizonShortLabels = horizonLabels;
+const FEEDBACK_TOKEN_HEADER = 'X-Analysis-Feedback-Token';
 
 const stanceClass = {
   偏多: 'tone-bull',
@@ -171,7 +169,7 @@ function AppShell({ children }) {
 
   useEffect(() => {
     addSearchEntries('pages', [
-      { id: 'page-dashboard', source: 'pages', title: '研究主页', hint: '短中长期预测、指标证据与近端新闻', route: '/', keywords: ['dashboard', '主页', '预测', '指标'] },
+      { id: 'page-dashboard', source: 'pages', title: '研究主页', hint: '短期、中期、长期观点与指标证据', route: '/', keywords: ['dashboard', '主页', '预测', '指标'] },
       { id: 'page-quant', source: 'pages', title: '量化研究面板', hint: 'HMM 状态机、公允价值、情景锥与校准记分卡', route: '/quant', keywords: ['quant', '量化', 'hmm', '校准', '因子'] },
       { id: 'page-signals', source: 'pages', title: '观点书与信号台账', hint: '短中长三尺度观点、每周不可变发布与前向记分卡', route: '/signals', keywords: ['signals', '观点书', '台账', '信号', 'ledger'] },
       { id: 'page-advisor', source: 'pages', title: '个性化投研', hint: '一份画像两种能力：配置研究 + 提问分析', route: '/advisor', keywords: ['advisor', 'agent', '个性化', '画像', '参考区间', '问答', '分析'] },
@@ -354,11 +352,11 @@ function DashboardPage() {
         <DriverMatrix groups={groups} drivers={dashboardInsights.drivers} />
       </section>
 
-      <section className="forecast-grid" aria-label="Forecast horizons">
+      <section className="forecast-grid" aria-label="量化模型参考">
         {forecasts.length ? (
           forecasts.map((forecast) => <ForecastCard key={forecast.horizon} forecast={forecast} />)
         ) : (
-          <PlaceholderPanel icon={Clock3} text={loading ? '正在读取短期 / 中期 / 长期预测基线。' : '暂无预测基线。'} />
+          <PlaceholderPanel icon={Clock3} text={loading ? '正在读取量化模型参考。' : '暂无量化模型参考。'} />
         )}
       </section>
 
@@ -561,7 +559,7 @@ function AdvisorWorkbench() {
 
 function QaAnalysisPanel({ profile, investorProfile, profileScore, profileComplete }) {
   const [question, setQuestion] = useState(starterPrompts[0]);
-  const [horizon, setHorizon] = useState('short_term');
+  const [researchHorizon, setResearchHorizon] = useState('short_term');
   const [analysis, setAnalysis] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -570,12 +568,13 @@ function QaAnalysisPanel({ profile, investorProfile, profileScore, profileComple
 
   const riskProfile = profile.risk_tolerance;
   const summary = analysis?.summary_card;
+  const researchFocus = analysis?.research_focus;
   const riskBanner = analysis?.risk_banner;
   const forecasts = analysis?.horizon_forecasts || [];
   const evidenceCards = analysis?.evidence_cards || [];
   const citations = analysis?.citations || [];
   const recentNews = analysis?.recent_news || [];
-  const selectedForecast = forecasts.find((item) => item.horizon === horizon) || forecasts[0];
+  const selectedForecast = forecasts.find((item) => item.horizon === summary?.horizon) || forecasts[0];
 
   const riskBudget = useMemo(
     () => buildRiskBudget(investorProfile, profileScore, profileComplete),
@@ -607,13 +606,13 @@ function QaAnalysisPanel({ profile, investorProfile, profileScore, profileComple
         body: JSON.stringify({
           question: trimmed,
           risk_profile: riskProfile,
-          horizon,
+          horizon: researchHorizon,
           locale: 'zh-CN',
           investor_profile: investorProfile,
         }),
       });
       const json = await readApiJson(response, '分析失败');
-      setAnalysis(json);
+      setAnalysis({ ...json, feedbackToken: response.headers.get(FEEDBACK_TOKEN_HEADER) });
       window.setTimeout(() => resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
     } catch (submitError) {
       setError(submitError.message || '分析失败');
@@ -623,11 +622,11 @@ function QaAnalysisPanel({ profile, investorProfile, profileScore, profileComple
   }
 
   async function submitFeedback(rating) {
-    if (!analysis?.analysis_id) return;
+    if (!analysis?.analysis_id || !analysis.feedbackToken) return;
     try {
       const response = await fetch(FEEDBACK_URL, {
         method: 'POST',
-        headers: apiHeaders(),
+        headers: apiHeaders({ [FEEDBACK_TOKEN_HEADER]: analysis.feedbackToken }),
         body: JSON.stringify({ analysis_id: analysis.analysis_id, rating, comment: null }),
       });
       await readApiJson(response, '反馈提交失败');
@@ -654,7 +653,7 @@ function QaAnalysisPanel({ profile, investorProfile, profileScore, profileComple
               value={question}
               onChange={(event) => setQuestion(event.target.value)}
               rows={5}
-              placeholder="例：如果 CPI 高于预期，黄金短期和一周视角分别要怎么看？"
+              placeholder="例：如果 CPI 高于预期，黄金短期风险与中期驱动会怎样变化？"
             />
           </label>
 
@@ -668,10 +667,10 @@ function QaAnalysisPanel({ profile, investorProfile, profileScore, profileComple
 
           <div className="control-pair">
             <SegmentedControl
-              label="分析周期"
-              value={horizon}
-              options={Object.entries(horizonLabels)}
-              onChange={setHorizon}
+              label="研究分类"
+              value={researchHorizon}
+              options={Object.entries(RESEARCH_HORIZON_LABELS)}
+              onChange={setResearchHorizon}
             />
           </div>
 
@@ -696,7 +695,7 @@ function QaAnalysisPanel({ profile, investorProfile, profileScore, profileComple
           </ul>
           {selectedForecast ? (
             <div className="sticky-forecast">
-              <span>{horizonShortLabels[selectedForecast.horizon]}</span>
+              <span>{forecastWindowLabel(selectedForecast.horizon)}</span>
               <strong>{selectedForecast.stance}</strong>
               <small>{forecastBasisLabel(selectedForecast)}</small>
               <p>{selectedForecast.reasons?.[0]}</p>
@@ -728,8 +727,29 @@ function QaAnalysisPanel({ profile, investorProfile, profileScore, profileComple
               title="风险适配分析"
               description="输出方向、情景、失效条件和禁止执行条件，避免把研究解读误读成下单指令。"
             />
+            {researchFocus?.section ? (
+              <section className="panel-block">
+                <PanelTitle
+                  icon={BookOpenCheck}
+                  title={`${horizonLabel(researchFocus.horizon)}研究观点`}
+                  subtitle={researchFocus.data_asof ? `数据截至 ${researchFocus.data_asof}` : '大盘观点书'}
+                />
+                {researchFocus.section.available ? (
+                  <p>{researchFocus.section.core_view}</p>
+                ) : (
+                  <p>当前研究结论证据不足。</p>
+                )}
+                {researchFocus.section.evidence?.length > 0 && (
+                  <SummaryList title="研究证据" items={researchFocus.section.evidence} />
+                )}
+                {researchFocus.section.available && (
+                  <SummaryList title="失效条件" items={researchFocus.section.invalidation || []} />
+                )}
+              </section>
+            ) : null}
             <div className="briefing-grid">
               <section className="decision-panel">
+                <p className="muted-copy">{forecastWindowLabel(summary.horizon)} · 风险适配参考</p>
                 <div className="decision-head">
                   <span className={`stance-badge ${stanceClass[summary.stance] || 'tone-neutral'}`}>{summary.stance}</span>
                   <span>{summary.confidence_band}置信度</span>
@@ -747,8 +767,8 @@ function QaAnalysisPanel({ profile, investorProfile, profileScore, profileComple
                 <p className="disclaimer">{summary.disclaimer}</p>
                 <div className="feedback-row">
                   <span>这条分析是否有帮助？</span>
-                  <button type="button" onClick={() => submitFeedback('helpful')}>有帮助</button>
-                  <button type="button" onClick={() => submitFeedback('not_helpful')}>没帮助</button>
+                  <button type="button" disabled={!analysis.feedbackToken} onClick={() => submitFeedback('helpful')}>有帮助</button>
+                  <button type="button" disabled={!analysis.feedbackToken} onClick={() => submitFeedback('not_helpful')}>没帮助</button>
                 </div>
                 {feedbackStatus ? <p className="feedback-status">{feedbackStatus}</p> : null}
               </section>
@@ -817,12 +837,6 @@ function QaAnalysisPanel({ profile, investorProfile, profileScore, profileComple
 const MARKET_VIEW_URL =
   import.meta.env.VITE_AGENT_MARKET_VIEW_URL || API_URL.replace('/analyze', '/market-view');
 
-const marketViewMeta = {
-  short_term: '短期 1-21天',
-  mid_term: '中期 1-6月',
-  long_term: '长期 6月+',
-};
-
 function MarketViewSummaryPanel() {
   const [book, setBook] = useState(null);
   const [failed, setFailed] = useState(false);
@@ -847,11 +861,11 @@ function MarketViewSummaryPanel() {
       />
       {book ? (
         <div className="compact-list">
-          {Object.entries(marketViewMeta).map(([key, label]) => {
+          {Object.entries(RESEARCH_HORIZON_LABELS).map(([key, label]) => {
             const section = book[key];
             return (
               <article key={key}>
-                <span>{label}{section?.available ? ` · 置信度${section.confidence}` : ''}</span>
+                <span>{label} · {RESEARCH_HORIZON_WINDOWS[key]}{section?.available ? ` · 置信度${section.confidence}` : ''}</span>
                 <p>{section?.available ? section.core_view : `数据降级：${section?.degraded_reason || '不可用'}`}</p>
               </article>
             );
@@ -1091,7 +1105,7 @@ function ForecastCard({ forecast }) {
   return (
     <article className={`forecast-card ${stanceClass[forecast.stance] || 'tone-neutral'}`}>
       <div>
-        <span>{horizonShortLabels[forecast.horizon] || forecast.horizon}</span>
+        <span>{forecastWindowLabel(forecast.horizon)}</span>
         <small>{forecastBasisLabel(forecast)}</small>
       </div>
       <strong>{forecast.stance}</strong>
@@ -1212,16 +1226,23 @@ function IndicatorAuditDetails({ group, indicator }) {
 function QualityPanel({ quality, flags }) {
   return (
     <section className="panel-block">
-      <PanelTitle icon={DatabaseZap} title="数据质量" subtitle={quality?.status || 'unknown'} />
+      <PanelTitle
+        icon={DatabaseZap}
+        title="数据质量"
+        subtitle={dataQualityStatusCopy(quality?.status)}
+      />
       <div className="quality-list">
-        <MetricLine label="指标状态" value={quality?.indicator_status || 'N/A'} />
-        <MetricLine label="新闻状态" value={quality?.news_status || 'N/A'} />
-        <MetricLine label="新鲜度" value={quality ? `${quality.freshness_seconds}s` : 'N/A'} />
+        <MetricLine label="指标状态" value={dataQualityStatusCopy(quality?.indicator_status)} />
+        <MetricLine label="新闻状态" value={dataQualityStatusCopy(quality?.news_status)} />
+        <MetricLine
+          label="新鲜度"
+          value={quality?.freshness_seconds != null ? `${quality.freshness_seconds}s` : 'N/A'}
+        />
       </div>
       {flags.length ? (
         <div className="flag-stack">
           {flags.slice(0, 5).map((flag) => (
-            <span key={flag}>{flag}</span>
+            <span key={flag}>{degradationFlagCopy(flag)}</span>
           ))}
         </div>
       ) : (
@@ -1237,30 +1258,46 @@ function SourceHealthPanel({ sources, loading }) {
       <PanelTitle icon={LockKeyhole} title="数据源健康监控" subtitle={sources.length ? `${sources.length} 个来源` : '等待'} />
       <div className="source-health-list">
         {sources.length ? (
-          sources.map((source) => (
-            <article key={source.id} className={`source-health-row status-${source.status}`}>
-              <div className="source-health-topline">
-                <strong>{source.label}</strong>
-                <QualityDot status={source.status} />
-              </div>
-              <div className="source-health-meta">
-                <span>{source.cadence}</span>
-                <span>{source.freshness_seconds}s / SLA {source.expected_lag_seconds}s</span>
-              </div>
-              <div className="source-coverage">
-                {(source.coverage || []).slice(0, 3).map((item) => (
-                  <span key={item}>{item}</span>
-                ))}
-              </div>
-              {source.degraded_reason ? <p>{source.degraded_reason}</p> : <p>来源状态正常，暂无降级原因。</p>}
-              {source.url ? (
-                <a href={source.url} target="_blank" rel="noreferrer">
-                  来源入口
-                  <ExternalLink size={13} />
-                </a>
-              ) : null}
-            </article>
-          ))
+          sources.map((source) => {
+            const health = classifySourceHealth(source);
+            return (
+              <article key={source.id} className={`source-health-row status-${source.status}`}>
+                <div className="source-health-topline">
+                  <strong>{source.label}</strong>
+                  <QualityDot status={source.status} />
+                </div>
+                <div className="source-health-classification" aria-label="来源健康分类">
+                  <span className={health.timeliness === '延迟' ? 'is-late' : health.timeliness === '时效未知' ? 'is-unknown' : ''}>
+                    时效 · {health.timeliness}
+                  </span>
+                  <span className={health.provenance === '直接来源' ? '' : 'is-proxy'}>
+                    出处 · {health.provenance}
+                  </span>
+                </div>
+                <div className="source-health-meta">
+                  <span>更新频率 · {source.cadence}</span>
+                  <span>数据年龄 {source.freshness_seconds}s · 预期 {source.expected_lag_seconds}s</span>
+                </div>
+                <div className="source-coverage">
+                  {(source.coverage || []).slice(0, 3).map((item) => (
+                    <span key={item}>{item}</span>
+                  ))}
+                </div>
+                <p>{sourceReasonCopy(source)}</p>
+                {source.degraded_reason ? (
+                  <small className="source-health-audit">
+                    专业审计码 · <code>{source.degraded_reason}</code>
+                  </small>
+                ) : null}
+                {source.url ? (
+                  <a href={source.url} target="_blank" rel="noreferrer">
+                    来源入口
+                    <ExternalLink size={13} />
+                  </a>
+                ) : null}
+              </article>
+            );
+          })
         ) : (
           <p>{loading ? '正在读取数据源健康状态。' : 'dashboard 暂未返回 source_health。'}</p>
         )}
@@ -1383,9 +1420,15 @@ function StatusBadge({ status, loading }) {
 }
 
 function QualityDot({ status }) {
+  const label = {
+    ok: '正常',
+    degraded: '有降级',
+    unavailable: '不可用',
+    unknown: '未知',
+  }[status] || '未知';
   return (
     <span className={`quality-dot status-${status}`}>
-      {status}
+      {label}
     </span>
   );
 }
@@ -1462,7 +1505,7 @@ function buildDashboardInsights({ market, forecasts, groups, news, dataQuality, 
   const pressure = [...drivers].sort((a, b) => Number.parseFloat(a.scoreLabel) - Number.parseFloat(b.scoreLabel))[0];
   const degraded = degradationFlags?.length || dataQuality?.status === 'degraded' || market?.is_stale;
   const headline = primary
-    ? `${horizonShortLabels[primary.horizon]} ${primary.stance}，执行倾向：${primary.action}`
+    ? `${forecastWindowLabel(primary.horizon)} ${primary.stance}，执行倾向：${primary.action}`
     : '等待稳定预测基线';
   const thesis = {
     kicker: degraded ? '含降级数据，先看风险' : '稳定基线已就绪',

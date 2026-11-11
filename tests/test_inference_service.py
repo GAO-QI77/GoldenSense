@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 from fastapi.testclient import TestClient
 
+from data_loader import NewsDataLoader
 from feature_engineer import FeatureEngineer
 from inference_service import create_app
 
@@ -252,13 +253,13 @@ def test_inference_readiness_accepts_heuristic_proxy_when_checkpoints_are_missin
     assert "T+1_checkpoint_missing" in data["warnings"]
 
 
-def test_t7_default_checkpoint_uses_available_model_dir():
+def test_t7_default_checkpoint_has_its_own_directory():
     app = create_app(
         market_loader=_FakeMarketDataLoader(),
         news_loader=_FakeNewsDataLoader(),
         feature_engineer=FeatureEngineer(),
     )
-    assert app.state.model_dirs["T+7"] == "model_checkpoints"
+    assert app.state.model_dirs["T+7"] == "model_checkpoints_t7"
 
 
 def test_inference_readiness_reports_model_state():
@@ -274,7 +275,76 @@ def test_inference_readiness_reports_model_state():
     assert resp.status_code == 200
     data = resp.json()
     assert data["status"] == "ok"
-    assert data["model_status"]["T+7"]["checkpoint_path"] == "model_checkpoints"
+    assert data["model_status"]["T+7"]["checkpoint_path"] == "model_checkpoints_t7"
+
+
+def test_shared_checkpoint_cannot_load_as_t7(tmp_path):
+    model = _FailingLoadModel()
+    app = create_app(
+        model_t7=model,
+        model_checkpoints_dir_t1=str(tmp_path),
+        model_checkpoints_dir_t7=str(tmp_path),
+    )
+    # Exercise the disk-load path; injected models otherwise start preloaded.
+    app.state.model_loaded["T+7"] = False
+    client = TestClient(app)
+
+    health = client.get("/health/ready").json()
+    assert health["forecast_mode"]["T+7"] == "heuristic_proxy"
+    assert "T+7_checkpoint_shared" in health["warnings"]
+
+
+def test_historical_forecast_filters_news_before_aggregation_and_cache():
+    day = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+
+    class TimestampedNews(NewsDataLoader):
+        def fetch_news(self):
+            return [
+                {"title": "war conflict crisis", "summary": "", "published": (day + timedelta(hours=12)).isoformat()},
+                {"title": "rate hike", "summary": "", "published": (day + timedelta(days=1)).isoformat()},
+                {"title": "breaking weak dollar", "summary": "", "published": "invalid"},
+            ]
+
+    def forecast(client, hours):
+        response = client.post("/api/v1/forecast", json={
+            "asset_symbol": "XAUUSD", "horizon": "T+30",
+            "current_timestamp": (day + timedelta(hours=hours)).isoformat(),
+        })
+        assert response.status_code == 200
+        return response.json()
+
+    client = TestClient(create_app(market_loader=_FakeMarketDataLoader(), news_loader=TimestampedNews()))
+    clean = TestClient(create_app(market_loader=_FakeMarketDataLoader(), news_loader=_FakeNewsDataLoader()))
+
+    late = forecast(client, 18)
+    early = forecast(client, 8)
+    assert early == forecast(clean, 8)
+    assert late != early
+
+
+def test_date_only_market_bar_is_not_visible_during_its_utc_day():
+    day = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    class IntradayMarket(_FakeMarketDataLoader):
+        def fetch_data(self, period="6mo", interval="1d"):
+            data = super().fetch_data(period, interval)
+            data.loc[data.index[-1], "Gold"] = 10000
+            return data
+
+    class LastClosedMarket(_FakeMarketDataLoader):
+        def fetch_data(self, period="6mo", interval="1d"):
+            return super().fetch_data(period, interval).iloc[:-1]
+
+    def forecast(loader):
+        client = TestClient(create_app(market_loader=loader, news_loader=_FakeNewsDataLoader()))
+        response = client.post("/api/v1/forecast", json={
+            "asset_symbol": "XAUUSD", "horizon": "T+30",
+            "current_timestamp": (day + timedelta(hours=8)).isoformat(),
+        })
+        assert response.status_code == 200
+        return response.json()
+
+    assert forecast(IntradayMarket()) == forecast(LastClosedMarket())
 
 
 def test_batch_forecast_reuses_market_and_news_inputs_for_three_horizons():

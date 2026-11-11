@@ -15,8 +15,9 @@ import psycopg
 import redis
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import AwareDatetime
 
-from data_loader import MarketDataProvider, create_market_data_provider
+from data_loader import MarketDataProvider, create_market_data_provider, market_data_as_of
 from service_contracts import (
     GoldPriceHistoryPoint,
     GoldPriceHistoryResponse,
@@ -880,13 +881,17 @@ def _with_freshness(
 async def _resolve_snapshot(
     loader: MarketDataProvider,
     cfg: MarketSnapshotConfig,
+    decision_at: Optional[datetime] = None,
 ) -> tuple[MarketSnapshotResponse, Optional[str]]:
     try:
         market_df = await asyncio.to_thread(loader.fetch_data, "6mo", "1d")
+        cutoff = decision_at or datetime.now(timezone.utc)
+        market_df = market_data_as_of(market_df, cutoff)
         snapshot = build_market_snapshot(
             market_df,
             source=getattr(loader, "provider_name", cfg.provider_name),
             stale_after_seconds=cfg.stale_after_seconds,
+            now=cutoff,
         )
         return snapshot, None
     except Exception as exc:
@@ -894,7 +899,7 @@ async def _resolve_snapshot(
             raise
         reason = f"synthetic_fallback:{type(exc).__name__}:{exc}"
         return (
-            build_synthetic_market_snapshot(stale_after_seconds=cfg.stale_after_seconds, degraded_reason=reason),
+            build_synthetic_market_snapshot(now=decision_at, stale_after_seconds=cfg.stale_after_seconds, degraded_reason=reason),
             reason,
         )
 
@@ -1084,8 +1089,12 @@ def create_app(
             raise HTTPException(status_code=503, detail=f"market_refresh_failed: {exc}") from exc
 
     @app.get("/api/v1/market/snapshot/latest", response_model=MarketSnapshotResponse)
-    async def get_latest_market_snapshot() -> MarketSnapshotResponse:
+    async def get_latest_market_snapshot(decision_at: Optional[AwareDatetime] = None) -> MarketSnapshotResponse:
         snapshot = getattr(app.state, "latest_snapshot", None) or persistence.load()
+        if decision_at is not None:
+            if snapshot is None or snapshot.as_of > decision_at:
+                raise HTTPException(status_code=503, detail="market_snapshot_unavailable_at_decision")
+            return _with_freshness(snapshot, stale_after_seconds=cfg.stale_after_seconds, now=decision_at)
         if snapshot is None and cfg.allow_synthetic_fallback:
             app.state.last_error = "synthetic_fallback:cache_miss"
             snapshot = build_synthetic_market_snapshot(
@@ -1100,25 +1109,34 @@ def create_app(
         return snapshot
 
     @app.get("/api/v1/market/indicators/current", response_model=MarketIndicatorsResponse)
-    async def get_current_market_indicators() -> MarketIndicatorsResponse:
-        snapshot = await get_latest_market_snapshot()
+    async def get_current_market_indicators(decision_at: Optional[AwareDatetime] = None) -> MarketIndicatorsResponse:
+        try:
+            snapshot = await get_latest_market_snapshot(decision_at)
+        except HTTPException:
+            if decision_at is None:
+                raise
+            snapshot = await refresh_market_snapshot(decision_at)
         return build_market_indicators(snapshot)
 
     @app.get("/api/v1/market/gold/history", response_model=GoldPriceHistoryResponse)
-    async def get_gold_price_history() -> GoldPriceHistoryResponse:
+    async def get_gold_price_history(decision_at: Optional[AwareDatetime] = None) -> GoldPriceHistoryResponse:
         try:
             market_df = await asyncio.to_thread(loader.fetch_data, "1y", "1d")
+            if decision_at is not None:
+                market_df = market_data_as_of(market_df, decision_at)
             return build_gold_price_history(
                 market_df,
                 source=getattr(loader, "provider_name", cfg.provider_name),
+                now=decision_at,
             )
         except Exception as exc:
             if not cfg.allow_synthetic_fallback:
                 raise HTTPException(status_code=503, detail=f"market_history_unavailable: {exc}") from exc
-            market_df = build_synthetic_market_frame()
+            market_df = build_synthetic_market_frame(now=decision_at)
             return build_gold_price_history(
                 market_df,
                 source="synthetic_fallback",
+                now=decision_at,
             )
 
     return app

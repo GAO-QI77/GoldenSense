@@ -8,6 +8,7 @@ citation and both sides degrade explicitly and independently.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from event_classifier import classify_news
@@ -23,6 +24,7 @@ def search_knowledge(
     event_library: Optional[EventStudyLibrary] = None,
     news_archive: Optional[NewsArchive] = None,
     limit: int = 8,
+    decision_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     event_library = event_library or shared_event_library
     news_archive = news_archive or NewsArchive(DEFAULT_ARCHIVE_PATH)
@@ -33,7 +35,7 @@ def search_knowledge(
     event_analogs: Optional[Dict[str, Any]] = None
     if classification:
         try:
-            event_analogs = event_library.analogs_for(classification["category"])
+            event_analogs = event_library.analogs_for(classification["category"], decision_at=decision_at)
             if event_analogs is None:
                 degraded["event_analogs"] = "event_study_unavailable"
         except Exception as exc:
@@ -43,7 +45,7 @@ def search_knowledge(
 
     news_hits = []
     try:
-        news_hits = news_archive.search(query, limit=limit)
+        news_hits = news_archive.search(query, limit=limit, now=decision_at)
     except Exception as exc:
         degraded["news_hits"] = f"{type(exc).__name__}: {exc}"
 

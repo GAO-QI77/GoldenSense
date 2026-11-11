@@ -126,7 +126,7 @@ REDIS_URL=rediss://...        # Upstash Redis connection string
 
 `APP_ENV=demo` 会显式使用 `yfinance + RSS`，并保留带标记的 fallback。该模式适合公开黑客松体验，不应描述为交易级行情基础设施。
 
-若需要先发布可体验版本，再补齐第三方服务，可以暂时省略 `DEEPSEEK_API_KEY`、`DATABASE_URL` 和 `REDIS_URL`。启动器会使用规则叙事、内存 trace 和显式降级结果。Neon、Upstash 与 DeepSeek 接入后，无需改代码，只需补充环境变量并重新部署。
+公开环境需要可访问的 PostgreSQL 持久化账本和审计连接。账本默认使用 `DATABASE_URL`，也可以通过 `SIGNAL_LEDGER_DATABASE_URL` 指定。LLM 和 Redis 仍可按项目配置选择，缺少 LLM 时用规则叙事。
 
 ### 成本基线
 
@@ -175,6 +175,8 @@ VITE_AGENT_DASHBOARD_URL=https://agent-gateway-production-fa79.up.railway.app/ap
 VITE_AGENT_FEEDBACK_URL=https://agent-gateway-production-fa79.up.railway.app/api/v1/agent/feedback
 VITE_AGENT_API_KEY=your-public-key
 ```
+
+Vercel 的 SPA 路由由 `modern_showcase_site/vercel.json` 处理，浏览器按上述 URL 直接访问 Railway。`VITE_` 变量会进入前端构建产物，内部 API key 和数据库凭证应留在后端环境。
 
 后端生产环境至少需要：
 
@@ -262,3 +264,47 @@ python3 scripts/competition_acceptance.py \
 
 首页聚合默认使用 15 秒共享快照合并并发下游请求。读、分析、研究、个性化和写入使用独立限流桶；429 响应包含
 `Retry-After`、中文原因和重试时间，前端不得将其呈现为研究结论。
+
+## 7. 研究数据与数据库升级
+
+在 Railway 持久卷上保存研究数据，确保应用和定时任务使用同一组文件路径。Docker 构建会排除本地 `data_cache/`，部署时需单独准备这些数据。
+
+| 变量 | 文件用途 |
+| --- | --- |
+| `GOLD_RESEARCH_MARKET_PATH` | 量化研究、事件研究和影子评分共用的扩展行情 |
+| `MACRO_VINTAGES_PATH` | 带可见时间的 ALFRED 宏观历史版本 |
+| `GOLD_DRIVER_FLOWS_PATH` | 带可见时间的 ETF、COT 和央行购金数据 |
+| `GOLD_RISK_REVIEW_PATH` | 短期候选风险模型的复验摘要 |
+
+`python3 scripts/refresh_data.py` 刷新扩展行情，获取失败时保留上一份有效数据。
+Railway 单容器默认在启动时刷新并按天继续运行，可用
+`DATA_REFRESH_INTERVAL_SECONDS` 调整间隔。过期快照保留用于带标记的研究降级，当周发布等待数据恢复。启用 `GOLD_DRIVER_COT_REFRESH_ENABLED=1`
+后，刷新任务同时采集 COT。宏观版本单独运行 `python3 scripts/refresh_macro_vintages.py` 更新，
+可在执行环境配置 `FRED_API_KEY` 或用 `--alfred-exports` 导入核验过的离线数据。
+
+短期波动复验、分析校准和影子组合可使用同一套经核验的黄金会话数据。
+将价格文件 `Date,Gold` 和会话文件 `Date,close_at,available_at` 放在持久卷，
+按日期逐行对应。两个时间列都必须含时区。配置 `GOLD_VERIFIED_CLOSES_PATH`
+和 `GOLD_VERIFIED_SESSIONS_PATH` 后，影子记分与分析校准只读截止前已可见的报价。
+原有日级代理仍可用于研究，记分卡会显示该口径。用正式数据跑短期复验时，将
+两份文件传给 `scripts/evaluate_short_term_risk.py` 并显式指定评估起点和截止时间。
+
+在迁移任务的运行环境配置 `DATABASE_URL`，先在测试数据库验证，再对目标数据库运行只读预检，
+确认历史事件表、新闻快照表和待清理审计记录的状态。确认目标与备份后可执行可重复运行的结构迁移，
+再以只读预检核对结果。Railway 使用 `/health/ready` 检查下游和账本。部署前命令仅应用新增表与列等结构迁移，失败时保留上个部署。旧审计清理由独立命令执行。
+
+```bash
+python3 scripts/migrate_release.py
+python3 scripts/migrate_release.py --apply-schema
+python3 scripts/migrate_release.py
+```
+
+旧审计数据清理会永久精简旧载荷、清空工具调用和证据详情、删除反馈自由文本，并仅保留脚本允许的期限、
+摘要立场、置信度等级及反馈评分。确认留存要求和备份后，单独执行清理并检查返回的剩余条数。
+
+```bash
+python3 scripts/migrate_release.py --redact-legacy
+```
+
+影子发布依赖当期研究数据。遇到过期或缺失数据时，系统保留已经登记的记录。
+使用 `python3 scripts/publish_signal.py --no-digest` 可仅登记当前周，不发送摘要。

@@ -7,11 +7,13 @@ import logging
 import math
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Literal, Optional, Sequence, Tuple, TypedDict
@@ -64,7 +66,7 @@ from model_governance import (
 # allocation-profile-aligned model from investor_profile.py.
 from investor_profile import InvestorProfile as PersonalResearchProfile
 from investor_profile import PersonalNarrative
-from market_view import build_market_view
+from market_view import ResearchHorizon, build_market_view
 from narrative_critic import verify_narrative
 from personal_research import (
     build_personal_facts,
@@ -88,15 +90,21 @@ from research_case import (
 )
 from research_orchestrator import build_research_case
 from signal_ledger import (
+    build_ledger_store,
     JsonlLedgerStore,
+    LedgerIntegrityError,
+    LedgerUnavailableError,
+    PostgresLedgerStore,
     publish_weekly,
-    score_track_record,
+    score_configured_track_record,
+    StalePublicationDataError,
 )
 from subscriptions import SubscriptionStore, mask_email, send_digest
 from outcome_tracker import (
     backfill_outcomes,
     calibration_summary,
     committee_weight_adjustments,
+    extract_analysis_record,
 )
 from regime_strategy import evaluate_regime, evaluate_regime_v2
 from research_context import shared_context as quant_research_context
@@ -131,6 +139,14 @@ def _horizon_zh(horizon: str) -> str:
         return HORIZON_LABELS[public_horizon_payload(horizon)]
     except ValueError:
         return horizon
+
+
+_DECISION_AT: ContextVar[Optional[datetime]] = ContextVar("decision_at", default=None)
+_FEEDBACK_TOKEN_HEADER = "X-Analysis-Feedback-Token"
+
+
+def _decision_at() -> datetime:
+    return _DECISION_AT.get() or datetime.now(timezone.utc)
 
 
 class RiskResult(TypedDict):
@@ -399,6 +415,16 @@ AgentForecastsResponse.model_rebuild()
 AgentDashboardResponse.model_rebuild()
 
 
+class ResearchFocus(BaseModel):
+    horizon: ResearchHorizon
+    section: Dict[str, Any]
+    data_asof: Optional[str] = None
+
+
+class ResearchAgentAnalyzeResponse(AgentAnalyzeResponse):
+    research_focus: ResearchFocus
+
+
 class AgentFeedbackRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -499,6 +525,7 @@ class AnalysisComputation:
     recent_news: List[NewsEventItem]
     evidence_cards: List[EvidenceCard]
     citations: List[CitationItem]
+    feedback_token: str
 
 
 def _env(name: str, default: str) -> str:
@@ -558,9 +585,8 @@ def _fallback_quant_forecast(reason: str) -> Dict[str, Any]:
     }
 
 
-def _fallback_recent_news(query: str) -> RecentNewsResponse:
-    now = datetime.now(timezone.utc)
-    prompt = query.strip() or "黄金市场"
+def _fallback_recent_news() -> RecentNewsResponse:
+    now = _decision_at()
     return RecentNewsResponse(
         as_of=now,
         freshness_seconds=0,
@@ -571,10 +597,10 @@ def _fallback_recent_news(query: str) -> RecentNewsResponse:
             NewsEventItem(
                 event_id="fallback-news-1",
                 published_at=now,
-                title=f"降级模式：围绕“{prompt[:32]}”的实时新闻暂不可用。",
+                title="降级模式：实时新闻暂不可用。",
                 summary="系统已切换为保守解释模式，优先使用可用的市场快照、风险控制和历史逻辑框架。",
                 source="synthetic_fallback",
-                normalized_event=prompt[:80],
+                normalized_event="新闻源暂不可用",
                 sentiment_score=0.0,
                 importance=0.1,
                 categories=["fallback"],
@@ -1125,19 +1151,21 @@ class AgentTraceStore:
         self._db_ready = False
 
     async def startup(self) -> None:
+        schema_unavailable = False
         try:
             await asyncio.to_thread(self._ensure_schema_sync)
             self._db_ready = True
         except Exception as exc:
             self._db_ready = False
             LOGGER.warning(
-                "agent_trace_schema_init_failed database_url=%s allow_memory_fallback=%s error=%s",
-                self._database_url,
+                "agent_trace_schema_init_failed allow_memory_fallback=%s error_type=%s",
                 self._allow_memory_fallback,
-                f"{type(exc).__name__}:{exc}",
+                type(exc).__name__,
             )
             if not self._allow_memory_fallback:
-                raise TraceStoreUnavailableError("trace_store_schema_unavailable") from exc
+                schema_unavailable = True
+        if schema_unavailable:
+            raise TraceStoreUnavailableError("trace_store_schema_unavailable") from None
 
     def _prune_memory(self) -> None:
         if not self._allow_memory_fallback:
@@ -1198,19 +1226,22 @@ class AgentTraceStore:
                 return analysis_id
             raise TraceStoreUnavailableError("trace_store_unavailable")
 
+        persist_unavailable = False
         try:
             await asyncio.to_thread(self._persist_analysis_sync, row)
             return analysis_id
         except Exception as exc:
             LOGGER.warning(
-                "agent_trace_persist_failed analysis_id=%s allow_memory_fallback=%s error=%s",
+                "agent_trace_persist_failed analysis_id=%s allow_memory_fallback=%s error_type=%s",
                 analysis_id,
                 self._allow_memory_fallback,
-                f"{type(exc).__name__}:{exc}",
+                type(exc).__name__,
             )
             if self._allow_memory_fallback:
                 return analysis_id
-            raise TraceStoreUnavailableError("trace_store_persist_failed") from exc
+            persist_unavailable = True
+        if persist_unavailable:
+            raise TraceStoreUnavailableError("trace_store_persist_failed") from None
 
     async def save_feedback(self, analysis_id: str, rating: str, comment: Optional[str]) -> bool:
         row = self._memory.get(analysis_id)
@@ -1218,21 +1249,24 @@ class AgentTraceStore:
             row["feedback_rating"] = rating
             row["feedback_comment"] = comment
 
+        feedback_unavailable = False
         if self._db_ready:
             try:
                 updated = await asyncio.to_thread(self._save_feedback_sync, analysis_id, rating, comment)
                 return updated or row is not None
             except Exception as exc:
                 LOGGER.warning(
-                    "agent_trace_feedback_failed analysis_id=%s allow_memory_fallback=%s error=%s",
+                    "agent_trace_feedback_failed analysis_id=%s allow_memory_fallback=%s error_type=%s",
                     analysis_id,
                     self._allow_memory_fallback,
-                    f"{type(exc).__name__}:{exc}",
+                    type(exc).__name__,
                 )
                 if row is not None and self._allow_memory_fallback:
                     return True
                 if not self._allow_memory_fallback:
-                    raise TraceStoreUnavailableError("trace_store_feedback_failed") from exc
+                    feedback_unavailable = True
+        if feedback_unavailable:
+            raise TraceStoreUnavailableError("trace_store_feedback_failed") from None
         return row is not None
 
     async def load_trace(self, analysis_id: str) -> Optional[Dict[str, Any]]:
@@ -1243,32 +1277,38 @@ class AgentTraceStore:
             if self._allow_memory_fallback:
                 return None
             raise TraceStoreUnavailableError("trace_store_unavailable")
+        load_unavailable = False
         try:
             return await asyncio.to_thread(self._load_trace_sync, analysis_id)
         except Exception as exc:
             LOGGER.warning(
-                "agent_trace_load_failed analysis_id=%s allow_memory_fallback=%s error=%s",
+                "agent_trace_load_failed analysis_id=%s allow_memory_fallback=%s error_type=%s",
                 analysis_id,
                 self._allow_memory_fallback,
-                f"{type(exc).__name__}:{exc}",
+                type(exc).__name__,
             )
             if self._allow_memory_fallback:
                 return None
-            raise TraceStoreUnavailableError("trace_store_load_failed") from exc
+            load_unavailable = True
+        if load_unavailable:
+            raise TraceStoreUnavailableError("trace_store_load_failed") from None
 
     async def load_recent_analyses(self, limit: int = 500) -> List[Dict[str, Any]]:
         """Recent analyses for outcome tracking. DB first, else dev memory."""
+        recent_unavailable = False
         if self._db_ready:
             try:
                 return await asyncio.to_thread(self._load_recent_sync, limit)
             except Exception as exc:
                 LOGGER.warning(
-                    "agent_trace_recent_failed allow_memory_fallback=%s error=%s",
+                    "agent_trace_recent_failed allow_memory_fallback=%s error_type=%s",
                     self._allow_memory_fallback,
-                    f"{type(exc).__name__}:{exc}",
+                    type(exc).__name__,
                 )
                 if not self._allow_memory_fallback:
-                    raise TraceStoreUnavailableError("trace_store_recent_failed") from exc
+                    recent_unavailable = True
+        if recent_unavailable:
+            raise TraceStoreUnavailableError("trace_store_recent_failed") from None
         self._prune_memory()
         rows = [
             {k: v for k, v in row.items() if k != "created_at_epoch"}
@@ -1510,28 +1550,41 @@ class HttpResearchToolbox:
         self._cfg = cfg
 
     async def get_market_snapshot(self) -> MarketSnapshotResponse:
-        # Public reads must never mutate or refetch third-party market data.
         # Refreshing is owned by the market service's background/internal path.
-        resp = await self._http.get(self._cfg.market_snapshot_url)
+        cutoff = _decision_at()
+        resp = await self._http.get(self._cfg.market_snapshot_url, params={"decision_at": cutoff.isoformat()})
         resp.raise_for_status()
-        return MarketSnapshotResponse(**resp.json())
+        snapshot = MarketSnapshotResponse(**resp.json())
+        if snapshot.as_of > cutoff:
+            raise ValueError("market_snapshot_after_decision")
+        return snapshot
 
     async def get_market_indicators(self) -> MarketIndicatorsResponse:
-        resp = await self._http.get(self._cfg.market_indicators_url)
+        cutoff = _decision_at()
+        resp = await self._http.get(self._cfg.market_indicators_url, params={"decision_at": cutoff.isoformat()})
         resp.raise_for_status()
-        return MarketIndicatorsResponse(**resp.json())
+        indicators = MarketIndicatorsResponse(**resp.json())
+        if indicators.as_of > cutoff:
+            raise ValueError("market_indicators_after_decision")
+        return indicators
 
     async def get_gold_history(self) -> GoldPriceHistoryResponse:
-        resp = await self._http.get(self._cfg.market_history_url)
+        cutoff = _decision_at()
+        resp = await self._http.get(self._cfg.market_history_url, params={"decision_at": cutoff.isoformat()})
         resp.raise_for_status()
-        return GoldPriceHistoryResponse(**resp.json())
+        history = GoldPriceHistoryResponse(**resp.json())
+        if history.as_of > cutoff:
+            raise ValueError("market_history_after_decision")
+        return history
 
-    async def get_quant_forecast(self, horizon: PublicHorizon) -> Dict[str, Any]:
+    async def get_quant_forecast(
+        self, horizon: PublicHorizon, *, decision_at: Optional[datetime] = None
+    ) -> Dict[str, Any]:
         mapped = _public_to_internal_horizon(horizon)
         payload = {
             "asset_symbol": "XAUUSD",
             "horizon": mapped,
-            "current_timestamp": datetime.now(timezone.utc).isoformat(),
+            "current_timestamp": (decision_at or _decision_at()).isoformat(),
         }
         resp = await self._http.post(self._cfg.forecast_url, json=payload)
         resp.raise_for_status()
@@ -1543,15 +1596,19 @@ class HttpResearchToolbox:
             if "/api/v1/forecast" in self._cfg.forecast_url
             else f"{self._cfg.forecast_url.rstrip('/')}/batch"
         )
+        decision_at = _decision_at()
         mapped_horizons = [_public_to_internal_horizon(horizon) for horizon in horizons]
         payload = {
             "asset_symbol": "XAUUSD",
             "horizons": mapped_horizons,
-            "current_timestamp": datetime.now(timezone.utc).isoformat(),
+            "current_timestamp": decision_at.isoformat(),
         }
         resp = await self._http.post(batch_url, json=payload)
         if resp.status_code in {404, 405}:
-            return {horizon: await self.get_quant_forecast(horizon) for horizon in horizons}
+            return {
+                horizon: await self.get_quant_forecast(horizon, decision_at=decision_at)
+                for horizon in horizons
+            }
         resp.raise_for_status()
         data = resp.json()
         forecasts = data.get("forecasts", {})
@@ -1562,32 +1619,27 @@ class HttpResearchToolbox:
         }
 
     async def search_recent_news(self, query: str, limit: int = 6) -> RecentNewsResponse:
-        cached: Optional[RecentNewsResponse] = None
-        try:
-            resp = await self._http.get(self._cfg.recent_news_url, params={"limit": limit, "q": query})
-            resp.raise_for_status()
-            cached = RecentNewsResponse(**resp.json())
-            if cached.items and cached.freshness_seconds <= self._cfg.news_stale_after_seconds:
-                return cached
-        except Exception:
-            cached = None
-
-        refresh_url = self._cfg.recent_news_url.replace("/recent", "/refresh")
-        try:
-            refresh = await self._http.post(refresh_url, json={})
-            refresh.raise_for_status()
-            resp = await self._http.get(self._cfg.recent_news_url, params={"limit": limit, "q": query})
-            resp.raise_for_status()
-            return RecentNewsResponse(**resp.json())
-        except Exception:
-            if cached is not None:
-                return cached
-            resp = await self._http.get(self._cfg.recent_news_url, params={"limit": limit, "q": query})
-            resp.raise_for_status()
-            return RecentNewsResponse(**resp.json())
+        cutoff = _decision_at()
+        # Keep arbitrary request text out of upstream URLs and access logs.
+        topics = ("黄金", "金价", "美元", "利率", "美联储", "通胀", "非农", "就业", "避险",
+                  "gold", "fed", "cpi", "etf", "cftc", "fomc")
+        keywords = " ".join(topic for topic in topics if topic in query.lower()) or "黄金 gold"
+        resp = await self._http.get(
+            self._cfg.recent_news_url,
+            params={"limit": limit, "q": keywords, "decision_at": cutoff.isoformat()},
+        )
+        resp.raise_for_status()
+        news = RecentNewsResponse(**resp.json()).visible_at(cutoff)
+        if news.status == "ok" and news.freshness_seconds > self._cfg.news_stale_after_seconds:
+            return news.model_copy(update={"status": "degraded", "degraded_reason": "news_snapshot_stale"})
+        return news
 
     async def retrieve_historical_events(self, text: str, top_k: int = 3) -> HistoricalEventsLookup:
-        resp = await self._http.post(self._cfg.memory_url, json={"current_event_text": text, "top_k": top_k})
+        resp = await self._http.post(self._cfg.memory_url, json={
+            "current_event_text": text,
+            "top_k": top_k,
+            "decision_at": _decision_at().isoformat(),
+        })
         resp.raise_for_status()
         payload = resp.json()
         items = payload.get("results", [])
@@ -1696,73 +1748,7 @@ class OpenAINarrator:
         profile: PersonalResearchProfile,
         draft: PersonalNarrative,
     ) -> PersonalNarrative:
-        """Polish the deterministic personalized draft. Language only: the
-        critic re-grounds every number afterwards, and directive phrasing is
-        rejected downstream, so degrading to ``draft`` is always safe."""
-        model = (
-            self._cfg.complex_model if facts.get("risk_flags") else self._cfg.default_model
-        )
-        if self._client is None:
-            LOGGER.warning(
-                "personal_narrator_degraded provider=%s model=%s reason=no_client_configured",
-                self._provider,
-                model,
-            )
-            return draft
-        if self._provider not in {"deepseek", "openai"}:
-            LOGGER.warning(
-                "personal_narrator_degraded provider=%s reason=unsupported_provider",
-                self._provider,
-            )
-            return draft
-
-        schema = PersonalNarrative.model_json_schema()
-        system_prompt = (
-            "你是 GoldenSense 的中文个性化研究助手。根据给定的结构化事实，"
-            "为该投资者画像重写一份更流畅的研究参考叙事。硬性规则："
-            "1) 只能使用事实中已有的数字，禁止编造或外推任何数值；"
-            "2) 禁止任何操作指令式措辞（如'建议买入/卖出、应该加仓、满仓、清仓、抄底'），"
-            "只能使用'参考区间/差距/风险提示'框架；"
-            "3) 依据 experience 调整解释深度：novice 需解释术语，professional 直接给结论；"
-            "4) 保留免责声明原文。"
-            "严格输出符合以下 JSON Schema 的 json 对象，不要输出 markdown："
-            f"{json.dumps(schema, ensure_ascii=False)}"
-        )
-        payload = {
-            "profile": profile.model_dump(),
-            "facts": facts,
-            "draft": draft.model_dump(),
-        }
-
-        for attempt in range(1, 3):
-            try:
-                async def _request() -> str:
-                    response = await self._client.chat.completions.create(
-                        model=model,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                        ],
-                        response_format={"type": "json_object"},
-                    )
-                    choices = getattr(response, "choices", [])
-                    if not choices:
-                        return ""
-                    return str(getattr(getattr(choices[0], "message", None), "content", "") or "")
-
-                output_text = await asyncio.wait_for(_request(), timeout=self._timeout_seconds)
-                if not output_text:
-                    raise ValueError("empty_output")
-                return PersonalNarrative(**json.loads(output_text))
-            except Exception as exc:
-                LOGGER.warning(
-                    "personal_narrator_degraded provider=%s model=%s attempt=%s reason=%s:%s",
-                    self._provider,
-                    model,
-                    attempt,
-                    type(exc).__name__,
-                    exc,
-                )
+        """Keep position-dependent research text within the gateway."""
         return draft
 
     async def narrate_research_case(
@@ -1789,22 +1775,7 @@ class OpenAINarrator:
             "conditions. Return only JSON matching this schema: "
             f"{json.dumps(schema, ensure_ascii=False)}"
         )
-        payload = {
-            "question": case.question,
-            "data_asof": case.data_asof,
-            "accepted_facts": [
-                claim.model_dump(mode="json")
-                for claim in case.fact_claims
-                if claim.status == "accepted"
-            ],
-            "agent_views": [view.model_dump(mode="json") for view in case.agent_views],
-            "conflicts": [conflict.model_dump(mode="json") for conflict in case.conflicts],
-            "horizon_strategy": {
-                key: value.model_dump(mode="json") for key, value in case.horizon_strategy.items()
-            },
-            "model_registry": [card.model_dump(mode="json") for card in case.model_registry],
-            "draft": draft.model_dump(mode="json"),
-        }
+        payload = {"draft": draft.model_dump(mode="json")}
 
         async def _request() -> str:
             if self._provider == "deepseek":
@@ -1864,17 +1835,19 @@ class OpenAINarrator:
         return None
 
     def _prompt_payload(self, bundle: AnalysisBundle, draft: NarrativeOutput) -> Dict[str, Any]:
+        # Send only the deterministic brief and approved scalar facts.
         return {
-            "question": bundle.question,
-            "optional_news_text": bundle.optional_news_text,
-            "risk_profile": bundle.risk_profile,
-            "snapshot": bundle.snapshot.model_dump(mode="json"),
-            "forecast": bundle.forecast,
-            "recent_news": bundle.news.model_dump(mode="json"),
-            "rag_events": [event.model_dump() for event in bundle.rag_events],
-            "macro_context": bundle.macro_context,
-            "risk_gate": bundle.risk_gate,
-            "draft": draft.model_dump(),
+            "forecast": {
+                field: bundle.forecast[field]
+                for field in ("direction_prediction", "probability", "forecast_basis")
+                if field in bundle.forecast
+            },
+            "market": {
+                "asset": bundle.snapshot.asset,
+                "latest_price": bundle.snapshot.latest_price,
+                "as_of": bundle.snapshot.as_of.isoformat(),
+            },
+            "draft": draft.model_dump(mode="json"),
         }
 
     async def _narrate_deepseek(
@@ -2034,11 +2007,12 @@ class AgentAnalysisService:
         rows = await self._trace_store.load_recent_analyses(limit=limit)
 
         def _score() -> Dict[str, Any]:
-            from data_sources import load_market_data
+            from gold_sessions import load_gold_outcome_prices
 
-            raw, source = load_market_data()
-            outcomes = backfill_outcomes(rows, raw["Gold"])
-            summary = calibration_summary(outcomes)
+            prices, source = load_gold_outcome_prices(_decision_at())
+            outcomes = backfill_outcomes(rows, prices)
+            valid_analysis_count = sum(extract_analysis_record(row) is not None for row in rows)
+            summary = calibration_summary(outcomes, total_valid_analyses=valid_analysis_count)
             summary["price_data_source"] = source
             summary["weight_adjustment"] = committee_weight_adjustments(summary)
             summary["recent_outcomes"] = [
@@ -2077,7 +2051,7 @@ class AgentAnalysisService:
         return (await self.analyze_internal(req)).response
 
     async def analyze_internal(self, req: AgentAnalyzeRequest) -> AnalysisComputation:
-        t0 = datetime.now(timezone.utc)
+        t0 = _decision_at()
         evidence_query = _evidence_query(req)
         news_query = _news_search_query(req)
         snapshot, forecast_map, news, memory_lookup, tool_trace = await self._gather(
@@ -2096,7 +2070,7 @@ class AgentAnalysisService:
         # comes from the repo-local dataset with a TTL cache; per-request tool
         # history is far too short for those models. Failure degrades softly.
         try:
-            quant_ctx = await asyncio.to_thread(quant_research_context.get_context)
+            quant_ctx = await asyncio.to_thread(quant_research_context.get_context_at, t0)
         except Exception as exc:  # pragma: no cover - defensive
             quant_ctx = {"degraded": {"local_context": f"{type(exc).__name__}:{exc}"}}
         state_posterior = (quant_ctx.get("regime_posterior") or {}).get("latest")
@@ -2186,7 +2160,7 @@ class AgentAnalysisService:
             news_classification = classify_news(class_text)
             if news_classification:
                 analog_prior = shared_event_library.analogs_for(
-                    news_classification["category"]
+                    news_classification["category"], decision_at=t0
                 )
                 cache_invalidated = False
                 if news_classification["severity"] == "high":
@@ -2362,7 +2336,8 @@ class AgentAnalysisService:
 
         elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
         analysis_id = str(uuid.uuid4())
-        response_model = AgentAnalyzeResponse(
+        feedback_token = secrets.token_urlsafe(32)
+        response_fields = dict(
             analysis_id=analysis_id,
             summary_card=narrative.summary_card,
             horizon_forecasts=horizon_forecasts,
@@ -2374,31 +2349,50 @@ class AgentAnalysisService:
             follow_up_questions=narrative.follow_up_questions,
             timing_ms={"total": elapsed_ms},
         )
+        book = build_market_view(quant_ctx)
+        response_model = ResearchAgentAnalyzeResponse(
+            **response_fields,
+            research_focus=ResearchFocus(
+                horizon=req.horizon,
+                section=book[req.horizon],
+                data_asof=book["meta"]["data_asof"],
+            ),
+        )
         try:
             await self._trace_store.persist_analysis(
                 analysis_id=analysis_id,
-                request_payload=req.model_dump(mode="json"),
+                request_payload={
+                    "horizon": req.horizon,
+                    "decision_at": t0.isoformat(),
+                    "feedback_token_hash": hashlib.sha256(feedback_token.encode()).hexdigest(),
+                },
                 tool_trace=tool_trace,
                 evidence_payload={
-                    "evidence_query": evidence_query,
                     "degradation_flags": degradation_flags,
                     "bundle": {
                         "snapshot": bundle.snapshot.model_dump(mode="json"),
                         "forecast": bundle.forecast,
-                        "news": bundle.news.model_dump(mode="json"),
+                        "news_ids": [item.event_id for item in bundle.news.items],
                         "rag_events": [event.model_dump() for event in bundle.rag_events],
                         "memory_status": bundle.memory_status,
                         "memory_degraded_reason": bundle.memory_degraded_reason,
                         "macro_context": bundle.macro_context,
-                        "investor_profile": bundle.investor_profile,
                         "regime": regime_payload,
                         "committee": committee,
                     },
-                    "risk_gate": bundle.risk_gate,
-                    "evidence_cards": [card.model_dump() for card in evidence_cards],
-                    "citations": [citation.model_dump() for citation in citations],
+                    "risk_gate": {
+                        "level": bundle.risk_gate["level"],
+                        "force_observation": bundle.risk_gate["force_observation"],
+                    },
+                    "evidence_ids": [card.id for card in evidence_cards],
+                    "citation_ids": [citation.id for citation in citations],
                 },
-                response_payload=response_model.model_dump(mode="json"),
+                response_payload={
+                    "summary_card": response_model.summary_card.model_dump(
+                        mode="json", include={"stance", "horizon", "confidence_band"}
+                    ),
+                    "degradation_flags": degradation_flags,
+                },
             )
         except TraceStoreUnavailableError as exc:
             raise HTTPException(
@@ -2416,6 +2410,7 @@ class AgentAnalysisService:
             recent_news=classify_news_items(news.items[:6]),
             evidence_cards=evidence_cards,
             citations=citations,
+            feedback_token=feedback_token,
         )
 
     async def current_forecasts(self) -> AgentForecastsResponse:
@@ -2545,7 +2540,7 @@ class AgentAnalysisService:
             )
         except Exception as exc:
             news_elapsed = int((datetime.now(timezone.utc) - news_started).total_seconds() * 1000)
-            news = _fallback_recent_news("黄金市场")
+            news = _fallback_recent_news()
             news_trace = self._tool_trace_entry(
                 "search_dashboard_news",
                 news,
@@ -2694,7 +2689,7 @@ class AgentAnalysisService:
                 self._timed_optional_tool(
                     "search_recent_news",
                     self._toolbox.search_recent_news(news_query, limit=6),
-                    lambda exc: _fallback_recent_news(evidence_query),
+                    lambda exc: _fallback_recent_news(),
                 ),
                 self._timed_optional_tool(
                     "retrieve_historical_events",
@@ -2829,28 +2824,23 @@ class AgentAnalysisService:
             scores.append(self._sentiment_scorer.score(req.optional_news_text))
         return _clamp(_mean(scores), -1.0, 1.0)
 
-    def _memory_average(self, horizon: PublicHorizon, rag_events: List[RagEventItem]) -> float:
-        values: List[Optional[float]] = []
-        for event in rag_events:
-            if horizon == "short_term":
-                values.append(event.gold_t1_return)
-            elif horizon == "mid_term":
-                values.append(event.gold_t7_return)
-            else:
-                proxy = None
-                if event.gold_t7_return is not None:
-                    proxy = event.gold_t7_return * 1.6
-                elif event.gold_t1_return is not None:
-                    proxy = event.gold_t1_return * 2.8
-                values.append(proxy)
-        return _mean(values)
+    def _memory_average(
+        self, horizon: PublicHorizon, rag_events: List[RagEventItem],
+    ) -> Optional[float]:
+        if horizon == "short_term":
+            values = [event.gold_t1_return for event in rag_events if event.gold_t1_return is not None]
+        elif horizon == "mid_term":
+            values = [event.gold_t7_return for event in rag_events if event.gold_t7_return is not None]
+        else:
+            return None
+        return sum(values) / len(values) if values else None
 
     def _compute_conflict(
         self,
         *,
         quant_direction: int,
         news_sentiment: float,
-        memory_avg: float,
+        memory_avg: Optional[float],
         technical_state: str,
         macro_signal: int,
     ) -> Tuple[int, bool]:
@@ -2861,9 +2851,9 @@ class AgentAnalysisService:
             signals.append(1)
         elif news_sentiment < -0.08:
             signals.append(-1)
-        if memory_avg > 0.002:
+        if memory_avg is not None and memory_avg > 0.002:
             signals.append(1)
-        elif memory_avg < -0.002:
+        elif memory_avg is not None and memory_avg < -0.002:
             signals.append(-1)
         if technical_state == "bullish":
             signals.append(1)
@@ -2955,13 +2945,13 @@ class AgentAnalysisService:
         elif horizon == "mid_term":
             horizon_reason = (
                 f"历史相似事件在中期代理口径的均值表现约 {memory_avg * 100:+.2f}%，只用于判断冲击延续性。"
-                if rag_events
+                if memory_avg is not None
                 else "中期视角同时参考政策路径、状态切换、美元、实际利率和资金流。"
             )
         else:
             horizon_reason = (
                 f"历史相似事件在短期代理口径的均值表现约 {memory_avg * 100:+.2f}%，只作为事件风险参考。"
-                if rag_events
+                if memory_avg is not None
                 else "短期 1–21 天更容易受事件预期差、美元、实际利率、技术结构与流动性影响。"
             )
 
@@ -3154,15 +3144,18 @@ class AgentAnalysisService:
             )
         if bundle.rag_events:
             first = bundle.rag_events[0]
+            returns = [
+                f"{window} 日 {value:+.2%}"
+                for window, value in ((1, first.gold_t1_return), (7, first.gold_t7_return))
+                if value is not None
+            ]
+            result = f"事件后{'，'.join(returns)}" if returns else "暂无成熟收益"
             citations.append(
                 CitationItem(
                     id="cit-memory",
                     label="历史相似事件",
                     source_type="historical_analogs",
-                    excerpt=(
-                        f"{first.headline}；事件后 1 日 {((first.gold_t1_return or 0.0) * 100):+.2f}%，"
-                        f"7 日 {((first.gold_t7_return or 0.0) * 100):+.2f}%。"
-                    ),
+                    excerpt=f"{first.headline}。{result}。",
                 )
             )
         elif bundle.memory_status != "ok":
@@ -3257,31 +3250,25 @@ class AgentAnalysisService:
             )
         )
 
-        memory_avg = _mean(
-            [
-                event.gold_t1_return if bundle.horizon == "short_term" else event.gold_t7_return
-                for event in bundle.rag_events
-            ]
-        )
+        memory_avg = self._memory_average(bundle.horizon, bundle.rag_events)
+        memory_takeaway = _memory_unavailable_copy(bundle.memory_status, bundle.memory_degraded_reason)
+        if bundle.memory_status == "ok":
+            if memory_avg is None:
+                memory_takeaway = "所选研究期限暂无成熟的历史类比收益。"
+            else:
+                label = "1 日" if bundle.horizon == "short_term" else "7 日"
+                memory_takeaway = f"历史相似事件的成熟收益均值为 {memory_avg:+.2%}（{label}模型窗口）。"
         memory_direction = "neutral"
-        if memory_avg > 0.002:
+        if memory_avg is not None and memory_avg > 0.002:
             memory_direction = "supportive" if bullish else "contradictory"
-        elif memory_avg < -0.002:
+        elif memory_avg is not None and memory_avg < -0.002:
             memory_direction = "supportive" if not bullish else "contradictory"
         cards.append(
             EvidenceCard(
                 id="ev-memory",
                 title="历史相似事件",
                 signal_type="memory",
-                takeaway=(
-                    _memory_unavailable_copy(bundle.memory_status, bundle.memory_degraded_reason)
-                    if bundle.memory_status != "ok"
-                    else (
-                        "历史相似事件均值表现 "
-                        f"{memory_avg * 100:+.2f}%（按{'短期' if bundle.horizon == 'short_term' else '中长期代理'}口径），"
-                        "可用于判断新闻冲击是否容易延续。"
-                    )
-                ),
+                takeaway=memory_takeaway,
                 direction="neutral" if bundle.memory_status != "ok" else memory_direction,
                 citation_ids=["cit-memory"] if any(c.id == "cit-memory" for c in citations) else ["cit-macro"],
             )
@@ -3503,6 +3490,50 @@ def _trim_gold_history(
     )
 
 
+class _GuardedLedgerStore:
+    """Normalize store-boundary failures without exposing backend details."""
+
+    def __init__(self, store: Any, *, on_availability: Optional[Any] = None) -> None:
+        self._store = store
+        self._on_availability = on_availability
+
+    def _report_availability(self, available: bool) -> None:
+        if self._on_availability is not None:
+            self._on_availability(available)
+
+    def _call(self, operation: str, callback: Any) -> Any:
+        unavailable = False
+        result = None
+        try:
+            result = callback()
+        except Exception as exc:
+            LOGGER.error(
+                "signal_ledger_operation_failed operation=%s error_type=%s",
+                operation,
+                type(exc).__name__,
+            )
+            unavailable = True
+        if unavailable:
+            self._report_availability(False)
+            raise LedgerUnavailableError(
+                "Signal publication ledger is unavailable."
+            ) from None
+        self._report_availability(True)
+        return result
+
+    def load_all(self) -> list:
+        return self._call("load", lambda: self._store.load_all())
+
+    def append(self, record: Dict[str, Any]) -> Optional[bool]:
+        return self._call("append", lambda: self._store.append(record))
+
+    def healthcheck(self) -> bool:
+        callback = getattr(self._store, "healthcheck", None)
+        if callback is None:
+            callback = lambda: self._store.load_all() is not None
+        return bool(self._call("healthcheck", callback))
+
+
 
 def create_app(
     *,
@@ -3518,7 +3549,7 @@ def create_app(
 ) -> FastAPI:
     tool_timeout_seconds = float(_env("AGENT_TOOL_TIMEOUT_SECONDS", "35.0"))
     tool_connect_timeout_seconds = float(_env("AGENT_TOOL_CONNECT_TIMEOUT_SECONDS", "1.5"))
-    app_env = _env("APP_ENV", "development").lower()
+    app_env = os.environ.get("APP_ENV", "").strip().lower()
     cfg = AgentGatewayConfig(
         forecast_url=_env("FORECAST_URL", "http://localhost:8010/api/v1/forecast"),
         memory_url=_env("MEMORY_URL", "http://localhost:8012/api/v1/memory/search"),
@@ -3532,7 +3563,15 @@ def create_app(
         stale_after_seconds=int(_env("MARKET_STALE_AFTER_SECONDS", "180")),
         news_stale_after_seconds=int(_env("NEWS_STALE_AFTER_SECONDS", "300")),
     )
-    database_url = _env("DATABASE_URL", "postgresql://localhost/postgres")
+    database_url = os.environ.get("DATABASE_URL") or (
+        "postgresql://localhost/postgres" if app_env == "development" else ""
+    )
+    signal_ledger_database_url = os.environ.get(
+        "SIGNAL_LEDGER_DATABASE_URL"
+    ) or os.environ.get("DATABASE_URL")
+    signal_ledger_connect_timeout_seconds = max(
+        1, int(_env("SIGNAL_LEDGER_CONNECT_TIMEOUT_SECONDS", "5"))
+    )
     public_keys_raw = os.environ.get("AGENT_PUBLIC_API_KEYS")
     internal_keys_raw = os.environ.get("AGENT_INTERNAL_API_KEYS")
     if app_env != "development" and (not public_keys_raw or not internal_keys_raw):
@@ -3595,9 +3634,30 @@ def create_app(
                 window_seconds=analyze_rate_limit_window_seconds,
             ),
         }
-        app.state.signal_ledger_store = signal_ledger_store or JsonlLedgerStore(
-            _env("SIGNAL_LEDGER_PATH", "data_cache/signal_ledger.jsonl")
-        )
+        if signal_ledger_store is not None:
+            app.state.signal_ledger_store = signal_ledger_store
+            app.state.signal_ledger_available = True
+        else:
+            try:
+                app.state.signal_ledger_store = await asyncio.to_thread(
+                    build_ledger_store,
+                    app_env=app_env,
+                    database_url=signal_ledger_database_url,
+                    jsonl_path=_env(
+                        "SIGNAL_LEDGER_PATH",
+                        "data_cache/signal_ledger.jsonl",
+                    ),
+                    connect_timeout_seconds=signal_ledger_connect_timeout_seconds,
+                    postgres_store_factory=PostgresLedgerStore,
+                )
+                app.state.signal_ledger_available = True
+            except Exception as exc:
+                app.state.signal_ledger_store = None
+                app.state.signal_ledger_available = False
+                LOGGER.error(
+                    "signal_ledger_initialization_failed error_type=%s",
+                    type(exc).__name__,
+                )
         app.state.subscription_store = subscription_store or SubscriptionStore(
             _env("SUBSCRIPTIONS_PATH", "data_cache/subscriptions.jsonl")
         )
@@ -3629,39 +3689,61 @@ def create_app(
             try:
                 quant_research_context.get_context()
             except Exception as exc:  # pragma: no cover - defensive
-                LOGGER.warning("quant_context_warmup_failed error=%s", f"{type(exc).__name__}:{exc}")
+                LOGGER.warning(
+                    "quant_context_warmup_failed error_type=%s",
+                    type(exc).__name__,
+                )
 
         if _env("AGENT_WARM_QUANT_CONTEXT", "1") == "1":
             threading.Thread(target=_warm_quant_context, name="quant-warmup", daemon=True).start()
 
-        # Optional startup autopublish: freeze this ISO week's signal if it is
-        # missing. Publishing is idempotent, so this is safe to run on every
-        # boot; failures are logged and never block startup.
+        # Optional startup autopublish: freeze this ISO week's signal before
+        # traffic is accepted. Publishing is idempotent on every boot.
         def _autopublish_signal() -> None:
+            from signal_ledger import publish_weekly as _publish
+
+            decision_at = datetime.now(timezone.utc)
+            ctx = quant_research_context.get_context_at(decision_at)
+            record, created = _publish(_ledger_store(), ctx, now=decision_at)
+            LOGGER.info(
+                "signal_autopublish %s publication_id=%s",
+                "created" if created else "already_exists",
+                record["publication_id"],
+            )
+
+        autopublish_enabled = _env("SIGNAL_AUTOPUBLISH_ENABLED", "0") == "1"
+        app.state.signal_publication_ready = not autopublish_enabled
+        if autopublish_enabled and app.state.signal_ledger_available:
             try:
-                from signal_ledger import publish_weekly as _publish
-
-                ctx = quant_research_context.get_context()
-                record, created = _publish(app.state.signal_ledger_store, ctx)
-                LOGGER.info(
-                    "signal_autopublish %s publication_id=%s",
-                    "created" if created else "already_exists",
-                    record["publication_id"],
+                await asyncio.to_thread(_autopublish_signal)
+                app.state.signal_publication_ready = True
+            except StalePublicationDataError:
+                LOGGER.warning("signal_autopublish_held reason=stale_or_unavailable_research")
+            except Exception as exc:
+                LOGGER.error(
+                    "signal_autopublish_failed error_type=%s", type(exc).__name__
                 )
-            except Exception as exc:  # pragma: no cover - defensive
-                LOGGER.warning(
-                    "signal_autopublish_failed error=%s:%s", type(exc).__name__, exc
-                )
-
-        if _env("SIGNAL_AUTOPUBLISH_ENABLED", "0") == "1":
-            threading.Thread(
-                target=_autopublish_signal, name="signal-autopublish", daemon=True
-            ).start()
+                raise RuntimeError("Initial signal publication failed.") from None
         yield
         if own_http:
             await http.aclose()
 
     app = FastAPI(title="GoldenSense Agent Gateway", version="2.0.0", lifespan=lifespan)
+
+    @app.exception_handler(LedgerUnavailableError)
+    async def signal_ledger_unavailable_handler(
+        _request: Request, _exc: LedgerUnavailableError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unavailable",
+                "error_code": "signal_ledger_unavailable",
+                "message": "信号发布台账暂时不可用，请稍后重试。",
+                "guidance": "持久化恢复前不会返回空历史或接受新发布。",
+                "retryable": True,
+            },
+        )
     # Metrics registry is created eagerly (not in lifespan) so the recording
     # middleware always has it, even for requests during startup.
     app.state.metrics = MetricsRegistry()
@@ -3679,6 +3761,7 @@ def create_app(
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=[_FEEDBACK_TOKEN_HEADER],
     )
 
     @app.middleware("http")
@@ -3697,12 +3780,14 @@ def create_app(
     @app.middleware("http")
     async def record_metrics(request: Request, call_next: Any) -> Response:
         started = time.perf_counter()
+        decision_token = _DECISION_AT.set(datetime.now(timezone.utc))
         status_code = 500
         try:
             response = await call_next(request)
             status_code = response.status_code
             return response
         finally:
+            _DECISION_AT.reset(decision_token)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             # Group by route template, not raw path, so /traces/{id} does not
             # explode the cardinality of the metrics registry.
@@ -3739,6 +3824,19 @@ def create_app(
         errors: List[str] = []
         if not trace_health.get("db_ready") and not trace_health.get("allow_memory_fallback"):
             errors.append("trace_store_unavailable")
+        ledger_is_healthy = False
+        if getattr(app.state, "signal_ledger_store", None) is not None:
+            try:
+                ledger_is_healthy = await asyncio.to_thread(
+                    _ledger_store().healthcheck
+                )
+            except Exception:
+                ledger_is_healthy = False
+        signal_ledger_health = {
+            "status": "ok" if ledger_is_healthy else "unavailable"
+        }
+        if signal_ledger_health["status"] != "ok":
+            errors.append("signal_ledger_unavailable")
 
         downstream: Dict[str, Any] = {}
         if getattr(app.state, "uses_injected_toolbox", False):
@@ -3764,7 +3862,10 @@ def create_app(
                     if not ok:
                         errors.append(f"{name}_unavailable")
                 except Exception as exc:
-                    downstream[name] = {"status": "unavailable", "error": f"{type(exc).__name__}:{exc}"}
+                    downstream[name] = {
+                        "status": "unavailable",
+                        "error_type": type(exc).__name__,
+                    }
                     errors.append(f"{name}_unavailable")
 
         status = "ok" if not errors else "unavailable"
@@ -3773,17 +3874,21 @@ def create_app(
             content={
                 "status": status,
                 "trace_store": trace_health,
+                "signal_ledger": signal_ledger_health,
                 "downstream": downstream,
                 "errors": errors,
             },
         )
 
-    @app.post("/api/v1/agent/analyze", response_model=AgentAnalyzeResponse)
-    async def analyze(req: AgentAnalyzeRequest, request: Request) -> AgentAnalyzeResponse:
+    @app.post("/api/v1/agent/analyze", response_model=ResearchAgentAnalyzeResponse)
+    async def analyze(req: AgentAnalyzeRequest, request: Request, response: Response) -> AgentAnalyzeResponse:
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
         await app.state.rate_limiters["analyze"].check(auth_ctx["client_id"])
         service: AgentAnalysisService = app.state.analysis_service
-        return await service.analyze(req)
+        result = await service.analyze_internal(req)
+        response.headers[_FEEDBACK_TOKEN_HEADER] = result.feedback_token
+        response.headers["Cache-Control"] = "no-store"
+        return result.response
 
     @app.get("/api/v1/agent/forecasts/current", response_model=AgentForecastsResponse)
     async def current_forecasts(request: Request) -> AgentForecastsResponse:
@@ -3808,7 +3913,7 @@ def create_app(
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
         await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
         try:
-            ctx = await asyncio.to_thread(quant_research_context.get_context)
+            ctx = await asyncio.to_thread(quant_research_context.get_context_at, _decision_at())
         except Exception as exc:
             raise HTTPException(
                 status_code=503,
@@ -3828,7 +3933,7 @@ def create_app(
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
         await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
         try:
-            ctx = await asyncio.to_thread(quant_research_context.get_context)
+            ctx = await asyncio.to_thread(quant_research_context.get_context_at, _decision_at())
         except Exception as exc:
             raise HTTPException(
                 status_code=503,
@@ -3938,9 +4043,10 @@ def create_app(
             ) from exc
 
         try:
-            ctx = await asyncio.to_thread(quant_research_context.get_context)
+            decision_at = _decision_at()
+            ctx = await asyncio.to_thread(quant_research_context.get_context_at, decision_at)
             case = await asyncio.to_thread(
-                build_research_case, question.strip(), packet, ctx, mode=mode
+                build_research_case, question.strip(), packet, ctx, mode=mode, now=decision_at
             )
             case = case.model_copy(update={"owner_hash": owner_hash})
             if mode == "full" and case.status != "blocked" and case.narrative is not None:
@@ -4028,19 +4134,18 @@ def create_app(
         """Internal cron hook: append a scored revision using each due-date close."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=True)
         await app.state.rate_limiters["write"].check(auth_ctx["client_id"])
-        now = datetime.now(timezone.utc)
+        now = _decision_at()
 
         def _score() -> Dict[str, Any]:
             import pandas as pd
-            from data_sources import load_market_data
+            from gold_sessions import load_gold_outcome_prices
 
-            frame, source = load_market_data()
-            gold = frame["Gold"].dropna().copy()
+            gold, source = load_gold_outcome_prices(now)
             gold.index = pd.to_datetime(gold.index, utc=True)
 
             def price_at(due_at: datetime) -> Optional[float]:
                 due = pd.Timestamp(due_at).tz_convert("UTC")
-                eligible = gold[(gold.index >= due.normalize()) & (gold.index <= pd.Timestamp(now))]
+                eligible = gold[gold.index >= (due if source == "session_timestamps" else due.normalize())]
                 return float(eligible.iloc[0]) if not eligible.empty else None
 
             scanned = scored_count = matured_count = 0
@@ -4103,7 +4208,7 @@ def create_app(
                 detail={"error_code": "research_case_not_found", "message": "research case not found"},
             )
         try:
-            ctx = await asyncio.to_thread(quant_research_context.get_context)
+            ctx = await asyncio.to_thread(quant_research_context.get_context_at, _decision_at())
             brief = build_three_dimensional_brief(profile, ctx, case)
         except Exception as exc:
             raise HTTPException(
@@ -4127,7 +4232,7 @@ def create_app(
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
         await app.state.rate_limiters["personalize"].check(auth_ctx["client_id"])
         try:
-            ctx = await asyncio.to_thread(quant_research_context.get_context)
+            ctx = await asyncio.to_thread(quant_research_context.get_context_at, _decision_at())
         except Exception as exc:
             raise HTTPException(
                 status_code=503,
@@ -4293,7 +4398,7 @@ def create_app(
         from knowledge_retriever import search_knowledge
 
         try:
-            payload = await asyncio.to_thread(search_knowledge, q)
+            payload = await asyncio.to_thread(search_knowledge, q, decision_at=_decision_at())
         except Exception as exc:
             raise HTTPException(
                 status_code=503,
@@ -4304,8 +4409,18 @@ def create_app(
             ) from exc
         return JSONResponse(content=jsonable_encoder(payload))
 
+    def _ledger_store() -> _GuardedLedgerStore:
+        store = getattr(app.state, "signal_ledger_store", None)
+        if store is None:
+            raise LedgerUnavailableError("Signal publication ledger is unavailable.")
+
+        def _set_availability(available: bool) -> None:
+            app.state.signal_ledger_available = available
+
+        return _GuardedLedgerStore(store, on_availability=_set_availability)
+
     def _ledger_records() -> list:
-        return app.state.signal_ledger_store.load_all()
+        return _ledger_store().load_all()
 
     @app.get("/api/v1/signals/current")
     async def signals_current(request: Request) -> JSONResponse:
@@ -4351,22 +4466,36 @@ def create_app(
         await app.state.rate_limiters["read"].check(auth_ctx["client_id"])
 
         def _score() -> Dict[str, Any]:
-            from data_sources import load_market_data
+            return score_configured_track_record(_ledger_records(), decision_at=_decision_at())
 
-            records = _ledger_records()
-            raw, _source = load_market_data()
-            return score_track_record(records, raw["Gold"])
-
+        unexpected_error_type = None
         try:
             payload = await asyncio.to_thread(_score)
+        except LedgerUnavailableError:
+            raise
+        except LedgerIntegrityError as exc:
+            app.state.signal_ledger_available = False
+            LOGGER.error(
+                "signal_ledger_operation_failed operation=track_integrity error_type=%s",
+                type(exc).__name__,
+            )
+            raise LedgerUnavailableError(
+                "Signal publication ledger is unavailable."
+            ) from None
         except Exception as exc:
+            unexpected_error_type = type(exc).__name__
+        if unexpected_error_type:
+            LOGGER.error(
+                "signal_track_record_failed error_type=%s",
+                unexpected_error_type,
+            )
             raise HTTPException(
                 status_code=503,
                 detail={
                     "error_code": "track_record_unavailable",
-                    "message": f"{type(exc).__name__}: {exc}",
+                    "message": "前向记分卡暂时不可用，请稍后重试。",
                 },
-            ) from exc
+            ) from None
         return JSONResponse(content=jsonable_encoder(payload))
 
     @app.post("/api/v1/signals/publish")
@@ -4375,19 +4504,38 @@ def create_app(
         publication is an operational act, not a public mutation."""
         auth_ctx = app.state.authorizer.authorize(request, internal_only=True)
         await app.state.rate_limiters["write"].check(auth_ctx["client_id"])
+        store = _ledger_store()
+        unexpected_error_type = None
         try:
-            ctx = await asyncio.to_thread(quant_research_context.get_context)
+            ctx = await asyncio.to_thread(quant_research_context.get_context_at, _decision_at())
             record, created = await asyncio.to_thread(
-                publish_weekly, app.state.signal_ledger_store, ctx
+                publish_weekly, store, ctx, now=_decision_at()
             )
+        except LedgerUnavailableError:
+            raise
+        except LedgerIntegrityError as exc:
+            app.state.signal_ledger_available = False
+            LOGGER.error(
+                "signal_ledger_operation_failed operation=publish_integrity error_type=%s",
+                type(exc).__name__,
+            )
+            raise LedgerUnavailableError(
+                "Signal publication ledger is unavailable."
+            ) from None
         except Exception as exc:
+            unexpected_error_type = type(exc).__name__
+        if unexpected_error_type:
+            LOGGER.error(
+                "signal_publish_failed error_type=%s",
+                unexpected_error_type,
+            )
             raise HTTPException(
                 status_code=503,
                 detail={
                     "error_code": "publish_failed",
-                    "message": f"{type(exc).__name__}: {exc}",
+                    "message": "本周信号暂时无法发布，请稍后重试。",
                 },
-            ) from exc
+            ) from None
         return JSONResponse(
             content=jsonable_encoder({"record": record, "created": created})
         )
@@ -4437,15 +4585,24 @@ def create_app(
             ) from exc
         # Expose the performance-governance verdict derived from these outcomes.
         payload["governance"] = evaluate_governance(payload).as_dict()
+        payload["recent_outcomes"] = []
         return JSONResponse(content=jsonable_encoder(payload))
 
     @app.post("/api/v1/agent/feedback", response_model=AgentFeedbackResponse)
     async def feedback(req: AgentFeedbackRequest, request: Request) -> AgentFeedbackResponse:
         auth_ctx = app.state.authorizer.authorize(request, internal_only=False)
         await app.state.rate_limiters["write"].check(auth_ctx["client_id"])
+        token = request.headers.get(_FEEDBACK_TOKEN_HEADER, "")
+        invalid_token = HTTPException(status_code=403, detail="feedback_token_invalid")
+        if not token:
+            raise invalid_token
         store: AgentTraceStore = app.state.trace_store
         try:
-            updated = await store.save_feedback(req.analysis_id, req.rating, req.comment)
+            trace = await store.load_trace(req.analysis_id)
+            digest = (trace or {}).get("request_payload", {}).get("feedback_token_hash", "")
+            if not secrets.compare_digest(digest, hashlib.sha256(token.encode()).hexdigest()):
+                raise invalid_token
+            updated = await store.save_feedback(req.analysis_id, req.rating, None)
         except TraceStoreUnavailableError as exc:
             raise HTTPException(
                 status_code=503,
@@ -4487,7 +4644,29 @@ def create_app(
                     "message": f"Analysis trace not found: {analysis_id}",
                 },
             )
-        return AgentTraceResponse(**payload)
+        request_payload = payload["request_payload"]
+        if not request_payload.get("feedback_token_hash"):
+            # Older rows were written before the minimized trace contract.
+            # They may contain user text in several nested fields.
+            legacy_horizon = request_payload.get("horizon")
+            return AgentTraceResponse(
+                analysis_id=payload["analysis_id"],
+                created_at=payload["created_at"],
+                request_payload={"horizon": legacy_horizon} if legacy_horizon in (*PUBLIC_HORIZONS, "24h", "7d", "30d") else {},
+                tool_trace=[],
+                evidence_payload={},
+                response_payload={},
+                feedback_rating=payload["feedback_rating"] if payload["feedback_rating"] in ("helpful", "not_helpful") else None,
+                feedback_comment=None,
+            )
+        return AgentTraceResponse(**{
+            **payload,
+            "request_payload": {
+                key: value for key, value in request_payload.items()
+                if key != "feedback_token_hash"
+            },
+            "feedback_comment": None,
+        })
 
     @app.post("/api/v1/agent/trigger", response_model=AgentTriggerResponse)
     async def trigger(req: AgentTriggerRequest, request: Request, response: Response) -> AgentTriggerResponse:

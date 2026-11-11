@@ -155,21 +155,56 @@ def test_backfill_outcomes_scores_matured_rows_only():
 def test_calibration_summary_hit_rate_and_brier():
     prices = _price_series("2026-01-01", 90, drift=0.002)
     rows = [
-        _row(datetime(2026, 1, 5, tzinfo=timezone.utc), "偏多", conf="高"),
-        _row(datetime(2026, 1, 12, tzinfo=timezone.utc), "偏空", conf="中"),
-        _row(datetime(2026, 1, 19, tzinfo=timezone.utc), "中性"),
-    ]
+        _row(
+            datetime(2026, 1, 5, tzinfo=timezone.utc) + timedelta(days=offset),
+            "偏多" if offset % 2 == 0 else "偏空",
+            conf="高" if offset % 2 == 0 else "中",
+        )
+        for offset in range(20)
+    ] + [_row(datetime(2026, 1, 25, tzinfo=timezone.utc), "中性")]
     outcomes = backfill_outcomes(rows, prices)
-    summary = calibration_summary(outcomes)
-    assert summary["total_scored"] == 3
-    assert summary["directional_calls"] == 2
+    summary = calibration_summary(outcomes, total_valid_analyses=len(rows))
+    assert summary["total_scored"] == 21
+    assert summary["directional_calls"] == 20
     assert summary["neutral_or_gated"] == 1
     assert summary["hit_rate"] == 0.5  # 偏多 hit, 偏空 miss in a rising market
     assert 0.0 <= summary["brier_score"] <= 1.0
     assert summary["by_stance"]["偏多"]["hit_rate"] == 1.0
     assert summary["by_stance"]["偏空"]["hit_rate"] == 0.0
     assert summary["evidence_class"] == "live_forward"
+    assert summary["evidence_status"] == "ready"
+    assert summary["minimum_directional_calls"] == 20
+    assert summary["pending_analyses"] == 0
     assert summary["by_stance"]["偏多"]["evidence_class"] == "live_forward"
+
+
+def test_calibration_accumulates_pending_analyses_without_premature_metrics():
+    summary = calibration_summary([], total_valid_analyses=1)
+
+    assert summary["minimum_directional_calls"] == 20
+    assert summary["pending_analyses"] == 1
+    assert summary["evidence_status"] == "accumulating"
+    assert summary["hit_rate"] is None
+    assert summary["brier_score"] is None
+
+
+def test_calibration_hides_metrics_until_directional_threshold():
+    outcomes = [
+        {
+            "stance": "偏多",
+            "confidence_band": "高",
+            "realized_direction": 1,
+        }
+    ]
+
+    summary = calibration_summary(outcomes, total_valid_analyses=1)
+
+    assert summary["directional_calls"] == 1
+    assert summary["evidence_status"] == "accumulating"
+    assert summary["hit_rate"] is None
+    assert summary["brier_score"] is None
+    assert summary["by_stance"] == {}
+    assert summary["by_confidence"] == {}
 
 
 def test_public_horizons_are_not_collapsed_to_legacy_one_day_scoring():

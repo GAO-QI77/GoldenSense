@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from evidence_shield import EvidencePacket
 from market_view import build_market_view
+from risk_review import GARCH_CANDIDATE
 from research_case import (
     AgentView,
     AuditReport,
@@ -215,6 +216,24 @@ def _model_registry(ctx: Dict[str, Any]) -> List[ModelCard]:
             can_influence_strategy=flagship_state == "production",
         ),
     ]
+    risk_windows = (ctx.get("risk_review") or {}).get("windows") or {}
+    for model_id, label in (
+        ("log_har", "log-HAR"),
+        ("log_har_vra", "log-HAR with matured error adjustment"),
+        (GARCH_CANDIDATE, "Student-t GARCH"),
+    ):
+        reports = [window[model_id] for window in risk_windows.values() if model_id in window]
+        coverage = [f"{window[model_id]['coverage']:.1%}" for window in risk_windows.values()
+                    if model_id in window and window[model_id]["coverage"] is not None]
+        cards.append(ModelCard(
+            model_id=model_id, label=label, state="watch", role="challenger",
+            oos_metric=f"Mature band coverage {' / '.join(coverage)}" if coverage else None,
+            degradation_reason=(
+                "release_threshold_pending" if any(r["status"] == "hold" for r in reports)
+                else "independent_review_required" if reports else "review_artifact_unavailable"
+            ),
+            can_influence_strategy=False,
+        ))
     for model_id, label in (
         ("xgboost", "XGBoost"), ("lightgbm", "LightGBM"), ("gru", "GRU"),
         ("lstm", "LSTM"), ("transformer", "Transformer"),
@@ -559,6 +578,7 @@ def build_research_case(
         "data_source", "data_asof", "data_age_days", "data_stale", "vol_bands",
         "regime_posterior", "macro_factors", "fair_value", "scenario_cone",
         "flagship", "degraded", "series_asof", "series_age_days", "stale_series",
+        "gold_drivers", "driver_attribution", "risk_review",
     )
     quant_pack = {key: quant_ctx.get(key) for key in quant_keys if key in quant_ctx}
     entry_price = (

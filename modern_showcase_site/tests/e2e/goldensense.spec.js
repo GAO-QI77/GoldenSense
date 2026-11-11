@@ -335,13 +335,93 @@ const personalResearchPayload = {
   },
 };
 
+const productionEmptySignalPayload = {
+  status: 'empty',
+  error_code: 'first_publication_required',
+  guidance: '由内部发布任务冻结本周研究。',
+};
+
+const productionWithheldPersonalResearchPayload = {
+  ...personalResearchPayload,
+  profile_echo: {
+    ...personalResearchPayload.profile_echo,
+    current_gold_pct: 60,
+  },
+  facts: {
+    ...personalResearchPayload.facts,
+    reference_range: { available: true, range_pct: [4, 9.1], midpoint: 6.55 },
+    position_gap: { status: 'withheld', current_gold_pct: 60, gap_pct: null },
+    suitability: {
+      status: 'insufficient',
+      position_analysis_allowed: false,
+      missing_fields: ['loss_capacity'],
+      reasons: [],
+      scope: 'education_only_unlevered_gold_research',
+    },
+  },
+  narrative: {
+    ...personalResearchPayload.narrative,
+    position_analysis: '个人仓位差距暂不计算。',
+  },
+  three_dimensional_brief: {
+    ...personalResearchPayload.three_dimensional_brief,
+    rules: {
+      ...personalResearchPayload.three_dimensional_brief.rules,
+      suitability: {
+        status: 'insufficient',
+        position_analysis_allowed: false,
+        missing_fields: ['loss_capacity'],
+        reasons: [],
+      },
+    },
+  },
+};
+
+const productionCalibrationAccumulationPayload = {
+  total_scored: 0,
+  directional_calls: 0,
+  minimum_directional_calls: 20,
+  pending_analyses: 1,
+  evidence_status: 'accumulating',
+  hit_rate: null,
+  brier_score: null,
+  governance: {
+    mode: 'insufficient_data',
+    directional_calls: 0,
+    min_directional_calls: 20,
+  },
+};
+
+const productionSourceHealthRows = [
+  {
+    id: 'static_proxy',
+    label: 'Static proxy source',
+    source_type: 'fundamental',
+    status: 'degraded',
+    freshness_seconds: 11,
+    expected_lag_seconds: 180,
+    cadence: '日内',
+    degraded_reason: 'proxy_static_source',
+    coverage: ['黄金需求'],
+    url: null,
+  },
+  {
+    id: 'real_yield_proxy',
+    label: 'Real yield proxy',
+    source_type: 'macro_policy',
+    status: 'degraded',
+    freshness_seconds: 11,
+    expected_lag_seconds: 180,
+    cadence: '日内',
+    degraded_reason: 'real_yield_proxy_from_nominal_yield',
+    coverage: ['实际利率'],
+    url: null,
+  },
+];
+
 test.beforeEach(async ({ page }) => {
   await page.route('**/api/v1/agent/event-alert', async (route) => {
     await route.fulfill({ status: 404, json: { detail: 'no active event in fixture' } });
-  });
-  await page.route('**/api/v1/agent/market-view', async (route) => {
-    const section = { available: true, core_view: 'Fixture view', confidence: '中', evidence: [], invalidation: ['Fixture invalidation'] };
-    await route.fulfill({ json: { meta: { data_asof: '2026-08-12', data_age_days: 1, data_stale: false }, short_term: section, mid_term: section, long_term: section } });
   });
   await page.route('**/api/v1/agent/research/current', async (route) => {
     await route.fulfill({ status: 503, json: { detail: 'fixture uses active ResearchCase panels' } });
@@ -350,7 +430,7 @@ test.beforeEach(async ({ page }) => {
     await route.fulfill({ status: 503, json: { detail: 'no calibration fixture' } });
   });
   await page.route('**/api/v1/signals/current', async (route) => {
-    await route.fulfill({ status: 404, json: { detail: 'empty fixture ledger' } });
+    await route.fulfill({ status: 200, json: productionEmptySignalPayload });
   });
   await page.route('**/api/v1/signals/history?*', async (route) => {
     await route.fulfill({ json: { publications: [] } });
@@ -361,13 +441,28 @@ test.beforeEach(async ({ page }) => {
   await page.route('**/api/v1/agent/dashboard/current', async (route) => {
     await route.fulfill({ json: dashboardPayload });
   });
+  await page.route('**/api/v1/agent/market-view', async (route) => {
+    await route.fulfill({ json: {
+      meta: { data_asof: '2026-08-12', data_age_days: 1, data_stale: false },
+      short_term: { available: true, confidence: '中', core_view: '短期关注风险分布。' },
+      mid_term: { available: true, confidence: '中', core_view: '中期关注宏观驱动。' },
+      long_term: { available: true, confidence: '中', core_view: '长期关注估值与配置。' },
+    } });
+  });
   await page.route('**/api/v1/agent/analyze', async (route) => {
     const body = route.request().postDataJSON();
     expect(body.investor_profile).toBeTruthy();
     expect(body.investor_profile.capital_allocation_pct).toBeGreaterThanOrEqual(0);
-    await route.fulfill({ json: analysisPayload });
+    await route.fulfill({
+      json: analysisPayload,
+      headers: {
+        'X-Analysis-Feedback-Token': 'test-analysis-feedback-token',
+        'Access-Control-Expose-Headers': 'X-Analysis-Feedback-Token',
+      },
+    });
   });
   await page.route('**/api/v1/agent/feedback', async (route) => {
+    expect(route.request().headers()['x-analysis-feedback-token']).toBe('test-analysis-feedback-token');
     await route.fulfill({ json: { analysis_id: 'analysis-playwright', status: 'recorded' } });
   });
   await page.route('**/api/v1/agent/research-cases', async (route) => {
@@ -430,6 +525,382 @@ async function fillSuitabilityProfile(page, { maxDrawdown = '12', leverage = 'no
   await page.getByLabel('基础货币').selectOption('SGD');
 }
 
+async function computedContrast(locator) {
+  await locator.scrollIntoViewIfNeeded();
+  const measurement = await locator.evaluate((element) => {
+    const elementRect = element.getBoundingClientRect();
+    if (!elementRect.width || !elementRect.height) {
+      throw new Error('Contrast target has no painted area');
+    }
+
+    const maxTextRects = 24;
+    const xFractions = [0.05, 0.25, 0.5, 0.75, 0.95];
+    const yFractions = [0.2, 0.5, 0.8];
+    const textRects = [];
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    const range = document.createRange();
+    for (let textNode = walker.nextNode(); textNode; textNode = walker.nextNode()) {
+      if (!textNode.textContent?.trim()) continue;
+      range.selectNodeContents(textNode);
+      textRects.push(...range.getClientRects());
+    }
+    if (!textRects.length) throw new Error('Contrast target has no painted text');
+    if (textRects.length > maxTextRects) {
+      throw new Error(`Contrast target has ${textRects.length} text rects; maximum is ${maxTextRects}`);
+    }
+
+    const sampleKeys = new Set();
+    const samples = [];
+    for (const textRect of textRects) {
+      const left = Math.max(elementRect.left, textRect.left);
+      const right = Math.min(elementRect.right, textRect.right);
+      const top = Math.max(elementRect.top, textRect.top);
+      const bottom = Math.min(elementRect.bottom, textRect.bottom);
+      if (right <= left || bottom <= top) continue;
+      for (const xFraction of xFractions) {
+        for (const yFraction of yFractions) {
+          const xRatio = (left + (right - left) * xFraction - elementRect.left) / elementRect.width;
+          const yRatio = (top + (bottom - top) * yFraction - elementRect.top) / elementRect.height;
+          const key = `${xRatio.toFixed(5)}:${yRatio.toFixed(5)}`;
+          if (sampleKeys.has(key)) continue;
+          sampleKeys.add(key);
+          samples.push({ xRatio, yRatio });
+        }
+      }
+    }
+    if (!samples.length) throw new Error('Contrast target text is outside its painted area');
+
+    const probeSize = 6;
+    const probeBatches = [];
+    samples.forEach((sample, sampleIndex) => {
+      const x = sample.xRatio * elementRect.width;
+      const y = sample.yRatio * elementRect.height;
+      let batch = probeBatches.find((candidate) => candidate.every((otherIndex) => {
+        const other = samples[otherIndex];
+        const otherX = other.xRatio * elementRect.width;
+        const otherY = other.yRatio * elementRect.height;
+        return Math.abs(x - otherX) >= probeSize || Math.abs(y - otherY) >= probeSize;
+      }));
+      if (!batch) {
+        batch = [];
+        probeBatches.push(batch);
+      }
+      batch.push(sampleIndex);
+    });
+
+    const inlineStyle = {
+      color: element.style.getPropertyValue('color'),
+      colorPriority: element.style.getPropertyPriority('color'),
+      textShadow: element.style.getPropertyValue('text-shadow'),
+      textShadowPriority: element.style.getPropertyPriority('text-shadow'),
+      textFill: element.style.getPropertyValue('-webkit-text-fill-color'),
+      textFillPriority: element.style.getPropertyPriority('-webkit-text-fill-color'),
+    };
+    const foregroundCss = getComputedStyle(element).color;
+    element.style.setProperty('color', 'transparent', 'important');
+    element.style.setProperty('text-shadow', 'none', 'important');
+    element.style.setProperty('-webkit-text-fill-color', 'transparent', 'important');
+
+    return {
+      foregroundCss,
+      inlineStyle,
+      probeBatches,
+      samples,
+    };
+  });
+
+  let backgroundScreenshot;
+  const foregroundScreenshots = [];
+  try {
+    backgroundScreenshot = await locator.screenshot({ animations: 'disabled', caret: 'hide' });
+    for (const sampleIndexes of measurement.probeBatches) {
+      await locator.evaluate((element, { foregroundCss, sampleIndexes, samples }) => {
+        const elementRect = element.getBoundingClientRect();
+        for (const sampleIndex of sampleIndexes) {
+          const sample = samples[sampleIndex];
+          const probe = document.createElement('i');
+          probe.dataset.contrastProbe = '';
+          probe.setAttribute('aria-hidden', 'true');
+          Object.assign(probe.style, {
+            position: 'fixed',
+            left: `${elementRect.left + sample.xRatio * elementRect.width - 3}px`,
+            top: `${elementRect.top + sample.yRatio * elementRect.height - 3}px`,
+            width: '6px',
+            height: '6px',
+            display: 'block',
+            margin: '0',
+            padding: '0',
+            border: '0',
+            borderRadius: '0',
+            background: foregroundCss,
+            boxShadow: 'none',
+            pointerEvents: 'none',
+            zIndex: '2147483647',
+          });
+          element.appendChild(probe);
+        }
+      }, {
+        foregroundCss: measurement.foregroundCss,
+        sampleIndexes,
+        samples: measurement.samples,
+      });
+      foregroundScreenshots.push({
+        sampleIndexes,
+        screenshot: await locator.screenshot({ animations: 'disabled', caret: 'hide' }),
+      });
+      await locator.evaluate((element) => {
+        for (const probe of element.querySelectorAll('[data-contrast-probe]')) probe.remove();
+      });
+    }
+  } finally {
+    await locator.evaluate((element, inlineStyle) => {
+      for (const probe of element.querySelectorAll('[data-contrast-probe]')) probe.remove();
+      const restore = (property, value, priority) => {
+        if (value) element.style.setProperty(property, value, priority);
+        else element.style.removeProperty(property);
+      };
+      restore('color', inlineStyle.color, inlineStyle.colorPriority);
+      restore('text-shadow', inlineStyle.textShadow, inlineStyle.textShadowPriority);
+      restore('-webkit-text-fill-color', inlineStyle.textFill, inlineStyle.textFillPriority);
+    }, measurement.inlineStyle);
+  }
+
+  const paintedColors = await locator.page().evaluate(async ({ backgroundUrl, foregroundBatches, samples }) => {
+    const sampleScreenshot = async (dataUrl, requestedSamples) => {
+      const response = await fetch(dataUrl);
+      const bitmap = await createImageBitmap(await response.blob());
+      const canvas = document.createElement('canvas');
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const context = canvas.getContext('2d', { willReadFrequently: true });
+      context.drawImage(bitmap, 0, 0);
+      const colors = requestedSamples.map((sample) => {
+        const x = Math.min(bitmap.width - 1, Math.max(0, Math.floor(sample.xRatio * bitmap.width)));
+        const y = Math.min(bitmap.height - 1, Math.max(0, Math.floor(sample.yRatio * bitmap.height)));
+        const [r, g, b, alphaByte] = context.getImageData(x, y, 1, 1).data;
+        return { r, g, b, a: alphaByte / 255 };
+      });
+      bitmap.close();
+      return colors;
+    };
+    const foregrounds = Array(samples.length);
+    for (const batch of foregroundBatches) {
+      const colors = await sampleScreenshot(
+        batch.dataUrl,
+        batch.sampleIndexes.map((sampleIndex) => samples[sampleIndex]),
+      );
+      batch.sampleIndexes.forEach((sampleIndex, index) => {
+        foregrounds[sampleIndex] = colors[index];
+      });
+    }
+    return {
+      backgrounds: await sampleScreenshot(backgroundUrl, samples),
+      foregrounds,
+    };
+  }, {
+    backgroundUrl: `data:image/png;base64,${backgroundScreenshot.toString('base64')}`,
+    foregroundBatches: foregroundScreenshots.map(({ sampleIndexes, screenshot }) => ({
+      dataUrl: `data:image/png;base64,${screenshot.toString('base64')}`,
+      sampleIndexes,
+    })),
+    samples: measurement.samples,
+  });
+
+  const composite = (foreground, backdrop) => ({
+    r: foreground.r * foreground.a + backdrop.r * (1 - foreground.a),
+    g: foreground.g * foreground.a + backdrop.g * (1 - foreground.a),
+    b: foreground.b * foreground.a + backdrop.b * (1 - foreground.a),
+  });
+  const luminance = ({ r, g, b }) => {
+    const linear = [r, g, b].map((channel) => {
+      const normalized = channel / 255;
+      return normalized <= 0.04045
+        ? normalized / 12.92
+        : ((normalized + 0.055) / 1.055) ** 2.4;
+    });
+    return linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722;
+  };
+  return Math.min(...paintedColors.backgrounds.map((background, index) => {
+    const paintedBackground = composite(background, { r: 255, g: 255, b: 255 });
+    const paintedForeground = composite(paintedColors.foregrounds[index], { r: 255, g: 255, b: 255 });
+    const foregroundLuminance = luminance(paintedForeground);
+    const backgroundLuminance = luminance(paintedBackground);
+    return (
+      (Math.max(foregroundLuminance, backgroundLuminance) + 0.05) /
+      (Math.min(foregroundLuminance, backgroundLuminance) + 0.05)
+    );
+  }));
+}
+
+async function expectAccessibleLightCardText(locator) {
+  await expect(locator).toBeVisible();
+  expect(await computedContrast(locator)).toBeGreaterThanOrEqual(4.5);
+  const isNearWhite = await locator.evaluate((element) => {
+    const channels = getComputedStyle(element).color.match(/[\d.]+/g)?.map(Number) || [];
+    return channels.length >= 3 && channels.slice(0, 3).every((channel) => channel >= 220);
+  });
+  expect(isNearWhite).toBe(false);
+}
+
+test('contrast helper composites translucent text over its painted background', async ({ page }) => {
+  await page.setContent(`
+    <div style="padding: 24px; background: white;">
+      <span id="translucent-text" style="color: rgba(0, 0, 0, 0.2);">translucent text</span>
+    </div>
+  `);
+
+  const contrast = await computedContrast(page.locator('#translucent-text'));
+  expect(contrast).toBeCloseTo(1.61, 2);
+  expect(contrast).toBeLessThan(4.5);
+});
+
+test('contrast helper samples narrow translucent text without overlapping probes', async ({ page }) => {
+  await page.setContent(`
+    <div style="padding: 24px; background: white;">
+      <span id="narrow-translucent-text" style="color: rgba(0, 0, 0, 0.4);">i</span>
+    </div>
+  `);
+
+  const contrast = await computedContrast(page.locator('#narrow-translucent-text'));
+  expect(contrast).toBeCloseTo(2.85, 2);
+  expect(contrast).toBeLessThan(4.5);
+});
+
+test('contrast helper applies ancestor group opacity once to text and background', async ({ page }) => {
+  await page.setContent(`
+    <div style="padding: 24px; background: white;">
+      <div style="padding: 12px; background: rgb(120, 120, 120); opacity: 0.7;">
+        <span id="group-opacity-text" style="color: black;">group opacity text</span>
+      </div>
+    </div>
+  `);
+
+  const contrast = await computedContrast(page.locator('#group-opacity-text'));
+  expect(contrast).toBeCloseTo(3.28, 1);
+  expect(contrast).toBeLessThan(4.5);
+});
+
+test('contrast helper reports the worst region across gradient-backed text lines', async ({ page }) => {
+  await page.setContent(`
+    <div
+      id="gradient-text"
+      style="box-sizing: border-box; width: 360px; padding: 12px; color: black;
+             background: linear-gradient(to right, white 0%, white 50%, black 80%, black 100%);
+             font: 16px/20px monospace; white-space: nowrap;"
+    >safe<br>0123456789012345678901234567890123</div>
+  `);
+
+  const textLineCount = await page.locator('#gradient-text').evaluate((element) => {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    return range.getClientRects().length;
+  });
+  expect(textLineCount).toBeGreaterThan(1);
+
+  const contrast = await computedContrast(page.locator('#gradient-text'));
+  expect(contrast).toBeLessThan(1.1);
+  expect(contrast).toBeLessThan(4.5);
+});
+
+test.describe('reported production screenshots', () => {
+  test('production state: typed empty signal stays date-safe and user-readable', async ({ page }) => {
+    await page.goto('/signals');
+
+    const currentLedger = page.locator('.ledger-current');
+    await expect(currentLedger).toContainText('需要第一期真实前向发布');
+    await expect(currentLedger).toContainText('由内部发布任务冻结本周研究。');
+    await expect(page.locator('body')).not.toContainText('Invalid Date');
+    await expect(page.locator('body')).not.toContainText('first_publication_required');
+    await expectAccessibleLightCardText(currentLedger.locator('.ledger-empty-guidance p'));
+    await expectAccessibleLightCardText(currentLedger.locator('.ledger-empty-guidance small'));
+  });
+
+  test('withheld production personal research keeps the valid range and accessible contrast', async ({ page }) => {
+    await page.unroute('**/api/v1/agent/personal-research?*');
+    await page.route('**/api/v1/agent/personal-research?*', async (route) => {
+      await route.fulfill({ json: productionWithheldPersonalResearchPayload });
+    });
+
+    await page.goto('/advisor');
+    await advanceAdvisorMobile(page, 2);
+    await page.getByRole('button', { name: /生成个性化配置研究/ }).click();
+
+    const rangePanel = page.locator('.advisor-range-panel');
+    await expect(rangePanel).toContainText('4.0% – 9.1%');
+    await expect(rangePanel).toContainText('中点 6.55%');
+    await expect(rangePanel).toContainText('参考区间可用；个人仓位差距暂不计算。');
+    await expect(rangePanel).toContainText('当前仓位 60%');
+    await expect(rangePanel).toContainText('个人仓位差距已暂停');
+    await expect(page.locator('body')).not.toContainText('Invalid Date');
+    await expect(page.locator('body')).not.toContainText('withheld');
+    await expectAccessibleLightCardText(rangePanel.locator('.advisor-gap-line > span').last());
+    await expectAccessibleLightCardText(rangePanel.locator('.suitability-verdict span'));
+    await expectAccessibleLightCardText(rangePanel.locator('.suitability-verdict strong'));
+  });
+
+  test('calibration accumulation reports 0/20 without mature score tiles', async ({ page }) => {
+    await page.unroute('**/api/v1/agent/research/current');
+    await page.route('**/api/v1/agent/research/current', async (route) => {
+      await route.fulfill({ json: {
+        data_asof: '2026-08-12',
+        data_age_days: 1,
+        data_stale: false,
+        data_source: 'fixture',
+        data_span: ['2004-01-01', '2026-08-12'],
+        data_rows: 5000,
+        degraded: {},
+      } });
+    });
+    await page.unroute('**/api/v1/agent/calibration');
+    await page.route('**/api/v1/agent/calibration', async (route) => {
+      await route.fulfill({ json: productionCalibrationAccumulationPayload });
+    });
+
+    await page.goto('/quant');
+
+    const calibrationPanel = page.locator('#panel-calibration');
+    await expect(calibrationPanel.getByText('正常积累中 0/20')).toBeVisible();
+    await expect(calibrationPanel.getByText('另有 1 条分析等待复核日成熟。')).toBeVisible();
+    await expect(calibrationPanel.locator('.calib-tiles')).toHaveCount(0);
+    await expect(calibrationPanel.getByText('已评分判断')).toHaveCount(0);
+    await expect(calibrationPanel.getByText('方向性判断命中率')).toHaveCount(0);
+    await expect(page.locator('body')).not.toContainText('insufficient_data');
+    await expect(page.locator('body')).not.toContainText('Invalid Date');
+  });
+
+  test('production state source health separates on-time provenance with accessible contrast', async ({ page }) => {
+    await page.unroute('**/api/v1/agent/dashboard/current');
+    await page.route('**/api/v1/agent/dashboard/current', async (route) => {
+      await route.fulfill({ json: {
+        ...dashboardPayload,
+        source_health: productionSourceHealthRows,
+      } });
+    });
+
+    await page.goto('/');
+    await expect(page.locator('body')).not.toContainText('proxy_static_source');
+    await expect(page.locator('body')).not.toContainText('real_yield_proxy_from_nominal_yield');
+    await page.getByRole('button', { name: '专业', exact: true }).click();
+
+    const staticProxy = page.locator('.source-health-row').filter({ hasText: 'Static proxy source' });
+    const realYieldProxy = page.locator('.source-health-row').filter({ hasText: 'Real yield proxy' });
+    await expect(staticProxy.getByText('时效 · 按时', { exact: true })).toBeVisible();
+    await expect(staticProxy.getByText('出处 · 代理值', { exact: true })).toBeVisible();
+    await expect(staticProxy).not.toContainText('时效 · 延迟');
+    await expect(staticProxy.locator('p')).toContainText('当前使用代理数据，并非实时官方数据');
+    await expect(realYieldProxy.getByText('时效 · 按时', { exact: true })).toBeVisible();
+    await expect(realYieldProxy.getByText('出处 · 衍生值', { exact: true })).toBeVisible();
+    await expect(realYieldProxy).not.toContainText('时效 · 延迟');
+    await expect(realYieldProxy.locator('p')).toContainText('实际利率由名义利率估算，属于衍生代理值');
+    await expectAccessibleLightCardText(staticProxy.locator('p'));
+    await expectAccessibleLightCardText(staticProxy.locator('.source-health-meta span').first());
+    await expectAccessibleLightCardText(staticProxy.getByText('出处 · 代理值', { exact: true }));
+    await expectAccessibleLightCardText(realYieldProxy.locator('p'));
+    await expectAccessibleLightCardText(realYieldProxy.getByText('出处 · 衍生值', { exact: true }));
+    await expect(page.locator('body')).not.toContainText('Invalid Date');
+  });
+});
+
 test('market-first dashboard orders live context before the research intake', async ({ page }) => {
   await page.goto('/');
 
@@ -485,6 +956,133 @@ test('mobile navigation stays compact and touch friendly', async ({ page }) => {
   expect(heights.every((height) => height >= 44)).toBe(true);
 });
 
+test('signals current outage preserves healthy market view without inventing a publication', async ({ page }) => {
+  await page.unroute('**/api/v1/signals/current');
+  await page.route('**/api/v1/signals/current', async (route) => {
+    await route.fulfill({ status: 503, json: { detail: 'publication store unavailable' } });
+  });
+
+  await page.goto('/signals');
+
+  await expect(page.getByText('短期关注风险分布。', { exact: true })).toBeVisible();
+  await expect(page.getByText('观点书不可用')).toHaveCount(0);
+  await expect(page.getByText('本周发布暂不可用')).toBeVisible();
+  await expect(page.getByText('等待第一期发布，不回填历史。')).toHaveCount(0);
+});
+
+test('market-view outage still settles healthy ledger modules', async ({ page }) => {
+  const publication = {
+    publication_id: '2026-W36',
+    published_at: '2026-09-03T01:00:00Z',
+    data_asof: '2026-09-02',
+    allocations: {
+      conservative: { range_pct: [2, 8], midpoint: 5 },
+      balanced: { range_pct: [5, 12], midpoint: 8.5 },
+      aggressive: { range_pct: [8, 18], midpoint: 13 },
+    },
+    content_hash: 'sha256:fixture-publication-hash',
+    disclaimer: 'Fixture live-forward publication.',
+  };
+  const trackRecord = {
+    matured_through: '2026-W35',
+    cost_bps: 5,
+    per_profile: {
+      conservative: { weeks_scored: 1, cum_return: 0.01, max_drawdown: -0.005 },
+      balanced: { weeks_scored: 1, cum_return: 0.015, max_drawdown: -0.006 },
+      aggressive: { weeks_scored: 1, cum_return: 0.02, max_drawdown: -0.008 },
+    },
+    benchmarks: { gold_buy_hold: { cum_return: 0.012 } },
+    disclaimer: 'Fixture simulated-forward scorecard.',
+  };
+
+  await usePro(page);
+  await page.unroute('**/api/v1/agent/market-view');
+  await page.unroute('**/api/v1/signals/current');
+  await page.unroute('**/api/v1/signals/history?*');
+  await page.unroute('**/api/v1/signals/track-record');
+  await page.route('**/api/v1/agent/market-view', async (route) => {
+    await route.fulfill({ status: 503, json: { detail: 'market view unavailable' } });
+  });
+  await page.route('**/api/v1/signals/current', async (route) => {
+    await route.fulfill({ json: publication });
+  });
+  await page.route('**/api/v1/signals/history?*', async (route) => {
+    await route.fulfill({ json: { publications: [publication] } });
+  });
+  await page.route('**/api/v1/signals/track-record', async (route) => {
+    await route.fulfill({ json: trackRecord });
+  });
+
+  await page.goto('/signals');
+
+  await expect(page.getByText('观点书不可用')).toBeVisible();
+  await expect(page.locator('.ledger-current')).toContainText('2026-W36');
+  await expect(page.locator('.ledger-current')).not.toContainText('台账为空');
+  await expect(page.locator('.ledger-history')).toContainText('1 期 · append-only');
+  await expect(page.locator('.ledger-history')).not.toContainText('0 期 · append-only');
+  await expect(page.locator('.ledger-track')).toContainText('已成熟至 2026-W35 · 成本 5bps');
+  await expect(page.locator('.ledger-track')).not.toContainText('读取中');
+  await expect(page.getByText('正在组装三尺度观点书与台账记录。')).toHaveCount(0);
+});
+
+test('generic signals current 404 is unavailable rather than an empty ledger', async ({ page }) => {
+  await page.unroute('**/api/v1/signals/current');
+  await page.route('**/api/v1/signals/current', async (route) => {
+    await route.fulfill({ status: 404, json: { detail: 'Not Found' } });
+  });
+
+  await page.goto('/signals');
+
+  await expect(page.getByText('短期关注风险分布。', { exact: true })).toBeVisible();
+  await expect(page.getByText('本周发布暂不可用')).toBeVisible();
+  await expect(page.getByText('需要第一期真实前向发布')).toHaveCount(0);
+});
+
+test('genuine typed empty ledger renders first-publication guidance', async ({ page }) => {
+  await usePro(page);
+  await page.goto('/signals');
+
+  await expect(page.getByText('短期关注风险分布。', { exact: true })).toBeVisible();
+  await expect(page.getByText('需要第一期真实前向发布')).toBeVisible();
+  await expect(page.getByText('本周发布暂不可用')).toHaveCount(0);
+  await expect(page.locator('.ledger-history')).toContainText('0 期 · append-only');
+  await expect(page.locator('.ledger-history')).toContainText('尚无发布记录。');
+});
+
+for (const historyFailure of ['503', 'malformed JSON']) {
+  test(`signals history ${historyFailure} remains unavailable rather than empty`, async ({ page }) => {
+    await usePro(page);
+    await page.unroute('**/api/v1/signals/history?*');
+    await page.route('**/api/v1/signals/history?*', async (route) => {
+      if (historyFailure === '503') {
+        await route.fulfill({ status: 503, json: { detail: 'history store unavailable' } });
+      } else {
+        await route.fulfill({ status: 200, contentType: 'application/json', body: '{not-json' });
+      }
+    });
+
+    await page.goto('/signals');
+
+    await expect(page.getByText('短期关注风险分布。', { exact: true })).toBeVisible();
+    await expect(page.locator('.ledger-history')).toContainText('发布历史暂不可用');
+    await expect(page.locator('.ledger-history')).not.toContainText('0 期 · append-only');
+    await expect(page.locator('.ledger-history')).not.toContainText('尚无发布记录。');
+  });
+}
+
+test('track-record outage is unavailable rather than an empty scorecard', async ({ page }) => {
+  await page.unroute('**/api/v1/signals/track-record');
+  await page.route('**/api/v1/signals/track-record', async (route) => {
+    await route.fulfill({ status: 503, json: { detail: 'track store unavailable' } });
+  });
+
+  await page.goto('/signals');
+
+  await expect(page.getByText('短期关注风险分布。', { exact: true })).toBeVisible();
+  await expect(page.locator('.ledger-track')).toContainText('记分服务暂不可用');
+  await expect(page.locator('.ledger-track')).not.toContainText('暂无成熟计分区间（诚实空账）');
+});
+
 test('mobile primary controls and evidence links meet 44px touch targets', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/');
@@ -538,7 +1136,7 @@ test('quant credibility abstains on implausible values and removes duplicate out
   await page.unroute('**/api/v1/agent/calibration');
   await page.route('**/api/v1/agent/calibration', async (route) => {
     const outcome = { analysis_id: 'duplicate', hit: true, stance: '偏多', horizon: 'mid_term', realized_return: 0.01, created_at: '2026-08-12' };
-    await route.fulfill({ json: { total_scored: 2, hit_rate: 1, brier_score: 0.1, neutral_or_gated: 0, recent_outcomes: [outcome, outcome] } });
+    await route.fulfill({ json: { total_scored: 20, directional_calls: 20, minimum_directional_calls: 20, hit_rate: 1, brier_score: 0.1, neutral_or_gated: 0, recent_outcomes: [outcome, outcome] } });
   });
   await page.goto('/quant');
 
@@ -548,9 +1146,47 @@ test('quant credibility abstains on implausible values and removes duplicate out
   await expect(page.getByText('估值关系显著偏离')).toBeVisible();
 });
 
+test('calibration keeps mature metrics hidden below the directional threshold', async ({ page }) => {
+  await page.unroute('**/api/v1/agent/research/current');
+  await page.route('**/api/v1/agent/research/current', async (route) => {
+    await route.fulfill({ json: {
+      data_asof: '2026-08-12', data_age_days: 1, data_stale: false, data_source: 'fixture',
+      data_span: ['2004-01-01', '2026-08-12'], data_rows: 5000, degraded: {},
+    } });
+  });
+  await page.unroute('**/api/v1/agent/calibration');
+  await page.route('**/api/v1/agent/calibration', async (route) => {
+    await route.fulfill({ json: {
+      total_scored: 30,
+      directional_calls: '19',
+      minimum_directional_calls: '20',
+      hit_rate: 0.84,
+      brier_score: 0.12,
+      neutral_or_gated: 11,
+      recent_outcomes: [],
+      governance: { mode: 'insufficient_data', directional_calls: '19', reason: '继续积累' },
+    } });
+  });
+  await page.goto('/quant');
+
+  await expect(page.getByText('正常积累中 19/20')).toBeVisible();
+  await expect(page.locator('.calib-tiles')).toHaveCount(0);
+  await expect(page.getByText('84%')).toHaveCount(0);
+});
+
 test('simple quant mode uses plain language instead of model abbreviations', async ({ page }) => {
   await page.goto('/quant');
   await expect(page.locator('body')).not.toContainText(/HAR-RV|HMM|BL-lite|Brier|OOS/);
+});
+
+test('simple dashboard translates data-quality machine states', async ({ page }) => {
+  await page.goto('/');
+
+  const qualityPanel = page.locator('.panel-block').filter({ hasText: '数据质量' });
+  await expect(qualityPanel.getByText('部分降级').first()).toBeVisible();
+  await expect(qualityPanel.getByText('部分市场指标使用代理或降级数据')).toBeVisible();
+  await expect(qualityPanel).not.toContainText('market_indicators_degraded');
+  await expect(qualityPanel).not.toContainText(/\bdegraded\b/i);
 });
 
 test('dashboard presents forecasts and four indicator pillars', async ({ page }) => {
@@ -559,6 +1195,11 @@ test('dashboard presents forecasts and four indicator pillars', async ({ page })
 
   await expect(page.getByRole('heading', { name: '黄金价格预测与指标总览' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '今日核心结论' })).toBeVisible();
+  await expect(page.getByLabel('今日研究摘要').getByText('短期 偏多，执行倾向：观察确认')).toBeVisible();
+  await expect(page.getByText('长期关注估值与配置。')).toBeVisible();
+  await expect(page.getByLabel('量化模型参考').getByText('长期', { exact: true })).toBeVisible();
+  await expect(page.getByText(/undefined/)).toHaveCount(0);
+  await expect(page.getByText('SHORT_TERM', { exact: true })).toHaveCount(0);
   await expect(page.getByRole('heading', { name: '驱动贡献矩阵' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '风险催化日历' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '三情景推演' })).toBeVisible();
@@ -575,6 +1216,18 @@ test('dashboard presents forecasts and four indicator pillars', async ({ page })
   await expect(page.locator('.indicator-card-head').filter({ hasText: '资金情绪' })).toBeVisible();
   await expect(page.getByText('代理量化引擎：真实行情驱动')).toHaveCount(3);
   await expect(page.getByRole('link', { name: /进入风险画像 Agent/ })).toBeVisible();
+});
+
+test('source provenance badges meet small-text contrast on cream cards', async ({ page }) => {
+  await usePro(page);
+  await page.goto('/');
+
+  const proxyBadge = page
+    .locator('.source-health-row')
+    .filter({ hasText: 'WGC Gold Demand' })
+    .getByText('出处 · 代理值', { exact: true });
+  await expect(proxyBadge).toBeVisible();
+  expect(await computedContrast(proxyBadge)).toBeGreaterThanOrEqual(4.5);
 });
 
 test('dashboard exposes source audit details for each indicator', async ({ page }) => {
@@ -620,6 +1273,8 @@ test('unified workbench: shared profile + Q&A analysis renders risk briefing', a
   await expect(page.getByRole('heading', { name: '用户风险画像' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '三情景执行框架' })).toBeVisible();
   await expect(page.getByText(/(?:加仓|减仓|仓试探|立即买入|立即卖出)/)).toHaveCount(0);
+  await page.getByRole('button', { name: '有帮助', exact: true }).click();
+  await expect(page.getByText('已记录：这条分析有帮助。')).toBeVisible();
 });
 
 test('unified workbench: allocation research tab is the default capability', async ({ page }) => {
@@ -631,6 +1286,31 @@ test('unified workbench: allocation research tab is the default capability', asy
   // Both capability tabs are present.
   await expect(page.getByRole('tab', { name: /配置研究/ })).toBeVisible();
   await expect(page.getByRole('tab', { name: /提问分析/ })).toBeVisible();
+});
+
+test('the long-term research category displays its valuation evidence', async ({ page }) => {
+  await page.route('**/api/v1/agent/analyze', async (route) => {
+    const body = route.request().postDataJSON();
+    expect(body.horizon).toBe('long_term');
+    await route.fulfill({ json: {
+      ...analysisPayload,
+      summary_card: { ...analysisPayload.summary_card, horizon: 'long_term' },
+      research_focus: {
+        horizon: 'long_term',
+        section: { available: true, core_view: '长期估值以宏观锚为参考。', evidence: ['控制美元后的利率敏感度发生变化。'], invalidation: [] },
+      },
+    } });
+  });
+  await page.goto('/advisor');
+  await advanceAdvisorMobile(page, 2);
+  await page.getByRole('tab', { name: /提问分析/ }).click();
+  await page.getByRole('button', { name: '长期', exact: true }).click();
+  await page.getByRole('button', { name: '生成风险适配分析' }).click();
+
+  await expect(page.getByRole('heading', { name: '长期研究观点' })).toBeVisible();
+  await expect(page.getByText('长期估值以宏观锚为参考。')).toBeVisible();
+  await expect(page.getByText('控制美元后的利率敏感度发生变化。')).toBeVisible();
+  await expect(page.getByText('长期 · 风险适配参考')).toBeVisible();
 });
 
 test('simple mode hides methodology internals until toggled', async ({ page }) => {
@@ -724,3 +1404,225 @@ test('complete suitability profile unlocks position comparison without trade dir
   await expect(page.getByText('允许显示个人仓位差距')).toBeVisible();
   await expect(page.getByText('立即买入')).toHaveCount(0);
 });
+
+test('signals page derives production ledger endpoints from the agent origin', async ({ page }) => {
+  const marketView = {
+    meta: {
+      data_asof: '2026-08-13',
+      data_age_days: 21,
+      data_stale: true,
+    },
+    short_term: {
+      available: true,
+      confidence: '中',
+      core_view: '短期保持观察，等待数据与价格共同确认。',
+      evidence: ['波动状态偏高'],
+      invalidation: ['数据质量进一步下降'],
+    },
+    mid_term: {
+      available: true,
+      confidence: '中',
+      core_view: '中期由宏观因子与资金流共同决定。',
+      evidence: ['美元趋势'],
+      invalidation: ['实际利率快速上行'],
+    },
+    long_term: {
+      available: true,
+      confidence: '低',
+      core_view: '长期估值关系处于结构性偏离期。',
+      evidence: ['估值锚偏离'],
+      invalidation: ['结构性需求逆转'],
+    },
+  };
+
+  await page.route('https://api.goldensense.test/api/v1/agent/market-view', (route) =>
+    route.fulfill({ json: marketView }),
+  );
+  await page.route('https://api.goldensense.test/api/v1/signals/current', (route) =>
+    route.fulfill({ json: productionEmptySignalPayload }),
+  );
+  await page.route('https://api.goldensense.test/api/v1/signals/history?limit=26', (route) =>
+    route.fulfill({ json: { publications: [] } }),
+  );
+  await page.route('https://api.goldensense.test/api/v1/signals/track-record', (route) =>
+    route.fulfill({ status: 503, json: { detail: { message: '暂无成熟周' } } }),
+  );
+  await page.route('https://api.goldensense.test/api/v1/agent/research/current', (route) =>
+    route.fulfill({ json: { cross_asset: null } }),
+  );
+
+  // Reproduce the SPA fallback when ledger requests use the web app's origin.
+  await page.route('http://127.0.0.1:4173/api/v1/signals/**', (route) =>
+    route.fulfill({ status: 200, contentType: 'text/html', body: '<!doctype html><title>GoldenSense</title>' }),
+  );
+
+  await page.goto('/signals');
+
+  await expect(page.getByText('短期保持观察，等待数据与价格共同确认。')).toBeVisible();
+  await expect(page.getByText("Unexpected token '<'")).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: '本周发布' })).toBeVisible();
+  await expect(page.getByText('台账为空', { exact: true })).toBeVisible();
+});
+
+test('quant page explains a slow first-load model warm-up', async ({ page }) => {
+  await page.route('https://api.goldensense.test/api/v1/agent/research/current', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 7_000));
+    await route.fulfill({ json: { data_span: ['2004-01-05', '2026-08-13'], data_rows: 5706 } });
+  });
+  await page.route('https://api.goldensense.test/api/v1/agent/calibration', (route) =>
+    route.fulfill({ status: 503, json: { detail: { message: '样本不足' } } }),
+  );
+
+  await page.goto('/quant');
+
+  await expect(page.getByRole('status').filter({ hasText: '首次打开正在唤醒研究服务' })).toBeVisible({
+    timeout: 6_500,
+  });
+});
+
+test('quant page displays driver attribution and matured valuation evidence', async ({ page }) => {
+  await page.route('**/api/v1/agent/research/current', (route) => route.fulfill({
+    json: {
+      macro_factors: {
+        latest: { usd_downtrend: 1 },
+        factors_used: ['usd_downtrend'],
+        composite: 1,
+      },
+      degraded: { macro_vintages: 'unavailable:2Y_CMT' },
+      gold_drivers: {
+        data_asof: '2026-07-14',
+        flows: { etf_net_tonnes: { label: '黄金 ETF 净流入', status: 'unavailable' } },
+      },
+      driver_attribution: { data_asof: '2026-07-14', latest: { actual: 0.01, dollar: 0.004, residual: 0.006 } },
+      vol_bands: { h1: { p10: -0.01, p50: 0, p90: 0.01, ann_vol_forecast: 0.2 } },
+      risk_review: {
+        price_end: '2026-07-14',
+        windows: {
+          '1': {
+            log_har: { n: 82, coverage: 0.817, status: 'hold', blockers: ['session_timestamps_missing'] },
+            student_t_garch: { n: null, coverage: null, status: 'hold', blockers: ['incomplete_forecasts'] },
+          },
+        },
+      },
+      fair_value: {
+        deviation_pct: 1.0,
+        anchor_status: 'conditional',
+        half_life_days: 40,
+        quartile_forward_returns: { q1_cheapest: 0.08 },
+        quartile_sample_counts: { q1_cheapest: 72 },
+        stress_scenarios_pct: { real_yield_up_100bp: -2.2, dollar_up_5pct: -1.1, joint_up: -3.25 },
+      },
+    },
+  }));
+  await page.route('**/api/v1/agent/calibration', (route) => route.fulfill({ json: {} }));
+  await usePro(page);
+  await page.goto('/quant');
+  await expect(page.getByText('部分宏观历史版本缺失', { exact: false })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '当期驱动归因' })).toBeVisible();
+  await expect(page.getByText('72 个成熟样本')).toBeVisible();
+  await expect(page.getByRole('heading', { name: '利率与美元条件锚' })).toBeVisible();
+  await expect(page.getByText('未观察到有效均值回归')).toBeVisible();
+  await expect(page.getByText('40 日', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: '长期估值压力情景' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '黄金驱动证据' })).toBeVisible();
+  await expect(page.getByText('缺少已发布数据')).toBeVisible();
+  await expect(page.getByRole('heading', { name: '短期风险候选复验' })).toBeVisible();
+  await expect(page.getByText('82 个成熟样本 · 暂缓晋级')).toBeVisible();
+  await expect(page.getByText('缺少核验会话')).toBeVisible();
+  await expect(page.getByText('Student-t GARCH', { exact: true })).toBeVisible();
+  await expect(page.getByText('成熟样本数待确认 · 暂缓晋级')).toBeVisible();
+  await expect(page.getByText('候选模型的预测记录不完整')).toBeVisible();
+});
+
+test('signals page labels date-only proxy scoring and same-cost benchmarks', async ({ page }) => {
+  await page.route('**/api/v1/agent/market-view', (route) =>
+    route.fulfill({ json: { meta: {} } }),
+  );
+  await page.route('**/api/v1/signals/current', (route) =>
+    route.fulfill({ json: productionEmptySignalPayload }),
+  );
+  await page.route('**/api/v1/signals/history?*', (route) =>
+    route.fulfill({ json: { publications: [] } }),
+  );
+  await page.route('**/api/v1/signals/track-record', (route) =>
+    route.fulfill({
+      json: {
+        price_evidence: 'date_only_proxy',
+        per_profile: {
+          conservative: { weeks_scored: 2, cum_return: 0.02 },
+          balanced: {
+            intervals_scored: 1, weeks_scored: 2, cum_return: 0.04, max_drawdown: -0.01,
+            ann_vol: null, sharpe: null, annualization_reason: 'nonweekly_intervals',
+          },
+        },
+        benchmarks: {
+          conservative_risk_matched_net: { weeks_scored: 0, cum_return: null },
+          balanced_fixed_net: { cum_return: 0.03 },
+          balanced_risk_matched_net: {
+            weeks_scored: 1,
+            cum_return: 0.025,
+            target_ann_vol: 0.08,
+            start_at: '2026-07-20T18:00:00+00:00',
+            strategy_same_period: { weeks_scored: 1, cum_return: 0.035 },
+          },
+        },
+      },
+    }),
+  );
+  await page.route('**/api/v1/agent/research/current', (route) =>
+    route.fulfill({ json: {} }),
+  );
+  await page.goto('/signals');
+  await expect(page.getByText('行情按日期估算可用时间，记分供研究参考。')).toBeVisible();
+  await expect(page.getByText('同成本固定仓位 3.00%')).toBeVisible();
+  await expect(page.locator('.track-row').filter({ hasText: '稳健' })).toContainText('区间数 1');
+  await expect(page.locator('.track-row').filter({ hasText: '保守' })).toContainText('区间数 2');
+  await expect(page.getByText('计分区间包含非周度间隔，年化波动率与 Sharpe 暂不可用。')).toBeVisible();
+  await expect(page.getByText('同成本风险匹配基准 2.50% · 同期策略 3.50% · 目标年化波动率 8.0% · 自 2026-07-20 起')).toBeVisible();
+  await expect(page.getByText(/同成本风险匹配基准/)).toHaveCount(1);
+});
+
+for (const scenario of [
+  {
+    name: 'suitability disallows a calculable status',
+    suitability: { status: 'insufficient', position_analysis_allowed: false, missing_fields: [], reasons: [] },
+    positionGap: { status: 'within', current_gold_pct: 60, gap_pct: 53.45 },
+    explanation: '适当性校验未允许个人仓位分析',
+  },
+  {
+    name: 'the position status is unrecognized',
+    suitability: { status: 'eligible', position_analysis_allowed: true, missing_fields: [], reasons: [] },
+    positionGap: { status: 'future_status', current_gold_pct: 60, gap_pct: 53.45 },
+    explanation: '仓位差距状态不可识别',
+  },
+]) {
+  test(`advisor fails closed when ${scenario.name}`, async ({ page }) => {
+    await page.unroute('**/api/v1/agent/personal-research?*');
+    await page.route('**/api/v1/agent/personal-research?*', async (route) => {
+      await route.fulfill({ json: {
+        ...personalResearchPayload,
+        facts: {
+          ...personalResearchPayload.facts,
+          reference_range: { available: true, range_pct: [4, 9.1], midpoint: 6.55 },
+          suitability: scenario.suitability,
+          position_gap: scenario.positionGap,
+        },
+        narrative: {
+          ...personalResearchPayload.narrative,
+          position_analysis: '敏感的个人仓位判断不应展示',
+        },
+      } });
+    });
+    await page.goto('/advisor');
+    await advanceAdvisorMobile(page, 2);
+    await page.getByRole('button', { name: /生成个性化配置研究/ }).click();
+
+    const rangePanel = page.locator('.advisor-range-panel');
+    await expect(rangePanel).toContainText('4.0% – 9.1%');
+    await expect(rangePanel).toContainText('当前仓位 60%');
+    await expect(rangePanel).toContainText('个人仓位差距暂不计算');
+    await expect(rangePanel).toContainText(scenario.explanation);
+    await expect(rangePanel.getByText('处于参考区间内', { exact: true })).toHaveCount(0);
+    await expect(page.getByText('敏感的个人仓位判断不应展示', { exact: true })).toHaveCount(0);
+  });
+}

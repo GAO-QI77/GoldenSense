@@ -84,7 +84,7 @@ flowchart LR
 
 | 组件 | 端口 | 职责 | 关键入口 |
 | --- | --- | --- | --- |
-| `inference_service.py` | `8010` | 内部量化适配器；网关统一映射为短期/中期/长期公开契约 | `POST /api/v1/forecast` |
+| `inference_service.py` | `8010` | 提供各计算窗口的预测、概率和解释特征，供网关构建短期、中期和长期研究 | `POST /api/v1/forecast` |
 | `memory_service.py` | `8012` | 返回历史相似事件及其后验金价表现 | `POST /api/v1/memory/search` |
 | `market_snapshot_service.py` | `8014` | 统一市场快照、技术状态、波动率与新鲜度信息 | `GET /api/v1/market/snapshot/latest` |
 | `market_snapshot_service.py` | `8014` | 基本面、技术面、宏观政策、资金情绪四类指标契约 | `GET /api/v1/market/indicators/current` |
@@ -259,7 +259,7 @@ export AGENT_INTERNAL_API_KEYS=dev-internal-key
 | `AGENT_TRACE_MEMORY_MAX_ITEMS` | `200` | dev 内存审计缓存上限 |
 | `VIX_CIRCUIT_BREAKER_THRESHOLD` | `30` | 风险熔断阈值 |
 | `INFERENCE_MODEL_CHECKPOINTS_DIR_T1` | `model_checkpoints` | T+1 模型 checkpoint 目录 |
-| `INFERENCE_MODEL_CHECKPOINTS_DIR_T7` | `model_checkpoints` | T+7 模型 checkpoint 目录；默认不再指向不存在的目录 |
+| `INFERENCE_MODEL_CHECKPOINTS_DIR_T7` | `model_checkpoints_t7` | 独立的 T+7 模型目录，需包含声明 `"horizon": "T+7"` 的 `model_manifest.json`。缺失或周期不符时显示规则代理 |
 
 ### 统一研究案件 API
 
@@ -363,18 +363,20 @@ python3 memory_ingestion.py \
 - 事件文本读取 [`perception_layer/news_mock_data.jsonl`](perception_layer/news_mock_data.jsonl)
 - Embedding 模型使用 `sentence-transformers/all-MiniLM-L6-v2`
 
-如果数据库不可用或检索失败，`memory_service.py` 会显式返回 `status=unavailable` 或 `status=degraded`，不会再伪装成“空结果就是没有历史相似事件”。
+如果数据库不可用或检索失败，`memory_service.py` 会显式返回 `status=unavailable` 或 `status=degraded`。升级时用已确认来源重新运行上述入库命令，初始化文本版本和各收益期限的可见时间。缺少可见时间的旧记录会被隔离，各期限收益在到期前返回空值。
 
-## 量化研究层（短 / 中 / 长期分层）
+## 量化研究层（短期、中期、长期）
 
 策略层按期限分工，每层使用不同的方法论，全部经过含成本回测与走前验证；纪律不变：
 任何新信号必须过 `backtest_engine` 的成本感知门槛才能进入 Agent 输出。
 
 | 期限 | 方法 | 模块 |
 | --- | --- | --- |
-| 短期 (1–21天) | 不在无样本外优势时预测方向，改为 HAR-RV 波动率预测 + 经验分位收益带 | `vol_models.py` |
+| 短期 (1–21天) | HAR-RV 波动率预测 + 经验分位收益带，方向判断需要样本外优势 | `vol_models.py` |
 | 中期 (数周~数月) | 三状态 HMM 概率状态机 + 实际利率/美元/通胀预期/资金流四因子组合，概率加权暴露 | `regime_probabilistic.py`, `strategy_macro.py`, `regime_strategy.evaluate_regime_v2` |
 | 长期 (6 个月+) | 公允价值锚（误差修正）+ BL-lite 配置区间 + regime-switching 蒙特卡洛情景锥 | `fair_value.py`, `allocation.py` |
+
+首页观点书和提问分析采用这三类研究期限。模型计算窗口属于内部量化参考，长期研究观点来自估值、情景与配置。
 
 **旗舰策略**（`strategy_integrated.py`）把上述各因果模块组合为单一暴露：多周期趋势 × 实际利率顺风 ×
 HMM 状态去险（走前重拟合 + 前向滤波，无未来信息）× 波动率目标。2004–2026 含成本回测对比买入持有：
@@ -405,6 +407,99 @@ Agent 编排新增确定性机制（均无 LLM 参与）：
   以硬上限反哺委员会置信度，并通过 `/api/v1/agent/calibration` 公开。
 - **性能治理**（`model_governance.py`）：当系统方向判断命中率跌破阈值时，自动降级为保守姿态
   （下调置信度、打 `model_demoted_by_performance` 标记），规则策略始终是冠军兜底。
+
+
+### 宏观历史版本与短期波动基准
+
+公开量化上下文通过 `MACRO_VINTAGES_PATH` 读取经核验的宏观历史版本。
+默认路径为 `data_cache/macro_vintages.csv`。文件列为
+`series_id,observation_date,available_at,value`。支持 DFII10、T10YIE、DGS2。
+观察日期使用 YYYY-MM-DD，`available_at` 使用带时区的 ISO 8601 时间。
+如果存在实际入库时间，提供两者中较晚的时间。每个修订版本单独保留一行。
+缺少可信版本的宏观字段会降级，旧扩展 CSV 中按观察日期存储的 FRED 值
+仍供旧研究脚本使用。日级黄金行情按次日 UTC 零时可见。带时区的交易会话和报价可见时间可用于分析校准、
+影子评分和短期波动复验。
+
+用一个标的经核验的已完成日收盘价 CSV 复跑短期波动基准。CSV 含
+`Date,Gold` 两列，日期严格递增。提供 `--sessions` 时，脚本按所给的交易所会话日历检查完整性。
+
+```bash
+python3 scripts/evaluate_short_term_risk.py verified_closes.csv \
+  --instrument GC=F --through 2026-07-14 --output-dir output/short_term_risk
+```
+
+脚本输出逐日预测、成熟日期、实现方差、QLIKE 和汇总。1、5、21 个观测
+窗口同属短期风险研究，窗口内各模型使用相同的评分日期。仓库旧行情
+可能含跨市场日期前填，使用该文件得到的分数仅为探索性结果。
+
+### 数据验收与实证复跑
+
+- 宏观历史版本使用 ALFRED 的 real-time periods。将 `FRED_API_KEY`
+  配置到本地运行环境后，执行 `python3 scripts/refresh_macro_vintages.py`。
+  ALFRED 只给日期时，系统等到次日纽约时间零时再放行。三条序列完整下载后
+  才替换现有存档。
+- 短期波动复验可传 `--sessions verified_sessions.csv`，其中包含
+  `Date,close_at,available_at`，并传入带时区的 `--through` 时间。
+  在截止时点前，收盘价必须和会话日期逐一对应。用 `--evaluation-from`
+  单独指定确认区间的起点。报告包含配对区块误差区间和 80% 收益区间覆盖、
+  上下尾超限及宽度。
+- 中期预测诊断可执行 `python3 scripts/evaluate_mid_term_drivers.py --through 2026-07-14 --output-dir output/mid_term_drivers`。
+  它将零收益、价格趋势和加驱动变量的模型对齐到相同评分日期。
+  当期驱动归因与中期预测分开呈现。
+- 长期估值分组每月只用此前的数据估计。压力情景根据已拟合系数计算，
+  独立验证完成前，估值偏离不参与公开配置区间倾斜。
+- 新闻服务在 PostgreSQL 中为成功采集的快照保留历史版本。影子账本沿用
+  发布后首个可用收盘价，按自然漂移后的权重收取换手成本，现金收益固定为零。
+
+没有 FRED 凭证时，可先下载 ALFRED 的 Real-Time Period CSV 导出并准备校验清单，
+再用 `python3 scripts/refresh_macro_vintages.py --alfred-exports ./alfred-exports`
+离线导入。本地历史档案默认放在 `data_cache/macro_vintages.csv`。
+部署时把档案放在持久卷，并用 `MACRO_VINTAGES_PATH` 指向该文件。
+
+如需验证历史类比迁移，将 `GOLDEN_TEST_POSTGRES_DSN` 指向可丢弃的测试数据库，
+执行 `python3 -m pytest tests/test_memory_postgres.py`。迁移保留旧表现有的
+数组或向量列类型。历史检索先筛出截止时点可见的记录，再计算相似度。
+
+### 黄金驱动证据
+
+Agent 的短期、中期、长期研究证据与量化页共享同一份研究快照。
+短期按项目原油日线与已可见实际利率的涨跌交叉分组，报告黄金同期收益
+均值、下尾第 10 百分位和样本量。长期对比两个相邻的 126 观测窗口，
+以实际利率变化与美元对数收益解释黄金同期对数收益，显示每 100 基点的
+利率敏感度估计。两项均用于解释，独立于方向、配置和模型晋级规则。
+
+`GOLD_DRIVER_FLOWS_PATH` 默认读取 `data_cache/gold_driver_flows.csv`。
+文件列为 `series,observation_date,available_at,value`，可附 `source_url`，支持以下序列。
+
+| series | 含义及单位 |
+| --- | --- |
+| `etf_net_tonnes` | 全球黄金 ETF 持仓净变化，吨 |
+| `cot_managed_net` | COMEX 黄金期货 Managed Money 净仓，手 |
+| `cot_other_net` | COMEX 黄金期货 Other Reportables 净仓，手 |
+| `central_bank_net_tonnes` | 全球央行已报告净购金，吨 |
+
+同一序列保持固定统计频率和来源，`observation_date` 为统计期末，
+`available_at` 为带时区的可用时间。`python3 scripts/refresh_gold_driver_flows.py`
+从 CFTC 公共接口采集 COMEX 黄金持仓，可用 `--wgc-excerpts` 导入人工核验的
+WGC 摘录。采集程序按首次取得该值的时间入档，修订增加一行，重复值保持原时点。
+设置 `GOLD_DRIVER_COT_REFRESH_ENABLED=1` 后，定时刷新也会采集 COT。
+ETF、COT、央行数据按 45、21、145 个自然日判断过期，GLD 成交额单独作为活跃度指标。
+
+定时刷新成功时，量化研究、事件研究和影子评分共用
+`data_cache/market_extended.csv`，可用 `GOLD_RESEARCH_MARKET_PATH` 指定路径。
+日级市场快照采用次日 UTC 截止。短期复验用
+`scripts/evaluate_short_term_risk.py --challengers` 计算 log-HAR 及成熟误差校准候选。
+加 `--student-t-garch` 可纳入使用厚尾误差的 GARCH(1,1)。研究环境需安装 `requirements.txt`，
+使用至多 756 个历史观测拟合，每 21 个观测重新估计。未收敛的窗口保留为缺失并阻止晋级。
+将生成的 `summary.json` 放在 `data_cache/gold_risk_review.json` 或通过
+`GOLD_RISK_REVIEW_PATH` 指定，可在量化页看到样本、覆盖率和暂缓晋级原因。
+候选产物只进入研究证据，现有风险区间继续使用基线。
+
+中期可用 `scripts/evaluate_mid_term_drivers.py --oil-interaction` 在共同成熟样本上比较
+WTI 与实际利率的主效应、交互项和零收益基准，逐期预测另存为 CSV。
+影子账本的风险匹配基准以首个可比较区间的实际仓位和近 20 个交易日的黄金波动率确定目标。
+之后仅用执行前已可见的收益估计波动率，黄金仓位上限为 100%，与策略同期计费和再平衡。
+
 
 ### 生产运维
 
@@ -544,7 +639,8 @@ POST /api/v1/signals/publish            # 冻结本 ISO 周发布（仅 internal
 **每周信号台账**是系统的问责层：每周冻结一条不可变记录（三档参考区间 + 观点书摘要 +
 证据快照 + `sha256` 防篡改哈希），append-only、同周幂等、历史永不重写。追踪记录
 自首次发布起**前向累积**——无任何回填历史；影子组合按各档中点持金（余为现金），
-发布日调仓、含换手成本（默认 5bps）、仅对已成熟周计分，对照恒定权重与买入持有双基准。
+按发布后首个可得收盘价调仓、按权重自然漂移计入换手成本（默认 5bps）、
+仅对已成熟周计分，对照恒定权重与买入持有双基准。
 回测归回测（`/research/current` 的 `flagship`），前向归前向（本台账），两者永不混算。
 所有输出附研究参考免责声明。运维：`python3 scripts/publish_signal.py`（cron 安全）或
 `SIGNAL_AUTOPUBLISH_ENABLED=1`（网关启动时补发本周缺失发布）。
@@ -598,17 +694,19 @@ X-API-Key: <public-or-internal-key>
 
 ### 3. 反馈入口
 
+分析响应通过 `X-Analysis-Feedback-Token` 返回本次分析的反馈凭证。客户端在提交反馈时带上该凭证，服务只保存评分。旧分析记录没有凭证时，可重新生成分析后提交反馈。
+
 ```http
 POST /api/v1/agent/feedback
 Content-Type: application/json
 X-API-Key: <public-or-internal-key>
+X-Analysis-Feedback-Token: <token-from-analyze-response>
 ```
 
 ```json
 {
   "analysis_id": "uuid-from-analyze",
-  "rating": "helpful",
-  "comment": "解释很清楚"
+  "rating": "helpful"
 }
 ```
 
@@ -643,7 +741,7 @@ X-API-Key: <internal-key>
 分析：
 
 ```bash
-curl -X POST http://127.0.0.1:8020/api/v1/agent/analyze \
+curl -i -X POST http://127.0.0.1:8020/api/v1/agent/analyze \
   -H 'Content-Type: application/json' \
   -H 'X-API-Key: dev-public-key' \
   -d '{
@@ -660,6 +758,7 @@ curl -X POST http://127.0.0.1:8020/api/v1/agent/analyze \
 curl -X POST http://127.0.0.1:8020/api/v1/agent/feedback \
   -H 'Content-Type: application/json' \
   -H 'X-API-Key: dev-public-key' \
+  -H 'X-Analysis-Feedback-Token: replace-with-token-from-analyze-response' \
   -d '{
     "analysis_id": "replace-with-analysis-id",
     "rating": "helpful"

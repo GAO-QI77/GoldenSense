@@ -111,6 +111,118 @@ def macro_composite_position(raw: pd.DataFrame) -> Tuple[pd.Series, List[str]]:
     return frame.mean(axis=1), used
 
 
+FACTOR_CARDS = {
+    "real_rate_momentum": {"source": "ALFRED DFII10", "lookback": 63, "rule": "实际利率回落"},
+    "usd_downtrend": {"source": "美元指数日线", "lookback": 50, "rule": "美元低于均线"},
+    "inflation_expectation": {"source": "ALFRED T10YIE", "lookback": 63, "rule": "盈亏平衡通胀率上升"},
+    "flow_confirmation": {"source": "GLD 成交额代理", "lookback": 63, "rule": "金价趋势与成交额同步增强"},
+    "price_trend_fallback": {"source": "黄金日线", "lookback": 200, "rule": "黄金价格趋势"},
+}
+
+
+def _driver_changes(raw: pd.DataFrame, lag: int) -> Dict[str, pd.Series]:
+    changes = {}
+    if "USD_Index" in raw:
+        changes["dollar"] = np.log(raw["USD_Index"].astype(float)).diff(lag)
+    if "Real_10Y" in raw:
+        changes["real_rate"] = raw["Real_10Y"].astype(float).diff(lag)
+    if "Breakeven_10Y" in raw:
+        changes["breakeven"] = raw["Breakeven_10Y"].astype(float).diff(lag)
+    return changes
+
+
+def driver_attribution(raw: pd.DataFrame, *, window: int = 252) -> pd.DataFrame | None:
+    """Explain contemporaneous log returns with coefficients fitted before each block."""
+    if window < 20 or not raw.index.is_unique or not raw.index.is_monotonic_increasing:
+        raise ValueError("attribution requires a valid window and chronological unique dates")
+    actual = np.log(raw["Gold"].astype(float)).diff().rename("actual")
+    drivers = _driver_changes(raw, 1)
+    if not drivers:
+        return None
+    changes = pd.DataFrame(drivers)
+    samples = changes.join(actual).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(samples) <= window:
+        return None
+
+    data = samples[list(drivers)].to_numpy()
+    target = samples["actual"].to_numpy()
+    design = np.column_stack([np.ones(len(data)), data])
+    blocks = []
+    for start in range(window, len(samples), 21):
+        end = min(start + 21, len(samples))
+        coef, _, rank, _ = np.linalg.lstsq(
+            design[start - window:start], target[start - window:start], rcond=None,
+        )
+        if rank < design.shape[1]:
+            continue
+        contributions = pd.DataFrame(
+            design[start:end] * coef, index=samples.index[start:end],
+            columns=["intercept", *drivers],
+        )
+        contributions["actual"] = target[start:end]
+        contributions["residual"] = contributions["actual"] - contributions[["intercept", *drivers]].sum(axis=1)
+        blocks.append(contributions)
+    return pd.concat(blocks) if blocks else None
+
+
+def walk_forward_drivers(
+    raw: pd.DataFrame, *, horizon: int, training_rows: int = 504, include_oil_interaction: bool = False,
+) -> pd.DataFrame:
+    """Compare fixed rolling trend and macro models on the same mature sample."""
+    from sklearn.linear_model import Ridge
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    if horizon < 1 or training_rows < 60 or not raw.index.is_unique or not raw.index.is_monotonic_increasing:
+        raise ValueError("invalid walk-forward driver settings")
+    drivers = _driver_changes(raw, 63)
+    if not drivers:
+        raise ValueError("no driver series available")
+    gold = np.log(raw["Gold"].astype(float))
+    frame = pd.DataFrame({"trend": gold.diff(63), **drivers})
+    models = [("trend", ["trend"]), ("driver", list(frame.columns))]
+    if include_oil_interaction:
+        if not {"Crude_Oil", "Real_10Y"} <= set(raw):
+            raise ValueError("oil interaction requires crude oil and point-in-time real rates")
+        oil = raw["Crude_Oil"].astype(float)
+        earlier = oil.shift(21)
+        frame["oil_21"] = oil.where(oil > 0).div(earlier.where(earlier > 0)).sub(1)
+        frame["real_rate_21"] = raw["Real_10Y"].astype(float).diff(21)
+        models.append(("oil_additive", list(frame.columns)))
+        frame["oil_rate_interaction"] = frame["oil_21"] * frame["real_rate_21"]
+        models.append(("oil_interaction", list(frame.columns)))
+    frame = frame.replace([np.inf, -np.inf], np.nan)
+    target = gold.shift(-horizon).sub(gold)
+    maturity = raw.index.to_series().shift(-horizon)
+    rows = []
+    for start in range(training_rows + horizon - 1, len(raw) - horizon, 21):
+        fit_end = start - horizon + 1
+        train = frame.iloc[fit_end - training_rows:fit_end].join(target.rename("target")).dropna()
+        if len(train) < training_rows:
+            continue
+        end = min(start + 21, len(raw) - horizon)
+        valid = frame.iloc[start:end].join(target.rename("target")).dropna()
+        if valid.empty:
+            continue
+        result = pd.DataFrame({
+            "matures_on": maturity.reindex(valid.index),
+            "realized_return": valid["target"],
+            "zero_forecast": 0.0,
+        })
+        for name, inputs in models:
+            model = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+            model.fit(train[inputs], train["target"])
+            result[f"{name}_forecast"] = model.predict(valid[inputs])
+        rows.append(result)
+    if not rows:
+        raise ValueError("insufficient common mature driver history")
+    result = pd.concat(rows)
+    result.attrs["drivers"] = list(drivers)
+    if include_oil_interaction:
+        result.attrs["oil_features"] = models[-1][1][len(models[1][1]):]
+    return result
+
+
 def build_strategies(raw: pd.DataFrame) -> Dict[str, pd.Series]:
     gold = raw["Gold"].astype(float)
     fwd = forward_returns_1d(gold)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from time import perf_counter
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -13,46 +14,52 @@ def _vector_to_pgvector_literal(vec: Sequence[float]) -> str:
     return "[" + ",".join(f"{float(x):.8f}" for x in vec) + "]"
 
 
-def _detect_storage(conn: psycopg.Connection) -> str:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            select data_type, udt_name
-            from information_schema.columns
-            where table_name = 'historical_events' and column_name = 'embedding'
-            """
-        )
-        row = cur.fetchone()
-        if row is None:
-            raise RuntimeError("historical_events table not found; run memory_ingestion.py first")
-        data_type, udt_name = str(row[0]), str(row[1])
-        if udt_name == "vector":
-            return "pgvector"
-        if data_type == "ARRAY":
-            return "array"
-        return "array"
+def _detect_storage(conn: psycopg.Connection, *, allow_missing: bool = False) -> Optional[str]:
+    row = conn.execute(
+        """
+        select t.typname
+        from pg_attribute a
+        join pg_type t on t.oid = a.atttypid
+        where a.attrelid = to_regclass('historical_events')
+          and a.attname = 'embedding' and not a.attisdropped
+        """
+    ).fetchone()
+    if row is None:
+        if allow_missing:
+            return None
+        raise RuntimeError("historical_events table not found; run memory_ingestion.py first")
+    storage = {"vector": "pgvector", "_float8": "array"}.get(row[0])
+    if storage is None:
+        raise RuntimeError("unsupported historical_events embedding type")
+    return storage
 
 
 def _query_pgvector(
-    conn: psycopg.Connection, query_vec: Sequence[float], top_k: int
+    conn: psycopg.Connection, query_vec: Sequence[float], top_k: int, decision_at: datetime
 ) -> List[Dict[str, object]]:
     qlit = _vector_to_pgvector_literal(query_vec)
     with conn.cursor() as cur:
         cur.execute(
             """
+            with visible as materialized (
+                select event_id, event_date, headline, context_summary, embedding,
+                       gold_t1_return, gold_t7_return, gold_t1_available_at, gold_t7_available_at
+                from historical_events
+                where event_date <= %(cutoff)s and available_at <= %(cutoff)s
+            )
             select
                 event_id::text,
                 event_date,
                 headline,
                 context_summary,
-                gold_t1_return,
-                gold_t7_return,
-                (1 - (embedding <=> %s::vector)) as similarity
-            from historical_events
-            order by embedding <=> %s::vector
-            limit %s
+                case when gold_t1_available_at <= %(cutoff)s then gold_t1_return end,
+                case when gold_t7_available_at <= %(cutoff)s then gold_t7_return end,
+                (1 - (embedding <=> %(vector)s::vector)) as similarity
+            from visible
+            order by embedding <=> %(vector)s::vector, event_id
+            limit %(limit)s
             """,
-            (qlit, qlit, int(top_k)),
+            {"vector": qlit, "limit": int(top_k), "cutoff": decision_at},
         )
         rows = cur.fetchall()
     return [
@@ -61,8 +68,8 @@ def _query_pgvector(
             "event_date": r[1].isoformat() if r[1] is not None else None,
             "headline": r[2],
             "context_summary": r[3],
-            "gold_t1_return": float(r[4]),
-            "gold_t7_return": float(r[5]),
+            "gold_t1_return": float(r[4]) if r[4] is not None else None,
+            "gold_t7_return": float(r[5]) if r[5] is not None else None,
             "similarity": float(r[6]),
         }
         for r in rows
@@ -70,7 +77,7 @@ def _query_pgvector(
 
 
 def _query_array_cosine(
-    conn: psycopg.Connection, query_vec: Sequence[float], top_k: int
+    conn: psycopg.Connection, query_vec: Sequence[float], top_k: int, decision_at: datetime
 ) -> List[Dict[str, object]]:
     q = np.asarray([float(x) for x in query_vec], dtype=np.float32)
     with conn.cursor() as cur:
@@ -81,11 +88,13 @@ def _query_array_cosine(
                 event_date,
                 headline,
                 context_summary,
-                gold_t1_return,
-                gold_t7_return,
+                case when gold_t1_available_at <= %(cutoff)s then gold_t1_return end,
+                case when gold_t7_available_at <= %(cutoff)s then gold_t7_return end,
                 embedding
             from historical_events
-            """
+            where event_date <= %(cutoff)s and available_at <= %(cutoff)s
+            """,
+            {"cutoff": decision_at},
         )
         rows = cur.fetchall()
 
@@ -100,7 +109,7 @@ def _query_array_cosine(
         sim = float(np.dot(emb, q))
         scored.append((sim, r))
 
-    scored.sort(key=lambda t: t[0], reverse=True)
+    scored.sort(key=lambda t: (-t[0], t[1][0]))
     top = scored[: int(top_k)]
     out: List[Dict[str, object]] = []
     for sim, r in top:
@@ -110,8 +119,8 @@ def _query_array_cosine(
                 "event_date": r[1].isoformat() if r[1] is not None else None,
                 "headline": str(r[2]),
                 "context_summary": str(r[3]),
-                "gold_t1_return": float(r[4]),
-                "gold_t7_return": float(r[5]),
+                "gold_t1_return": float(r[4]) if r[4] is not None else None,
+                "gold_t7_return": float(r[5]) if r[5] is not None else None,
                 "similarity": float(sim),
             }
         )
@@ -124,7 +133,10 @@ class MemoryRetriever:
         self.model_id = model_id
         self.encoder = SentenceTransformer(model_id)
 
-    def search(self, query_text: str, top_k: int = 3) -> dict:
+    def search(
+        self, query_text: str, top_k: int = 3, *, decision_at: Optional[datetime] = None
+    ) -> dict:
+        decision_at = decision_at or datetime.now(timezone.utc)
         t0 = perf_counter()
         qvec = self.encoder.encode([query_text], normalize_embeddings=True)[0].astype(float).tolist()
         t1 = perf_counter()
@@ -133,9 +145,9 @@ class MemoryRetriever:
             storage = _detect_storage(conn)
             t2 = perf_counter()
             if storage == "pgvector":
-                results = _query_pgvector(conn, qvec, top_k=top_k)
+                results = _query_pgvector(conn, qvec, top_k=top_k, decision_at=decision_at)
             else:
-                results = _query_array_cosine(conn, qvec, top_k=top_k)
+                results = _query_array_cosine(conn, qvec, top_k=top_k, decision_at=decision_at)
             t3 = perf_counter()
 
         return {

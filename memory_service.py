@@ -5,7 +5,7 @@ from typing import Dict, List, Literal, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from memory_retriever import MemoryRetriever
 
@@ -14,6 +14,7 @@ class SearchRequest(BaseModel):
 
     current_event_text: str = Field(..., description="当前突发新闻的文本")
     top_k: int = Field(default=3, description="返回最相似的历史事件数量", ge=1, le=10)
+    decision_at: Optional[AwareDatetime] = None
 
 class SearchResultItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -22,8 +23,8 @@ class SearchResultItem(BaseModel):
     event_date: str
     headline: str
     context_summary: str
-    gold_t1_return: float
-    gold_t7_return: float
+    gold_t1_return: Optional[float]
+    gold_t7_return: Optional[float]
     similarity: float
 
 class SearchResponse(BaseModel):
@@ -116,7 +117,9 @@ async def search_memory(req: SearchRequest):
         )
     
     try:
-        res = retriever.search(req.current_event_text, req.top_k)
+        res = await asyncio.to_thread(
+            retriever.search, req.current_event_text, req.top_k, decision_at=req.decision_at
+        )
         return SearchResponse(**res)
     except Exception as e:
         print(f"Memory search degraded: {e}")

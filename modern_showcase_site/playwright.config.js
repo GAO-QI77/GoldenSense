@@ -13,7 +13,10 @@ export default defineConfig({
   webServer: {
     command: 'npm run dev -- --host 127.0.0.1 --port 4173',
     url: 'http://127.0.0.1:4173',
-    reuseExistingServer: true,
+    env: {
+      VITE_AGENT_API_URL: 'https://api.goldensense.test/api/v1/agent/analyze',
+    },
+    reuseExistingServer: false,
     timeout: 120_000,
   },
   projects: [

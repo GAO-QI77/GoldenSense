@@ -57,7 +57,12 @@ def test_publish_requires_internal_key(client):
     assert resp.status_code in (401, 403)
 
 
-def test_publish_then_read_back_and_idempotent(client):
+def test_publish_then_read_back_and_idempotent(client, monkeypatch):
+    monkeypatch.setattr(agent_gateway.quant_research_context, "get_context_at", lambda _: {
+        "data_stale": False,
+        "degraded": {},
+        "allocation": {"balanced": {"reference_range_pct": [5.0, 12.0]}},
+    })
     first = client.post("/api/v1/signals/publish", headers=INTERNAL_HEADERS)
     assert first.status_code == 200
     body = first.json()

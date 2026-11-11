@@ -21,3 +21,10 @@ modern_showcase_site/playwright-report
 .vercel
 Resume-Doctor-working.docx
 outputs
+.pg17data
+.worktrees
+data_cache
+tmp
+*.zip
+*.docx
+*.pdf

@@ -76,3 +76,38 @@ def test_band_coverage_close_to_nominal():
     cov = band_coverage(prices, horizon_days=1, lo_q=0.10, hi_q=0.90)
     # Nominal coverage is 0.80; allow sampling slack on synthetic data.
     assert 0.70 <= cov <= 0.90
+
+
+def test_21_session_coverage_calibrates_only_with_mature_returns():
+    prices = _synthetic_prices(n=345)
+    horizon = 21
+    volatility = prices.pct_change().rolling(22).std() * np.sqrt(horizon)
+    standardized = (prices.shift(-horizon) / prices - 1.0) / volatility
+    hits = []
+    for i in range(horizon, len(prices) - horizon):
+        matured = standardized.iloc[: i - horizon + 1].dropna()
+        if len(matured) >= 252:
+            low, high = np.quantile(matured, [0.10, 0.90])
+            hits.append(low <= standardized.iloc[i] <= high)
+
+    assert band_coverage(prices, horizon_days=horizon) == pytest.approx(np.mean(hits))
+
+
+def test_short_term_comparison_scores_only_mature_labels_and_is_causal():
+    from vol_models import walk_forward_variance
+    rng = np.random.default_rng(43)
+    dates = pd.bdate_range("2024-01-01", periods=200)
+    prices = pd.Series(100 * np.cumprod(1 + rng.normal(0, 0.01, len(dates))), index=dates)
+    original = walk_forward_variance(prices, horizon=5, min_history=100)
+    changed = prices.copy()
+    changed.iloc[150:] *= 2
+    alternative = walk_forward_variance(changed, horizon=5, min_history=100)
+
+    assert original.index[-1] == dates[-6]
+    assert original["matures_on"].iloc[-1] == dates[-1]
+    forecasts = ["rolling_variance", "ewma_variance", "har_variance"]
+    pd.testing.assert_frame_equal(
+        original.loc[:dates[149], forecasts], alternative.loc[:dates[149], forecasts]
+    )
+    expected = (prices.pct_change().loc[dates[150]:dates[154]] ** 2).sum()
+    assert original.loc[dates[149], "realized_variance"] == pytest.approx(expected)

@@ -15,15 +15,81 @@ CSV, logs the reason) instead of crashing the deploy or fabricating data.
 """
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta, timezone
 import json
 import os
+from pathlib import Path
+import re
 import sys
 import threading
+from tempfile import NamedTemporaryFile
 import time
 from typing import Optional
 
 # Allow running as `python3 scripts/refresh_data.py` from the repo root.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_SAFE_DATA_ASOF = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SAFE_STEPS = {
+    "start",
+    "dataset_built",
+    "dataset_failed_kept_last_good",
+    "preflight_exception",
+}
+
+
+def has_usable_data_asof(summary: dict) -> bool:
+    """Return whether a refresh summary identifies usable local context."""
+    value = summary.get("data_asof")
+    if not isinstance(value, str) or _SAFE_DATA_ASOF.fullmatch(value) is None:
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def safe_refresh_summary(summary: dict) -> dict:
+    """Reduce an internal refresh result to fields safe for public logs."""
+    usable = has_usable_data_asof(summary)
+    step = summary.get("step")
+    if step not in _SAFE_STEPS:
+        step = "unknown"
+    if summary.get("ok") and usable:
+        status = "fresh"
+    elif step == "dataset_failed_kept_last_good" and usable:
+        status = "last_good"
+    elif usable:
+        status = "degraded"
+    else:
+        status = "unavailable"
+
+    safe = {
+        "ok": bool(summary.get("ok")),
+        "status": status,
+        "step": step,
+    }
+    if usable:
+        safe["data_asof"] = summary["data_asof"]
+    data_source = summary.get("data_source")
+    if isinstance(data_source, str) and _SAFE_NAME.fullmatch(data_source):
+        safe["data_source"] = data_source
+    degraded = summary.get("context_degraded")
+    if isinstance(degraded, dict):
+        components = sorted(
+            key
+            for key in degraded
+            if isinstance(key, str) and _SAFE_NAME.fullmatch(key)
+        )
+        if components:
+            safe["degraded_components"] = components
+    elapsed_ms = summary.get("elapsed_ms")
+    if isinstance(elapsed_ms, int) and elapsed_ms >= 0:
+        safe["elapsed_ms"] = elapsed_ms
+    return safe
 
 
 def refresh_once(*, cache_dir: Optional[str] = None) -> dict:
@@ -33,17 +99,44 @@ def refresh_once(*, cache_dir: Optional[str] = None) -> dict:
     """
     started = time.time()
     summary: dict = {"ok": False, "step": "start"}
+    dataset_built = False
     try:
-        from data_sources import DEFAULT_CACHE_DIR, build_extended_market_data
+        from data_sources import DEFAULT_CACHE_DIR, RESEARCH_MARKET_CACHE_PATH, YF_TICKERS, build_extended_market_data
 
-        _frame, meta = build_extended_market_data(
-            cache_dir=cache_dir or DEFAULT_CACHE_DIR
-        )
+        target = Path(os.environ.get("GOLD_RESEARCH_MARKET_PATH") or RESEARCH_MARKET_CACHE_PATH)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile(dir=target.parent, suffix=".csv", delete=False) as candidate:
+            path = Path(candidate.name)
+        try:
+            frame, meta = build_extended_market_data(cache_dir=cache_dir or DEFAULT_CACHE_DIR, out_path=str(path))
+            required = set(YF_TICKERS)
+            if not required <= set(frame) or any(key in meta.sources_degraded for key in required):
+                raise ValueError("required market sources missing")
+            fresh_after = (datetime.now(timezone.utc).date() - timedelta(days=4)).isoformat()
+            stale = sorted(key for key in required if meta.price_end_by_column.get(key, "") < fresh_after)
+            if frame.empty or stale:
+                raise ValueError(f"market refresh is stale: {', '.join(stale)}")
+            path.replace(target)
+        finally:
+            path.unlink(missing_ok=True)
         summary["dataset"] = meta.as_dict()
         summary["step"] = "dataset_built"
+        dataset_built = True
     except Exception as exc:  # network / provider failure -> keep last good CSV
         summary["dataset_error"] = f"{type(exc).__name__}: {exc}"
         summary["step"] = "dataset_failed_kept_last_good"
+
+    if os.environ.get("GOLD_DRIVER_COT_REFRESH_ENABLED") == "1":
+        try:
+            from scripts.refresh_gold_driver_flows import cot_observations, fetch_cot, merge_observations
+
+            payload = fetch_cot()
+            path = Path(os.environ.get("GOLD_DRIVER_FLOWS_PATH") or "data_cache/gold_driver_flows.csv")
+            summary["cot_versions_added"] = merge_observations(
+                path, cot_observations(payload), captured_at=datetime.fromisoformat(payload["captured_at"]),
+            )
+        except Exception as exc:
+            summary["cot_refresh_error"] = type(exc).__name__
 
     # Warm (force-refresh) the shared research context off whatever CSV we now
     # have, so the first user request after a refresh is already hot.
@@ -54,7 +147,9 @@ def refresh_once(*, cache_dir: Optional[str] = None) -> dict:
         summary["context_degraded"] = ctx.get("degraded", {})
         summary["data_asof"] = ctx.get("data_asof")
         summary["data_source"] = ctx.get("data_source")
-        summary["ok"] = "market_data" not in ctx.get("degraded", {})
+        summary["ok"] = dataset_built and "market_data" not in ctx.get(
+            "degraded", {}
+        )
     except Exception as exc:
         summary["context_error"] = f"{type(exc).__name__}: {exc}"
 
@@ -91,6 +186,11 @@ def archive_recent_news(*, fetch_items=None, archive=None) -> dict:
                 "summary": item.get("summary"),
                 "source": item.get("source"),
                 "published_at": item.get("published_at") or item.get("published"),
+                "url": item.get("url") or item.get("link"),
+                "first_seen_at": item.get("first_seen_at"),
+                "available_at": item.get("available_at"),
+                "updated": item.get("updated"),
+                "updated_at": item.get("updated_at"),
             }
             for item in items
         ]
@@ -103,7 +203,8 @@ def archive_recent_news(*, fetch_items=None, archive=None) -> dict:
 
 def _log(summary: dict) -> None:
     print(
-        "data_refresh " + json.dumps(summary, ensure_ascii=False, default=str),
+        "data_refresh "
+        + json.dumps(safe_refresh_summary(summary), ensure_ascii=False),
         flush=True,
     )
 
@@ -112,6 +213,7 @@ def start_background_refresh(
     *,
     interval_seconds: Optional[float] = None,
     run_immediately: bool = False,
+    enabled: Optional[bool] = None,
 ) -> Optional[threading.Thread]:
     """Spawn a daemon thread that refreshes on an interval. Returns the thread.
 
@@ -120,8 +222,14 @@ def start_background_refresh(
       DATA_REFRESH_INTERVAL_SECONDS=86400    -> cadence (default daily)
     Returns None when disabled.
     """
-    enabled = os.environ.get("DATA_REFRESH_ENABLED", "0") == "1"
-    if not enabled and interval_seconds is None:
+    is_enabled = (
+        os.environ.get("DATA_REFRESH_ENABLED", "0") == "1"
+        if enabled is None
+        else enabled
+    )
+    if enabled is False:
+        return None
+    if not is_enabled and interval_seconds is None:
         return None
     interval = float(
         interval_seconds

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -11,6 +11,9 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 import pandas as pd
 import psycopg
 from sentence_transformers import SentenceTransformer
+
+from data_loader import market_availability_times
+from memory_retriever import _detect_storage
 
 
 @dataclass(frozen=True)
@@ -20,8 +23,10 @@ class HistoricalEvent:
     headline: str
     context_summary: str
     embedding: List[float]
-    gold_t1_return: float
-    gold_t7_return: float
+    gold_t1_return: Optional[float]
+    gold_t7_return: Optional[float]
+    gold_t1_available_at: Optional[datetime]
+    gold_t7_available_at: Optional[datetime]
 
 
 def _vector_to_pgvector_literal(vec: Sequence[float]) -> str:
@@ -89,15 +94,15 @@ def _find_event_anchor_index(market_df: pd.DataFrame, event_dt: datetime) -> Opt
     return pos
 
 
-def _compute_forward_returns(market_df: pd.DataFrame, anchor_pos: int) -> Optional[Tuple[float, float]]:
-    if anchor_pos + 7 >= len(market_df):
-        return None
-    p0 = float(market_df["Gold"].iloc[anchor_pos])
-    p1 = float(market_df["Gold"].iloc[anchor_pos + 1])
-    p7 = float(market_df["Gold"].iloc[anchor_pos + 7])
-    if p0 <= 0.0:
-        return None
-    return (p1 / p0 - 1.0), (p7 / p0 - 1.0)
+def _forward_outcome(
+    prices: pd.Series, times: pd.DatetimeIndex, anchor_pos: Optional[int], horizon: int
+) -> Tuple[Optional[float], Optional[datetime]]:
+    if anchor_pos is None or anchor_pos + horizon >= len(prices):
+        return None, None
+    p0, p1 = float(prices.iloc[anchor_pos]), float(prices.iloc[anchor_pos + horizon])
+    if not (0.0 < p0 < float("inf") and 0.0 < p1 < float("inf")):
+        return None, None
+    return p1 / p0 - 1.0, times[anchor_pos + horizon].to_pydatetime()
 
 
 def _build_events(
@@ -107,14 +112,12 @@ def _build_events(
     max_events: int,
 ) -> List[HistoricalEvent]:
     events: List[HistoricalEvent] = []
+    times = market_availability_times(market_df.index)
+    prices = market_df["Gold"]
     for event_dt, title, body in event_stream:
         anchor_pos = _find_event_anchor_index(market_df, event_dt)
-        if anchor_pos is None:
-            continue
-        rets = _compute_forward_returns(market_df, anchor_pos)
-        if rets is None:
-            continue
-        t1_ret, t7_ret = rets
+        t1_ret, t1_at = _forward_outcome(prices, times, anchor_pos, 1)
+        t7_ret, t7_at = _forward_outcome(prices, times, anchor_pos, 7)
 
         text = (title + "\n" + body).strip()
         emb = encoder.encode([text], normalize_embeddings=True)[0].astype(float).tolist()
@@ -127,8 +130,10 @@ def _build_events(
                 headline=title,
                 context_summary=body,
                 embedding=emb,
-                gold_t1_return=float(t1_ret),
-                gold_t7_return=float(t7_ret),
+                gold_t1_return=t1_ret,
+                gold_t7_return=t7_ret,
+                gold_t1_available_at=t1_at,
+                gold_t7_available_at=t7_at,
             )
         )
         if len(events) >= max_events:
@@ -138,18 +143,20 @@ def _build_events(
 
 def _ensure_schema(conn: psycopg.Connection, embedding_dim: int) -> str:
     with conn.cursor() as cur:
-        cur.execute("select exists(select 1 from pg_available_extensions where name = 'vector')")
-        vector_available = bool(cur.fetchone()[0])
-
-        storage: str
-        if vector_available:
-            try:
-                cur.execute("create extension if not exists vector")
-                storage = "pgvector"
-            except Exception:
-                storage = "array"
-        else:
+        cur.execute("select pg_advisory_xact_lock(hashtext('golden_sense_historical_events_schema'))")
+        storage = _detect_storage(conn, allow_missing=True)
+        if storage is None:
             storage = "array"
+            cur.execute("select exists(select from pg_available_extensions where name = 'vector')")
+            if cur.fetchone()[0]:
+                try:
+                    with conn.transaction():
+                        cur.execute("create extension if not exists vector")
+                    storage = "pgvector"
+                except (psycopg.errors.InsufficientPrivilege, psycopg.errors.FeatureNotSupported):
+                    # Roll back the extension attempt to its savepoint before
+                    # creating the array table in the surrounding transaction.
+                    pass
 
         if storage == "pgvector":
             cur.execute(
@@ -185,6 +192,16 @@ def _ensure_schema(conn: psycopg.Connection, embedding_dim: int) -> str:
                 )
                 """
             )
+        cur.execute(
+            """
+            alter table historical_events
+                add column if not exists available_at timestamptz,
+                add column if not exists gold_t1_available_at timestamptz,
+                add column if not exists gold_t7_available_at timestamptz,
+                alter column gold_t1_return drop not null,
+                alter column gold_t7_return drop not null
+            """
+        )
         conn.commit()
         return storage
 
@@ -192,60 +209,53 @@ def _ensure_schema(conn: psycopg.Connection, embedding_dim: int) -> str:
 def _upsert_events(conn: psycopg.Connection, storage: str, events: Sequence[HistoricalEvent]) -> int:
     if not events:
         return 0
+    captured_at = datetime.now(timezone.utc)
+    embedding_sql = "%s::vector" if storage == "pgvector" else "%s"
     with conn.cursor() as cur:
-        if storage == "pgvector":
-            for e in events:
-                cur.execute(
-                    """
-                    insert into historical_events (
-                        event_id, event_date, headline, context_summary, embedding, gold_t1_return, gold_t7_return
-                    )
-                    values (%s, %s, %s, %s, %s::vector, %s, %s)
-                    on conflict (event_id) do update set
-                        event_date = excluded.event_date,
-                        headline = excluded.headline,
-                        context_summary = excluded.context_summary,
-                        embedding = excluded.embedding,
-                        gold_t1_return = excluded.gold_t1_return,
-                        gold_t7_return = excluded.gold_t7_return
-                    """,
-                    (
-                        str(e.event_id),
-                        e.event_date,
-                        e.headline,
-                        e.context_summary,
-                        _vector_to_pgvector_literal(e.embedding),
-                        e.gold_t1_return,
-                        e.gold_t7_return,
-                    ),
+        for event in events:
+            embedding = (
+                _vector_to_pgvector_literal(event.embedding) if storage == "pgvector" else event.embedding
+            )
+            cur.execute(
+                f"""
+                insert into historical_events (
+                    event_id, event_date, headline, context_summary, embedding,
+                    gold_t1_return, gold_t7_return, available_at,
+                    gold_t1_available_at, gold_t7_available_at
                 )
-        else:
-            for e in events:
-                cur.execute(
-                    """
-                    insert into historical_events (
-                        event_id, event_date, headline, context_summary, embedding, gold_t1_return, gold_t7_return
-                    )
-                    values (%s, %s, %s, %s, %s, %s, %s)
-                    on conflict (event_id) do update set
-                        event_date = excluded.event_date,
-                        headline = excluded.headline,
-                        context_summary = excluded.context_summary,
-                        embedding = excluded.embedding,
-                        gold_t1_return = excluded.gold_t1_return,
-                        gold_t7_return = excluded.gold_t7_return
-                    """,
-                    (
-                        str(e.event_id),
-                        e.event_date,
-                        e.headline,
-                        e.context_summary,
-                        e.embedding,
-                        e.gold_t1_return,
-                        e.gold_t7_return,
-                    ),
-                )
-        conn.commit()
+                values (%s, %s, %s, %s, {embedding_sql}, %s, %s, %s, %s, %s)
+                on conflict (event_id) do update set
+                    event_date = excluded.event_date,
+                    headline = excluded.headline,
+                    context_summary = excluded.context_summary,
+                    embedding = excluded.embedding,
+                    gold_t1_return = excluded.gold_t1_return,
+                    gold_t7_return = excluded.gold_t7_return,
+                    available_at = case
+                        when historical_events.context_summary = excluded.context_summary
+                         and historical_events.headline = excluded.headline
+                         and historical_events.event_date = excluded.event_date
+                        then coalesce(historical_events.available_at, excluded.available_at)
+                        else excluded.available_at
+                    end,
+                    gold_t1_available_at = case
+                        when historical_events.gold_t1_return = excluded.gold_t1_return
+                        then coalesce(historical_events.gold_t1_available_at, excluded.gold_t1_available_at)
+                        else greatest(excluded.gold_t1_available_at, excluded.available_at)
+                    end,
+                    gold_t7_available_at = case
+                        when historical_events.gold_t7_return = excluded.gold_t7_return
+                        then coalesce(historical_events.gold_t7_available_at, excluded.gold_t7_available_at)
+                        else greatest(excluded.gold_t7_available_at, excluded.available_at)
+                    end
+                """,
+                (
+                    str(event.event_id), event.event_date, event.headline, event.context_summary, embedding,
+                    event.gold_t1_return, event.gold_t7_return, captured_at,
+                    event.gold_t1_available_at, event.gold_t7_available_at,
+                ),
+            )
+    conn.commit()
     return len(events)
 
 
