@@ -308,7 +308,7 @@ function FlagshipHero({ flagship, isPro }) {
     { key: 'sharpe', label: 'Sharpe', value: fmt.num(m.sharpe, 2), bench: fmt.num(b.sharpe, 2) },
     { key: 'sortino', label: 'Sortino', value: fmt.num(m.sortino, 2), bench: fmt.num(b.sortino, 2) },
     { key: 'calmar', label: 'Calmar', value: fmt.num(m.calmar, 2), bench: fmt.num(b.calmar, 2) },
-    { key: 'dsr', label: 'Deflated Sharpe', value: fmt.pct(m.dsr, 0), note: '多重检验修正后' },
+    { key: 'dsr', label: 'Deflated Sharpe', value: fmt.pct(m.dsr, 0), note: '探索性统计 · 试验次数假设' },
   ].filter((tile) => isPro || tile.key === 'dd');
 
   return (
@@ -316,9 +316,9 @@ function FlagshipHero({ flagship, isPro }) {
       <div className="flagship-head">
         <div className="flagship-title">
           <span className="flagship-badge"><Trophy size={14} /> 旗舰策略 · {flagship.sample?.start?.slice(0, 4)}–{flagship.sample?.end?.slice(0, 4)} 回测</span>
-          <h2>以约一半的回撤，跑出更优的风险调整收益</h2>
+          <h2>黄金策略的历史收益与回撤</h2>
           <p>{isPro
-            ? `多周期趋势 × 实际利率顺风 × HMM 状态去险 × 波动率目标，全流程因果（无未来信息）、含 ${flagship.cost_bps} bps/边成本；对比买入持有。`
+            ? `多周期趋势 × 实际利率顺风 × HMM 状态去险 × 波动率目标，按仓位换手计入 ${flagship.cost_bps} bps 成本；基准为黄金买入持有。`
             : '策略同时参考趋势、实际利率和市场压力，并把历史回撤作为首要约束。'}</p>
         </div>
         <div className="flagship-toggle" role="tablist" aria-label="图表视图">
@@ -386,7 +386,7 @@ function FlagshipHero({ flagship, isPro }) {
       <p className="flagship-foot">
         <ShieldCheck size={13} />
         {isPro
-          ? `参数取自跨资产趋势/波动率管理文献（未对本样本拟合），HMM 走前重拟合 + 前向滤波，OOS by construction；Deflated Sharpe ${fmt.pct(m.dsr, 0)}。`
+          ? `HMM 使用走前重拟合与前向滤波。Deflated Sharpe ${fmt.pct(m.dsr, 0)} 为基于当前试验次数假设的探索性统计。`
           : '这是历史回测，已考虑交易成本，但不代表未来表现。'}
         非投资建议。
       </p>
@@ -598,6 +598,7 @@ function ConePanel({ cone, degraded, isPro }) {
 /* ----------------------------- fair value -------------------------------- */
 function FairValuePanel({ fairValue, degraded, isPro }) {
   const deviation = fairValue?.deviation_pct;
+  const hasDeviation = Number.isFinite(deviation);
   const structuralBreak = Boolean(fairValue?.regime_break) || Math.abs(Number(deviation)) > 50;
   const conditionalAnchor = fairValue?.anchor_status === 'conditional';
   const anchorLabel = conditionalAnchor ? '利率与美元条件锚' : '宏观公允价值锚';
@@ -633,15 +634,16 @@ function FairValuePanel({ fairValue, degraded, isPro }) {
     >
       {(() => {
         const regimeBreak = structuralBreak;
-        const tone = regimeBreak ? 'break' : deviation >= 0 ? 'rich' : 'cheap';
-        const label = regimeBreak
-          ? '结构性偏离期'
+        const tone = !hasDeviation ? 'pending' : regimeBreak ? 'break' : deviation >= 0 ? 'rich' : 'cheap';
+        const label = !hasDeviation
+          ? '估值偏离待确认'
+          : regimeBreak ? '结构性偏离期'
           : `相对${anchorLabel}（${deviation >= 0 ? '偏贵' : '偏便宜'}）`;
         return (
           <div className="fair-value-hero">
             <div>
               <span className="fair-value-figure" data-tone={tone}>
-                {deviation == null ? '—' : `${deviation >= 0 ? '+' : ''}${fmt.num(deviation, 1)}%`}
+                {!hasDeviation ? '—' : `${deviation >= 0 ? '+' : ''}${fmt.num(deviation, 1)}%`}
               </span>
               <small>
                 {label}
@@ -665,7 +667,7 @@ function FairValuePanel({ fairValue, degraded, isPro }) {
               </div>
               <div>
                 <dt>误差修正半衰期</dt>
-                <dd>{halfLife.label}</dd>
+                <dd>{fairValue ? halfLife.label : '待获取估值数据'}</dd>
               </div>
             </dl>
           </div>

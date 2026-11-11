@@ -1080,7 +1080,7 @@ test('track-record outage is unavailable rather than an empty scorecard', async 
 
   await expect(page.getByText('短期关注风险分布。', { exact: true })).toBeVisible();
   await expect(page.locator('.ledger-track')).toContainText('记分服务暂不可用');
-  await expect(page.locator('.ledger-track')).not.toContainText('暂无成熟周（诚实空账）');
+  await expect(page.locator('.ledger-track')).not.toContainText('暂无成熟计分区间（诚实空账）');
 });
 
 test('mobile primary controls and evidence links meet 44px touch targets', async ({ page }) => {
@@ -1550,7 +1550,10 @@ test('signals page labels date-only proxy scoring and same-cost benchmarks', asy
         price_evidence: 'date_only_proxy',
         per_profile: {
           conservative: { weeks_scored: 2, cum_return: 0.02 },
-          balanced: { weeks_scored: 2, cum_return: 0.04, max_drawdown: -0.01 },
+          balanced: {
+            intervals_scored: 1, weeks_scored: 2, cum_return: 0.04, max_drawdown: -0.01,
+            ann_vol: null, sharpe: null, annualization_reason: 'nonweekly_intervals',
+          },
         },
         benchmarks: {
           conservative_risk_matched_net: { weeks_scored: 0, cum_return: null },
@@ -1572,6 +1575,9 @@ test('signals page labels date-only proxy scoring and same-cost benchmarks', asy
   await page.goto('/signals');
   await expect(page.getByText('行情按日期估算可用时间，记分供研究参考。')).toBeVisible();
   await expect(page.getByText('同成本固定仓位 3.00%')).toBeVisible();
+  await expect(page.locator('.track-row').filter({ hasText: '稳健' })).toContainText('区间数 1');
+  await expect(page.locator('.track-row').filter({ hasText: '保守' })).toContainText('区间数 2');
+  await expect(page.getByText('计分区间包含非周度间隔，年化波动率与 Sharpe 暂不可用。')).toBeVisible();
   await expect(page.getByText('同成本风险匹配基准 2.50% · 同期策略 3.50% · 目标年化波动率 8.0% · 自 2026-07-20 起')).toBeVisible();
   await expect(page.getByText(/同成本风险匹配基准/)).toHaveCount(1);
 });

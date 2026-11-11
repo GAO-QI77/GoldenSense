@@ -335,7 +335,7 @@ export default function SignalsPage() {
                   : trackRecord?.matured_through
                   ? `已成熟至 ${trackRecord.matured_through} · 成本 ${trackRecord.cost_bps}bps`
                   : trackRecord
-                    ? '暂无成熟周（诚实空账）'
+                    ? '暂无成熟计分区间（诚实空账）'
                     : '读取中'}
               </span>
             </div>
@@ -357,13 +357,16 @@ export default function SignalsPage() {
                 return (
                   <div key={profile} className="track-row">
                     <strong>{{ conservative: '保守', balanced: '稳健', aggressive: '进取' }[profile]}</strong>
-                    <span>周数 {stats.weeks_scored}</span>
+                    <span>区间数 {stats.intervals_scored ?? stats.weeks_scored}</span>
                     <span>
                       累计 {stats.cum_return != null ? `${(stats.cum_return * 100).toFixed(2)}%` : '—'}
                     </span>
                     <span>
                       回撤 {stats.max_drawdown != null ? `${(stats.max_drawdown * 100).toFixed(2)}%` : '—'}
                     </span>
+                    {stats.annualization_reason === 'nonweekly_intervals' && (
+                      <span className="track-row-benchmark">计分区间包含非周度间隔，年化波动率与 Sharpe 暂不可用。</span>
+                    )}
                     {fixed?.cum_return != null && (
                       <span className="track-row-benchmark">同成本固定仓位 {(fixed.cum_return * 100).toFixed(2)}%</span>
                     )}
@@ -448,7 +451,7 @@ export default function SignalsPage() {
 
       <footer className="terminal-footer">
         <span>GoldenSense Signal Ledger</span>
-        <span>不可变发布 · 成熟周计分 · 双基准对照 · 非投资建议</span>
+        <span>不可变发布 · 成熟区间计分 · 基准对照 · 非投资建议</span>
       </footer>
     </main>
   );

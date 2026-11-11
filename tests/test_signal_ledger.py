@@ -642,3 +642,43 @@ def test_risk_matched_comparator_waits_for_enough_strictly_prior_verified_closes
     early_benchmark = early["benchmarks"]["balanced_risk_matched_net"]
     assert early_benchmark["weeks_scored"] == 0
     assert early_benchmark["cum_return"] is None
+
+
+@pytest.mark.parametrize(
+    ("history_start", "matched_intervals", "matched_reason"),
+    [
+        ("2026-06-08", 3, "nonweekly_intervals"),
+        ("2026-07-10", 2, None),
+    ],
+)
+def test_missing_publication_weeks_suppress_annualization_for_the_actual_scored_span(
+    history_start, matched_intervals, matched_reason,
+):
+    prices = _daily_prices(history_start, 60, 1.0)
+    records = [
+        build_publication(_ctx(), now=MON + pd.Timedelta(weeks=week))
+        for week in (0, 4, 5, 6)
+    ]
+    score = score_track_record(records, prices, cost_bps=0)
+    strategy = score["per_profile"]["balanced"]
+    fixed = score["benchmarks"]["balanced_fixed_net"]
+    matched = score["benchmarks"]["balanced_risk_matched_net"]
+    same_period = matched["strategy_same_period"]
+
+    execution_prices = prices.loc[["2026-07-14", "2026-08-11", "2026-08-18", "2026-08-25"]]
+    interval_returns = 0.085 * execution_prices.pct_change().dropna()
+    expected = (1 + interval_returns).prod() - 1
+    for stats in (strategy, fixed):
+        assert stats["weeks_scored"] == stats["intervals_scored"] == 3
+        assert stats["cum_return"] == pytest.approx(expected, abs=5e-7)
+        assert stats["ann_vol"] is None
+        assert stats["sharpe"] is None
+        assert stats["annualization_reason"] == "nonweekly_intervals"
+    for stats in (matched, same_period):
+        assert stats["intervals_scored"] == matched_intervals
+        assert stats["annualization_reason"] == matched_reason
+        assert (stats["ann_vol"] is None) == (matched_reason is not None)
+        assert (stats["sharpe"] is None) == (matched_reason is not None)
+
+    expected_same_period = (1 + interval_returns.iloc[-matched_intervals:]).prod() - 1
+    assert same_period["cum_return"] == pytest.approx(expected_same_period, abs=5e-7)

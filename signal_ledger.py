@@ -15,8 +15,8 @@ into an append-only ledger. Records are:
 
 Scoring holds, for each risk profile, a hypothetical shadow portfolio at the
 published midpoint gold weight (rest in zero-yield cash), rebalanced at each
-publication, net of turnover costs, and only over *matured* weeks (the next
-publication's rebalance price must exist).
+publication, net of turnover costs, and only over matured publication intervals
+(the next publication's rebalance price must exist).
 """
 from __future__ import annotations
 
@@ -434,35 +434,48 @@ def _rebalance_price(prices: pd.Series, published_at: str) -> Optional[Tuple[pd.
     return prices.index[pos], float(prices.iloc[pos])
 
 
-def _profile_stats(weekly_returns: List[float]) -> Dict[str, Any]:
-    if not weekly_returns:
+def _profile_stats(
+    interval_returns: List[float], interval_durations: List[pd.Timedelta],
+) -> Dict[str, Any]:
+    """Annualize only seven-day intervals. weeks_scored is a legacy count alias."""
+    if not interval_returns:
         return {
             "weeks_scored": 0,
+            "intervals_scored": 0,
             "cum_return": None,
             "ann_vol": None,
             "max_drawdown": None,
             "sharpe": None,
+            "annualization_reason": "insufficient_intervals",
         }
     import numpy as np
 
-    equity = np.cumprod([1.0] + [1.0 + r for r in weekly_returns])
+    equity = np.cumprod([1.0] + [1.0 + r for r in interval_returns])
     cum_return = float(equity[-1] - 1.0)
     running_max = np.maximum.accumulate(equity)
     max_dd = float((equity / running_max - 1.0).min())
-    if len(weekly_returns) >= 2:
-        vol = float(np.std(weekly_returns, ddof=1) * np.sqrt(WEEKS_PER_YEAR))
-        mean_ann = float(np.mean(weekly_returns) * WEEKS_PER_YEAR)
+    if any(duration != pd.Timedelta(weeks=1) for duration in interval_durations):
+        annualization_reason = "nonweekly_intervals"
+    elif len(interval_returns) < 2:
+        annualization_reason = "insufficient_intervals"
+    else:
+        annualization_reason = None
+    if annualization_reason is None:
+        vol = float(np.std(interval_returns, ddof=1) * np.sqrt(WEEKS_PER_YEAR))
+        mean_ann = float(np.mean(interval_returns) * WEEKS_PER_YEAR)
         sharpe = round(mean_ann / vol, 3) if vol > 0 else None
         ann_vol = round(vol, 4)
     else:
         ann_vol = None
         sharpe = None
     return {
-        "weeks_scored": len(weekly_returns),
+        "weeks_scored": len(interval_returns),
+        "intervals_scored": len(interval_returns),
         "cum_return": round(cum_return, 6),
         "ann_vol": ann_vol,
         "max_drawdown": round(max_dd, 6),
         "sharpe": sharpe,
+        "annualization_reason": annualization_reason,
     }
 
 
@@ -544,15 +557,17 @@ def score_track_record(
         "disclaimer": TRACK_RECORD_DISCLAIMER,
     }
 
-    # A week matures when the *next* publication's rebalance price exists.
+    # An interval matures when the next publication's rebalance price exists.
     matured_pairs = list(zip(points[:-1], points[1:]))
     if matured_pairs:
         result["matured_through"] = points[-1].record.get("publication_id")
 
     for profile in PROFILES:
-        weekly_returns: List[float] = []
+        interval_returns: List[float] = []
+        interval_durations: List[pd.Timedelta] = []
         fixed_returns: List[float] = []
         risk_matched_returns: List[float] = []
+        risk_matched_durations: List[pd.Timedelta] = []
         same_period_strategy_returns: List[float] = []
         fixed_weight = None
         risk_target = risk_start_at = None
@@ -560,14 +575,15 @@ def score_track_record(
         risk_matched_drift = same_period_strategy_drift = 0.0
         for current, following in matured_pairs:
             midpoint = ((current.record.get("allocations") or {}).get(profile) or {}).get("midpoint")
-            if midpoint is None and not weekly_returns:
+            if midpoint is None and not interval_returns:
                 continue
             weight = drift if midpoint is None else float(midpoint) / 100.0
             if not 0 <= weight <= 1:
                 raise ValueError("shadow allocations must lie between 0% and 100%")
             gold_return = following.price / current.price - 1.0
             period_return, drift = _shadow_step(weight, drift, gold_return, rate)
-            weekly_returns.append(period_return)
+            interval_returns.append(period_return)
+            interval_durations.append(following.at - current.at)
             if fixed_weight is None:
                 fixed_weight = weight
             fixed_return, fixed_drift = _shadow_step(fixed_weight, fixed_drift, gold_return, rate)
@@ -587,6 +603,7 @@ def score_track_record(
                 risk_weight, risk_matched_drift, gold_return, rate,
             )
             risk_matched_returns.append(risk_return)
+            risk_matched_durations.append(following.at - current.at)
             # Compare the exact same intervals, starting both portfolios in cash.
             strategy_weight = same_period_strategy_drift if midpoint is None else weight
             strategy_return, same_period_strategy_drift = _shadow_step(
@@ -594,19 +611,19 @@ def score_track_record(
             )
             same_period_strategy_returns.append(strategy_return)
         result["per_profile"][profile] = {
-            **_profile_stats(weekly_returns),
+            **_profile_stats(interval_returns, interval_durations),
             "evidence_class": "simulated_forward",
         }
         if fixed_weight is not None:
             result["benchmarks"][f"{profile}_fixed_net"] = {
-                **_profile_stats(fixed_returns),
+                **_profile_stats(fixed_returns, interval_durations),
                 "evidence_class": "simulated_forward",
                 "cost_bps": cost_bps,
                 "weight_pct": round(fixed_weight * 100, 4),
                 "description": "首期仓位固定权重，同期再平衡，计入同口径成本",
             }
         result["benchmarks"][f"{profile}_risk_matched_net"] = {
-            **_profile_stats(risk_matched_returns),
+            **_profile_stats(risk_matched_returns, risk_matched_durations),
             "evidence_class": "simulated_forward",
             "cost_bps": cost_bps,
             "lookback_sessions": RISK_MATCH_LOOKBACK_SESSIONS,
@@ -614,7 +631,7 @@ def score_track_record(
             "target_ann_vol": risk_target,
             "start_at": risk_start_at,
             "strategy_same_period": {
-                **_profile_stats(same_period_strategy_returns),
+                **_profile_stats(same_period_strategy_returns, risk_matched_durations),
                 "evidence_class": "simulated_forward",
             },
             "description": (
